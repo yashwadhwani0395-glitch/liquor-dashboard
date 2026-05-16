@@ -1,185 +1,393 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import date, timedelta
-import numpy as np
-import random
 
-from utils.helpers import format_inr, kpi_card, date_filter, section_header
+from db import run_query
+from utils.helpers import format_inr, section_header
 
-# ---------------------------------------------------------------------------
-# Mock data generator — replace calls to _mock_*() with run_query() later
-# ---------------------------------------------------------------------------
+# ── Sales transaction type IDs (ShortName='MS', PostingType='D', ItemYN='Y')
+SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
-BRANDS = ["Royal Stag", "Officer's Choice", "McDowell's", "Kingfisher", "Budweiser",
-          "Old Monk", "Jack Daniel's", "Johnnie Walker", "Bira 91", "Tuborg"]
-
-CUSTOMERS = [f"Customer {chr(65+i)}" for i in range(15)]
-
-
-def _mock_transactions(start: date, end: date) -> pd.DataFrame:
-    rng = np.random.default_rng(42)
-    n_days = max((end - start).days + 1, 1)
-    rows = []
-    for i in range(n_days * 8):
-        order_date = start + timedelta(days=rng.integers(0, n_days))
-        brand = rng.choice(BRANDS)
-        customer = rng.choice(CUSTOMERS)
-        qty = int(rng.integers(5, 150))
-        rate = float(rng.uniform(200, 3000))
-        rows.append({
-            "order_date": order_date,
-            "brand": brand,
-            "customer": customer,
-            "quantity": qty,
-            "rate": round(rate, 2),
-            "amount": round(qty * rate, 2),
-        })
-    df = pd.DataFrame(rows)
-    df["order_date"] = pd.to_datetime(df["order_date"])
-    return df.sort_values("order_date", ascending=False).reset_index(drop=True)
+# ── Chart theme constants
+_BG     = "rgba(0,0,0,0)"
+_GOLD   = "#E8A838"
+_GRID   = dict(gridcolor="#2a2d3e")
+_LAYOUT = dict(paper_bgcolor=_BG, plot_bgcolor=_BG,
+               font=dict(color="#FAFAFA"), margin=dict(t=30, b=20))
+_PAL    = px.colors.qualitative.Bold
 
 
-# ---------------------------------------------------------------------------
-# Chart builders
-# ---------------------------------------------------------------------------
+# ── Indian rupee formatter for table cells (exact, with grouping) ──────────
 
-CHART_BG = "rgba(0,0,0,0)"
-GOLD = "#E8A838"
-PALETTE = px.colors.qualitative.Bold
+def _inr(value: float) -> str:
+    neg = value < 0
+    s = str(int(round(abs(value))))
+    if len(s) > 3:
+        tail, head = s[-3:], s[:-3]
+        parts: list[str] = []
+        while head:
+            parts.append(head[-2:])
+            head = head[:-2]
+        s = ",".join(reversed(parts)) + "," + tail
+    return ("−" if neg else "") + "₹" + s
 
 
-def _sales_by_brand(df: pd.DataFrame) -> go.Figure:
-    agg = (df.groupby("brand")["amount"].sum()
-             .sort_values(ascending=False)
-             .reset_index())
-    fig = px.bar(
-        agg, x="brand", y="amount",
-        color="brand", color_discrete_sequence=PALETTE,
-        labels={"brand": "Brand", "amount": "Sales (₹)"},
-        text_auto=".2s",
+# ── Data loaders (all cached 5 minutes) ────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_brands() -> pd.DataFrame:
+    return run_query(
+        "SELECT BrandID, BrandName FROM MsBrandMaster ORDER BY BrandName"
     )
-    fig.update_layout(
-        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
-        showlegend=False, margin=dict(t=20, b=20),
-        yaxis=dict(gridcolor="#2a2d3e"),
-        font=dict(color="#FAFAFA"),
-    )
-    fig.update_traces(textposition="outside")
-    return fig
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_salesmen() -> pd.DataFrame:
+    return run_query(
+        "SELECT SalesManID, FullName FROM MsSalesmanMaster "
+        "WHERE ResignDate IS NULL ORDER BY FullName"
+    )
+
+
+def _build_query(brand_ids: tuple, salesman_ids: tuple) -> tuple[str, tuple]:
+    """Return (sql, params) with optional brand / salesman IN-filters.
+
+    Party deduplication: ROW_NUMBER picks the highest-debit party per voucher,
+    which is always the customer on a sales invoice.
+
+    Service items (ItemID LIKE 'S%', e.g. TCS, transport charges) are excluded
+    so only actual liquor line-items contribute to revenue.
+    """
+    type_ph   = ",".join("?" * len(SALES_TYPES))
+    brand_sql = sm_sql = ""
+    extra: tuple = ()
+
+    if brand_ids:
+        brand_sql = f"AND vi.BrandID IN ({','.join('?' * len(brand_ids))})"
+        extra += brand_ids
+    if salesman_ids:
+        sm_sql = f"AND h.SalesManID IN ({','.join('?' * len(salesman_ids))})"
+        extra += salesman_ids
+
+    sql = f"""
+        SELECT
+            h.VoucherDate,
+            h.VoucherNo,
+            h.SalesManID,
+            ISNULL(sm.FullName,       'Unassigned') AS SalesmanName,
+            ISNULL(d.PartyID,         '')            AS PartyID,
+            ISNULL(p.PartyName,       'Unknown')     AS PartyName,
+            ISNULL(b.BrandName,       'Unknown')     AS BrandName,
+            ISNULL(im.ItemDescription,'Unknown')     AS ItemDescription,
+            ISNULL(im.LiquorSize,     '')            AS LiquorSize,
+            CAST(vi.CaseQty        AS BIGINT) AS CaseQty,
+            CAST(vi.BottleQty      AS BIGINT) AS BottleQty,
+            CAST(vi.TotalBottleQty AS BIGINT) AS TotalBottleQty,
+            CAST(vi.TotalAmount    AS FLOAT)  AS TotalAmount
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'          -- exclude service/charge rows (S%)
+        LEFT JOIN (
+            -- One party per voucher: pick the largest debit (= the customer)
+            SELECT TransTypeID, VoucherNo, PartyID
+            FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY TransTypeID, VoucherNo
+                           ORDER BY Amount DESC
+                       ) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
+            ) x
+            WHERE rn = 1
+        ) d  ON  d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        LEFT JOIN MsPartyMaster    p  ON p.PartyID    = d.PartyID
+        LEFT JOIN MsItemMaster     im ON im.ItemID    = vi.ItemID
+        LEFT JOIN MsBrandMaster    b  ON b.BrandID    = im.BrandID   -- brand from item master, not voucher item
+        LEFT JOIN MsSalesmanMaster sm ON sm.SalesManID = h.SalesManID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND vi.FreeItemYN = 'N'
+          {brand_sql}
+          {sm_sql}
+          AND CAST(h.VoucherDate AS date) BETWEEN CAST(? AS date) AND CAST(? AS date)
+    """
+    return sql, extra
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_sales(
+    start: date,
+    end: date,
+    brand_ids: tuple = (),
+    salesman_ids: tuple = (),
+) -> pd.DataFrame:
+    sql, extra = _build_query(brand_ids, salesman_ids)
+    params = SALES_TYPES + extra + (str(start), str(end))
+    df = run_query(sql, params)
+    if df.empty:
+        return df
+    df["VoucherDate"] = pd.to_datetime(df["VoucherDate"])
+    df["TotalAmount"] = pd.to_numeric(df["TotalAmount"], errors="coerce").fillna(0.0)
+    df["CaseQty"]     = pd.to_numeric(df["CaseQty"],     errors="coerce").fillna(0).astype(int)
+    df["BottleQty"]   = pd.to_numeric(df["BottleQty"],   errors="coerce").fillna(0).astype(int)
+    return df
+
+
+# ── Chart builders ──────────────────────────────────────────────────────────
 
 def _daily_trend(df: pd.DataFrame) -> go.Figure:
-    agg = (df.groupby(df["order_date"].dt.date)["amount"].sum()
-             .reset_index()
-             .rename(columns={"order_date": "date"}))
+    agg = (
+        df.groupby(df["VoucherDate"].dt.date)["TotalAmount"]
+        .sum().reset_index()
+        .rename(columns={"VoucherDate": "Date", "TotalAmount": "Sales"})
+    )
     fig = px.line(
-        agg, x="date", y="amount",
-        labels={"date": "Date", "amount": "Daily Sales (₹)"},
-        markers=True,
-        color_discrete_sequence=[GOLD],
+        agg, x="Date", y="Sales", markers=True,
+        color_discrete_sequence=[_GOLD],
+        labels={"Sales": "Sales (₹)", "Date": ""},
     )
-    fig.update_layout(
-        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
-        margin=dict(t=20, b=20),
-        xaxis=dict(gridcolor="#2a2d3e"),
-        yaxis=dict(gridcolor="#2a2d3e"),
-        font=dict(color="#FAFAFA"),
-    )
+    fig.update_layout(**_LAYOUT, xaxis=_GRID, yaxis=_GRID)
     fig.update_traces(line_width=2.5, marker_size=5)
     return fig
 
 
-def _sales_by_customer(df: pd.DataFrame, top_n: int = 10) -> go.Figure:
-    agg = (df.groupby("customer")["amount"].sum()
-             .sort_values(ascending=False)
-             .head(top_n)
-             .reset_index())
+def _brand_bar(df: pd.DataFrame) -> go.Figure:
+    agg = (
+        df.groupby("BrandName")["TotalAmount"].sum()
+        .sort_values().tail(15).reset_index()
+    )
     fig = px.bar(
-        agg, x="amount", y="customer",
-        orientation="h",
-        color="amount",
-        color_continuous_scale=["#1A3A5C", GOLD],
-        labels={"customer": "Customer", "amount": "Sales (₹)"},
-        text_auto=".2s",
+        agg, x="TotalAmount", y="BrandName", orientation="h",
+        color="TotalAmount", color_continuous_scale=["#1A3A5C", _GOLD],
+        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "BrandName": ""},
     )
-    fig.update_layout(
-        paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
-        showlegend=False, margin=dict(t=20, b=20),
-        yaxis=dict(autorange="reversed", gridcolor="#2a2d3e"),
-        xaxis=dict(gridcolor="#2a2d3e"),
-        coloraxis_showscale=False,
-        font=dict(color="#FAFAFA"),
-    )
+    fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
+                      yaxis=dict(autorange="reversed", **_GRID), xaxis=_GRID)
     fig.update_traces(textposition="outside")
     return fig
 
 
-# ---------------------------------------------------------------------------
-# Page
-# ---------------------------------------------------------------------------
+def _brand_donut(df: pd.DataFrame) -> go.Figure:
+    agg = (
+        df.groupby("BrandName")["TotalAmount"].sum()
+        .sort_values(ascending=False).reset_index()
+    )
+    if len(agg) > 10:
+        top   = agg.head(10)
+        other = pd.DataFrame([{
+            "BrandName": "Others",
+            "TotalAmount": agg.iloc[10:]["TotalAmount"].sum(),
+        }])
+        agg = pd.concat([top, other], ignore_index=True)
+    fig = px.pie(
+        agg, names="BrandName", values="TotalAmount",
+        hole=0.42, color_discrete_sequence=_PAL,
+    )
+    fig.update_layout(**_LAYOUT, legend=dict(font=dict(size=11)))
+    fig.update_traces(textinfo="label+percent",
+                      pull=[0.05] + [0] * (len(agg) - 1))
+    return fig
+
+
+def _salesman_bar(df: pd.DataFrame) -> go.Figure:
+    agg = (
+        df.groupby("SalesmanName")["TotalAmount"].sum()
+        .sort_values(ascending=False).reset_index()
+    )
+    fig = px.bar(
+        agg, x="SalesmanName", y="TotalAmount",
+        color="SalesmanName", color_discrete_sequence=_PAL,
+        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "SalesmanName": ""},
+    )
+    fig.update_layout(**_LAYOUT, showlegend=False,
+                      xaxis=dict(tickangle=-30, **_GRID), yaxis=_GRID)
+    fig.update_traces(textposition="outside")
+    return fig
+
+
+def _customer_bar(df: pd.DataFrame) -> go.Figure:
+    agg = (
+        df[df["PartyName"] != "Unknown"]
+        .groupby("PartyName")["TotalAmount"].sum()
+        .sort_values().tail(10).reset_index()
+    )
+    fig = px.bar(
+        agg, x="TotalAmount", y="PartyName", orientation="h",
+        color="TotalAmount", color_continuous_scale=["#1A3A5C", _GOLD],
+        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "PartyName": ""},
+    )
+    fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
+                      yaxis=dict(autorange="reversed", **_GRID), xaxis=_GRID)
+    fig.update_traces(textposition="outside")
+    return fig
+
+
+def _size_bar(df: pd.DataFrame) -> go.Figure:
+    agg = (
+        df[df["LiquorSize"] != ""]
+        .groupby("LiquorSize")["TotalAmount"].sum()
+        .sort_values(ascending=False).reset_index()
+    )
+    fig = px.bar(
+        agg, x="LiquorSize", y="TotalAmount",
+        color="LiquorSize", color_discrete_sequence=_PAL,
+        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "LiquorSize": "Size"},
+    )
+    fig.update_layout(**_LAYOUT, showlegend=False,
+                      xaxis=_GRID, yaxis=_GRID)
+    fig.update_traces(textposition="outside")
+    return fig
+
+
+# ── Page entry point ────────────────────────────────────────────────────────
 
 def render():
     st.title("Sales & Revenue")
-    st.caption("All figures in Indian Rupees (₹). Using sample data — connect your DB to see live numbers.")
 
-    # ── Filters ────────────────────────────────────────────────────────────
+    # ── Pre-load filter option lists ──────────────────────────────────────
+    brands_df   = _load_brands()
+    salesmen_df = _load_salesmen()
+
+    # ── Sidebar filters ───────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("#### Filters")
-        start, end = date_filter(key_prefix="sales")
 
-    # ── Data ───────────────────────────────────────────────────────────────
-    # TODO: replace with real query once table names are confirmed
-    # from db import run_query
-    # df = run_query(f"""
-    #     SELECT order_date, brand, customer, quantity, rate, amount
-    #     FROM   dbo.SalesTransactions
-    #     WHERE  order_date BETWEEN '{start}' AND '{end}'
-    # """)
-    df = _mock_transactions(start, end)
+        today = date.today()
+        fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            start = st.date_input("From", value=fy_start, key="s_from")
+        with c2:
+            end = st.date_input("To", value=today, key="s_to")
+
+        if start > end:
+            st.warning("Start date must be before end date.")
+            return
+
+        # Brand filter
+        brand_map: dict[str, int] = {}
+        if not brands_df.empty:
+            brand_map = dict(zip(brands_df["BrandName"], brands_df["BrandID"].astype(int)))
+        sel_brands = st.multiselect("Brand", options=sorted(brand_map), key="s_brands")
+        brand_ids  = tuple(brand_map[b] for b in sel_brands)
+
+        # Salesman filter
+        sm_map: dict[str, str] = {}
+        if not salesmen_df.empty:
+            sm_map = dict(zip(salesmen_df["FullName"], salesmen_df["SalesManID"]))
+        sel_sm    = st.multiselect("Salesman", options=sorted(sm_map), key="s_sm")
+        salesman_ids = tuple(sm_map[s] for s in sel_sm)
+
+    # ── Fetch main period data ─────────────────────────────────────────────
+    with st.spinner("Fetching sales data..."):
+        df = _load_sales(start, end, brand_ids, salesman_ids)
 
     if df.empty:
-        st.warning("No data found for the selected date range.")
+        st.error(
+            "No sales data returned for the selected range. "
+            "Check your database connection or adjust the date filter."
+        )
+        st.info(
+            "Ensure `.env` is filled and the `KWPL` login has access to `KW2526`. "
+            "Run `python db_explorer.py` to verify connectivity."
+        )
         return
 
-    # ── KPI Cards ──────────────────────────────────────────────────────────
-    total_sales = df["amount"].sum()
-    total_orders = len(df)
-    avg_order_value = df["amount"].mean()
-    top_brand = df.groupby("brand")["amount"].sum().idxmax()
+    # ── Fetch prior period for delta (same number of days, immediately before)
+    n_days     = max((end - start).days, 1)
+    prev_end   = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=n_days - 1)
+    df_prev = _load_sales(prev_start, prev_end, brand_ids, salesman_ids)
 
-    section_header("Key Performance Indicators")
+    # ── KPI calculations ───────────────────────────────────────────────────
+    total_rev   = df["TotalAmount"].sum()
+    total_cases = int(df["CaseQty"].sum())
+    total_inv   = df["VoucherNo"].nunique()
+    top_brand   = df.groupby("BrandName")["TotalAmount"].sum().idxmax()
+
+    prev_rev  = df_prev["TotalAmount"].sum() if not df_prev.empty else 0.0
+    rev_delta = format_inr(total_rev - prev_rev) if prev_rev else None
+
+    # ── KPI cards ─────────────────────────────────────────────────────────
+    section_header(
+        "Key Performance Indicators",
+        f"{start.strftime('%d %b %Y')}  →  {end.strftime('%d %b %Y')}",
+    )
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        kpi_card("Total Sales", format_inr(total_sales))
+        st.metric("Total Revenue", format_inr(total_rev),
+                  delta=rev_delta, delta_color="normal")
     with k2:
-        kpi_card("Total Orders", f"{total_orders:,}")
+        st.metric("Total Cases Sold", f"{total_cases:,}")
     with k3:
-        kpi_card("Avg Order Value", format_inr(avg_order_value))
+        st.metric("Total Invoices", f"{total_inv:,}")
     with k4:
-        kpi_card("Top Brand", top_brand)
+        st.metric("Top Brand", top_brand)
 
     st.divider()
 
-    # ── Charts ─────────────────────────────────────────────────────────────
-    section_header("Sales by Brand")
-    st.plotly_chart(_sales_by_brand(df), use_container_width=True)
-
+    # ── Daily Sales Trend (full width) ─────────────────────────────────────
     section_header("Daily Sales Trend")
     st.plotly_chart(_daily_trend(df), use_container_width=True)
 
-    section_header("Top 10 Customers by Sales")
-    st.plotly_chart(_sales_by_customer(df), use_container_width=True)
+    # ── Brand bar + Brand donut (side by side) ─────────────────────────────
+    st.markdown("---")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.subheader("Sales by Brand (Top 15)")
+        st.plotly_chart(_brand_bar(df), use_container_width=True)
+    with col_b:
+        st.subheader("Brand Mix")
+        st.plotly_chart(_brand_donut(df), use_container_width=True)
 
-    # ── Recent Transactions ────────────────────────────────────────────────
-    section_header("Recent Transactions")
-    display_df = df.head(50).copy()
-    display_df["order_date"] = display_df["order_date"].dt.strftime("%d %b %Y")
-    display_df["amount"] = display_df["amount"].apply(lambda x: f"₹{x:,.2f}")
-    display_df["rate"] = display_df["rate"].apply(lambda x: f"₹{x:,.2f}")
-    display_df.columns = ["Date", "Brand", "Customer", "Qty", "Rate", "Amount"]
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # ── Salesman (full width) ──────────────────────────────────────────────
+    st.markdown("---")
+    section_header("Sales by Salesman")
+    st.plotly_chart(_salesman_bar(df), use_container_width=True)
+
+    # ── Customers + Liquor Size (side by side) ─────────────────────────────
+    st.markdown("---")
+    col_c, col_d = st.columns(2)
+    with col_c:
+        st.subheader("Top 10 Customers")
+        st.plotly_chart(_customer_bar(df), use_container_width=True)
+    with col_d:
+        st.subheader("Liquor Size Analysis")
+        st.plotly_chart(_size_bar(df), use_container_width=True)
+
+    # ── Transactions table ─────────────────────────────────────────────────
+    st.markdown("---")
+    section_header("Recent Transactions", "Latest 200 records · sorted by date desc")
+
+    disp = df.sort_values("VoucherDate", ascending=False).head(200).copy()
+    disp["Date"]    = disp["VoucherDate"].dt.strftime("%d %b %Y")
+    disp["Amount"]  = disp["TotalAmount"].apply(_inr)
+    disp["Cases"]   = disp["CaseQty"].astype(int)
+    disp["Bottles"] = disp["BottleQty"].astype(int)
+
+    st.dataframe(
+        disp[[
+            "Date", "VoucherNo", "PartyName", "BrandName",
+            "ItemDescription", "LiquorSize", "Cases", "Bottles", "Amount",
+        ]].rename(columns={
+            "VoucherNo":        "Invoice",
+            "PartyName":        "Party",
+            "BrandName":        "Brand",
+            "ItemDescription":  "Item",
+            "LiquorSize":       "Size",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 render()

@@ -36,5 +36,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Generated / local exploration files
+db_structure.txt
+streamlit_*.txt
+streamlit_*.log
+
 # Jupyter
 .ipynb_checkpoints/
