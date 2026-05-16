@@ -54,18 +54,41 @@ def _load_salesmen() -> pd.DataFrame:
     )
 
 
-def _build_query(brand_ids: tuple, salesman_ids: tuple) -> tuple[str, tuple]:
+def _financial_years(start: date, end: date) -> tuple[str, ...]:
+    """Return every financial year (Apr–Mar) that overlaps the date range.
+
+    Format matches TrVocItem.FinancialYear: '2026-2027'.
+    TrVocItem stores rows for BOTH the old and current FY for the same
+    (TT, VoucherNo, SerialNo) — filtering by the correct FY eliminates the
+    duplicate and halves the inflated revenue figure.
+    """
+    def _fy_start(d: date) -> int:
+        return d.year if d.month >= 4 else d.year - 1
+
+    fy1 = _fy_start(start)
+    fy2 = _fy_start(end)
+    return tuple(f"{y}-{y + 1}" for y in range(fy1, fy2 + 1))
+
+
+def _build_query(
+    brand_ids: tuple,
+    salesman_ids: tuple,
+    fy_years: tuple,
+) -> tuple[str, tuple]:
     """Return (sql, params) with optional brand / salesman IN-filters.
 
-    Party deduplication: ROW_NUMBER picks the highest-debit party per voucher,
-    which is always the customer on a sales invoice.
+    FinancialYear filter: TrVocItem contains duplicate rows for the same
+    (TransTypeID, VoucherNo, SerialNo) tagged with the prior year AND the
+    current year. Filtering vi.FinancialYear to only the correct FY(s)
+    removes the duplicates and matches the ERP brandwise sales figure.
 
-    Service items (ItemID LIKE 'S%', e.g. TCS, transport charges) are excluded
-    so only actual liquor line-items contribute to revenue.
+    Service items (ItemID LIKE 'S%', e.g. TCS, transport charges) are
+    excluded so only actual liquor line-items contribute to revenue.
     """
     type_ph   = ",".join("?" * len(SALES_TYPES))
+    fy_ph     = ",".join("?" * len(fy_years))
     brand_sql = sm_sql = ""
-    extra: tuple = ()
+    extra: tuple = tuple(fy_years)   # FinancialYear params come first in extra
 
     if brand_ids:
         brand_sql = f"AND vi.BrandID IN ({','.join('?' * len(brand_ids))})"
@@ -94,6 +117,7 @@ def _build_query(brand_ids: tuple, salesman_ids: tuple) -> tuple[str, tuple]:
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID LIKE 'I%'          -- exclude service/charge rows (S%)
+            AND vi.FinancialYear IN ({fy_ph}) -- key dedup: one FY row per item line
         LEFT JOIN (
             -- One party per voucher: pick the largest debit (= the customer)
             SELECT TransTypeID, VoucherNo, PartyID
@@ -129,7 +153,12 @@ def _load_sales(
     brand_ids: tuple = (),
     salesman_ids: tuple = (),
 ) -> pd.DataFrame:
-    sql, extra = _build_query(brand_ids, salesman_ids)
+    fy_years = _financial_years(start, end)
+    sql, extra = _build_query(brand_ids, salesman_ids, fy_years)
+    # params order must match SQL placeholders:
+    #   1. SALES_TYPES  → TransTypeID IN (...)
+    #   2. extra        → FinancialYear IN (...), then brand_ids, then salesman_ids
+    #   3. start, end   → VoucherDate BETWEEN
     params = SALES_TYPES + extra + (str(start), str(end))
     df = run_query(sql, params)
     if df.empty:
