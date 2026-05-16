@@ -43,40 +43,57 @@ PRINCIPAL_COLORS = {
 # ── Preferred column order for heatmap ─────────────────────────────────────
 CHANNEL_ORDER = [
     "MOP - Wine Shops",
+    "Retail",
     "POP - Permit Rooms",
     "Beer Shopee",
+    "KW Beer",
+    "Beer Cross Supply",
     "KW Institution",
     "PCMC Institution",
-    "KW Insti One Day",
-    "Retail",
     "FL-IV Club",
     "Other",
 ]
 
 # ── Short display labels for salesman bar chart Y-axis ─────────────────────
 _SHORT_LABELS: dict[str, str] = {
+    # Institution teams (AcType3ID-driven — highest priority)
+    "Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Institution)":
+        "SD/Pranav/DP/AR — KW Institution",
+    "Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)":
+        "Amol/Gajendra/Rahul — PCMC",
+    # Cross Supply teams
+    "Shashank / Sachin (USL - Cross Supply)":
+        "Shashank/Sachin — USL Cross Supply",
+    "Ajay / Deepak (Diageo - Cross Supply)":
+        "Ajay/Deepak — Diageo Cross Supply",
+    "Ajay / Deepak (BF - Cross Supply)":
+        "Ajay/Deepak — BF Cross Supply",
+    "Cross Supply - No Assigned Salesman (UBL)":
+        "Cross Supply — UBL (no salesman)",
+    "Cross Supply - No Assigned Salesman":
+        "Cross Supply — No Salesman",
+    # KW Beer
+    "Aabid / Omkar (UBL - KW Beer)":
+        "Aabid/Omkar — UBL KW Beer",
+    # USL / Diageo / BF — Wine Shops & Retail
     "Shashank / Sachin (USL - Wine Shops)":
         "Shashank/Sachin — USL Wine Shops",
     "Ajay / Deepak (Diageo - Wine Shops)":
         "Ajay/Deepak — Diageo Wine Shops",
     "Ajay / Deepak (BF - Wine Shops)":
         "Ajay/Deepak — BF Wine Shops",
+    # Permit Room teams
     "Aabid / Omkar (BF - Permit Rooms)":
         "Aabid/Omkar — BF Permit Rooms",
     "Miran / Rohit / Tulsi / Atish / Saurabh / Prashant (USL+Diageo - POP)":
         "Miran+Team — USL+Diageo POP",
+    # UBL teams
     "Aabid / Omkar (UBL - Wine Shops)":
         "Aabid/Omkar — UBL Wine Shops",
     "Aabid / Omkar (UBL - Beer Shopee)":
         "Aabid/Omkar — UBL Beer Shopee",
     "Aabid / Omkar (UBL - Permit Rooms)":
         "Aabid/Omkar — UBL Permit Rooms",
-    "Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Institution)":
-        "SD/Pranav/DP/AR — KW Insti",
-    "Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Insti One Day)":
-        "SD/Pranav/DP/AR — KW 1Day",
-    "Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)":
-        "Amol/Gajendra/Rahul — PCMC",
     "Other / Unassigned": "Other / Unassigned",
 }
 
@@ -171,46 +188,76 @@ def _load_data(start: date, end: date) -> pd.DataFrame:
 
             /* ── Salesman Team attribution ── */
             CASE
-              WHEN b.CompanyID = 'C00025' AND p.ClassID = '060021'
-                THEN 'Shashank / Sachin (USL - Wine Shops)'
-              WHEN b.CompanyID = 'C00040' AND p.ClassID = '060021'
-                THEN 'Ajay / Deepak (Diageo - Wine Shops)'
-              WHEN b.CompanyID = 'C00056' AND p.ClassID = '060021'
-                THEN 'Ajay / Deepak (BF - Wine Shops)'
-              WHEN b.CompanyID = 'C00056' AND p.ClassID = '060004'
-                THEN 'Aabid / Omkar (BF - Permit Rooms)'
-              WHEN b.CompanyID IN ('C00025','C00040')
-                AND p.ClassID = '060004'
-                AND (p.AcType3ID IS NULL
-                     OR p.AcType3ID NOT IN ('130004','130002','130006'))
-                THEN 'Miran / Rohit / Tulsi / Atish / Saurabh / Prashant (USL+Diageo - POP)'
-              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060021'
-                THEN 'Aabid / Omkar (UBL - Wine Shops)'
-              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060008'
-                THEN 'Aabid / Omkar (UBL - Beer Shopee)'
-              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060004'
-                AND (p.AcType3ID IS NULL
-                     OR p.AcType3ID NOT IN ('130004','130002','130006'))
-                THEN 'Aabid / Omkar (UBL - Permit Rooms)'
-              WHEN p.AcType3ID = '130004'
+              -- KW INSTITUTION (130004 or 130006) — institution team always wins
+              WHEN p.AcType3ID IN ('130004','130006')
                 THEN 'Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Institution)'
-              WHEN p.AcType3ID = '130006'
-                THEN 'Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Insti One Day)'
+
+              -- PCMC INSTITUTION (130002)
               WHEN p.AcType3ID = '130002'
                 THEN 'Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)'
+
+              -- BEER CROSS SUPPLY (130007) — by principal
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025'
+                THEN 'Shashank / Sachin (USL - Cross Supply)'
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040'
+                THEN 'Ajay / Deepak (Diageo - Cross Supply)'
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00056'
+                THEN 'Ajay / Deepak (BF - Cross Supply)'
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00039'
+                THEN 'Cross Supply - No Assigned Salesman (UBL)'
+              WHEN p.AcType3ID = '130007'
+                THEN 'Cross Supply - No Assigned Salesman'
+
+              -- KW BEER (130001) — Aabid & Omkar all channels
+              WHEN p.AcType3ID = '130001'
+                THEN 'Aabid / Omkar (UBL - KW Beer)'
+
+              -- UNITED SPIRITS (C00025) — Wine shops & Retail
+              WHEN b.CompanyID = 'C00025' AND p.ClassID IN ('060021','060020')
+                THEN 'Shashank / Sachin (USL - Wine Shops)'
+
+              -- DIAGEO (C00040) — Wine shops & Retail
+              WHEN b.CompanyID = 'C00040' AND p.ClassID IN ('060021','060020')
+                THEN 'Ajay / Deepak (Diageo - Wine Shops)'
+
+              -- BROWN-FORMAN (C00056) — Wine shops & Retail
+              WHEN b.CompanyID = 'C00056' AND p.ClassID IN ('060021','060020')
+                THEN 'Ajay / Deepak (BF - Wine Shops)'
+
+              -- BROWN-FORMAN — Permit Rooms
+              WHEN b.CompanyID = 'C00056' AND p.ClassID = '060004'
+                THEN 'Aabid / Omkar (BF - Permit Rooms)'
+
+              -- USL + DIAGEO — regular Permit Rooms
+              WHEN b.CompanyID IN ('C00025','C00040') AND p.ClassID = '060004'
+                THEN 'Miran / Rohit / Tulsi / Atish / Saurabh / Prashant (USL+Diageo - POP)'
+
+              -- UBL — Wine Shops & Retail
+              WHEN b.CompanyID = 'C00039' AND p.ClassID IN ('060021','060020')
+                THEN 'Aabid / Omkar (UBL - Wine Shops)'
+
+              -- UBL — Beer Shopee
+              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060008'
+                THEN 'Aabid / Omkar (UBL - Beer Shopee)'
+
+              -- UBL — regular Permit Rooms
+              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060004'
+                THEN 'Aabid / Omkar (UBL - Permit Rooms)'
+
               ELSE 'Other / Unassigned'
             END AS SalesmanTeam,
 
             /* ── Channel label ── */
             CASE
-              WHEN p.ClassID = '060021' THEN 'MOP - Wine Shops'
-              WHEN p.ClassID = '060004' AND p.AcType3ID = '130004' THEN 'KW Institution'
-              WHEN p.ClassID = '060004' AND p.AcType3ID = '130002' THEN 'PCMC Institution'
-              WHEN p.ClassID = '060004' AND p.AcType3ID = '130006' THEN 'KW Insti One Day'
-              WHEN p.ClassID = '060004' THEN 'POP - Permit Rooms'
-              WHEN p.ClassID = '060008' THEN 'Beer Shopee'
-              WHEN p.ClassID = '060020' THEN 'Retail'
-              WHEN p.ClassID = '060005' THEN 'FL-IV Club'
+              WHEN p.AcType3ID = '130007'               THEN 'Beer Cross Supply'
+              WHEN p.AcType3ID = '130001'               THEN 'KW Beer'
+              WHEN p.AcType3ID IN ('130004','130006')   THEN 'KW Institution'
+              WHEN p.AcType3ID = '130002'               THEN 'PCMC Institution'
+              WHEN p.ClassID   = '060021'               THEN 'MOP - Wine Shops'
+              WHEN p.ClassID   = '060020'               THEN 'Retail'
+              WHEN p.ClassID   = '060004'               THEN 'POP - Permit Rooms'
+              WHEN p.ClassID   = '060008'               THEN 'Beer Shopee'
+              WHEN p.ClassID   = '060005'               THEN 'FL-IV Club'
               ELSE 'Other'
             END AS Channel,
 
@@ -401,7 +448,7 @@ def _chart_heatmap(df: pd.DataFrame) -> go.Figure:
 
 def _chart_institution_bar(df: pd.DataFrame) -> go.Figure:
     """Side-by-side bar — KW vs PCMC Institution revenue by principal."""
-    inst_channels = ["KW Institution", "PCMC Institution", "KW Insti One Day"]
+    inst_channels = ["KW Institution", "PCMC Institution"]
     agg = (
         df[df["Channel"].isin(inst_channels)]
         .groupby(["Channel", "Principal"])["TotalAmount"]
@@ -483,9 +530,10 @@ def render():
         sel_channels = st.multiselect(
             "Channel",
             options=[
-                "MOP - Wine Shops", "POP - Permit Rooms", "Beer Shopee",
-                "KW Institution", "PCMC Institution", "KW Insti One Day",
-                "Retail", "FL-IV Club", "Others",
+                "MOP - Wine Shops", "Retail", "POP - Permit Rooms",
+                "Beer Shopee", "KW Beer", "Beer Cross Supply",
+                "KW Institution", "PCMC Institution",
+                "FL-IV Club", "Others",
             ],
             key="sm_channels",
         )
@@ -596,7 +644,7 @@ def render():
 
     # ── Chart 5: Institution breakdown (shown only when data exists) ───────
     inst_df = df[df["Channel"].isin(
-        ["KW Institution", "PCMC Institution", "KW Insti One Day"]
+        ["KW Institution", "PCMC Institution"]
     )]
     if not inst_df.empty:
         st.markdown("---")
