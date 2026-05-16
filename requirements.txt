@@ -1,5 +1,5 @@
 streamlit>=1.32.0
-pyodbc>=5.0.0
+pymssql>=2.2.0
 pandas>=2.0.0
 plotly>=5.18.0
 python-dotenv>=1.0.0
