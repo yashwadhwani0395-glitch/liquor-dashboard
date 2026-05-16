@@ -47,7 +47,7 @@ with st.sidebar:
     st.markdown("#### Navigation")
     page = st.radio(
         label="page",
-        options=["Sales & Revenue", "Salesman & Channels"],
+        options=["Sales & Revenue", "Salesman & Channels", "Distribution"],
         label_visibility="collapsed",
     )
 
@@ -78,4 +78,7 @@ if page == "Sales & Revenue":
     render()
 elif page == "Salesman & Channels":
     from pages.salesman import render
+    render()
+elif page == "Distribution":
+    from pages.distribution import render
     render()
