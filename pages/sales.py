@@ -54,20 +54,48 @@ def _load_salesmen() -> pd.DataFrame:
     )
 
 
-def _financial_years(start: date, end: date) -> tuple[str, ...]:
-    """Return every financial year (Apr–Mar) that overlaps the date range.
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_fy_years(start: date, end: date) -> tuple[str, ...]:
+    """Ask the DB which FinancialYear values exist in TrVocItem for this range.
 
-    Format matches TrVocItem.FinancialYear: '2026-2027'.
-    TrVocItem stores rows for BOTH the old and current FY for the same
-    (TT, VoucherNo, SerialNo) — filtering by the correct FY eliminates the
-    duplicate and halves the inflated revenue figure.
+    TrVocItem stores rows for BOTH the prior FY and the current FY for the
+    same (TransTypeID, VoucherNo, SerialNo).  We must keep only the rows
+    that belong to the date range's actual financial year(s); using whatever
+    strings the DB itself returns avoids any format-mismatch on cloud hosts.
+
+    Params order in the query: start, end  →  SALES_TYPES
     """
-    def _fy_start(d: date) -> int:
+    type_ph = ",".join("?" * len(SALES_TYPES))
+    df = run_query(
+        f"""
+        SELECT DISTINCT vi.FinancialYear
+        FROM TrVocItem vi
+        JOIN TrVocHead h
+            ON  h.TransTypeID = vi.TransTypeID
+            AND h.VoucherNo   = vi.VoucherNo
+        WHERE h.VoucherDate BETWEEN ? AND ?
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled = 'N'
+        """,
+        (str(start), str(end)) + SALES_TYPES,
+    )
+    if df.empty:
+        return ()
+
+    # Keep only the FY(s) that actually fall within the date range.
+    # The DB may return the prior FY tag; we discard it by comparing the
+    # year-start embedded in the string (e.g. '2026' in '2026-2027') to the
+    # April-1 boundary of the selected range.
+    def _fy_start_year(d: date) -> int:
         return d.year if d.month >= 4 else d.year - 1
 
-    fy1 = _fy_start(start)
-    fy2 = _fy_start(end)
-    return tuple(f"{y}-{y + 1}" for y in range(fy1, fy2 + 1))
+    valid_starts = {_fy_start_year(start), _fy_start_year(end)}
+    result = tuple(
+        fy for fy in df["FinancialYear"].tolist()
+        if fy and int(fy[:4]) in valid_starts
+    )
+    # Fallback: if the filter removed everything, use all DB-returned values
+    return result if result else tuple(df["FinancialYear"].dropna().tolist())
 
 
 def _build_query(
@@ -75,21 +103,32 @@ def _build_query(
     salesman_ids: tuple,
     fy_years: tuple,
 ) -> tuple[str, tuple]:
-    """Return (sql, params) with optional brand / salesman IN-filters.
+    """Return (sql, params) with optional brand / salesman / FY IN-filters.
 
     FinancialYear filter: TrVocItem contains duplicate rows for the same
     (TransTypeID, VoucherNo, SerialNo) tagged with the prior year AND the
-    current year. Filtering vi.FinancialYear to only the correct FY(s)
+    current year.  Filtering vi.FinancialYear to only the correct FY(s)
     removes the duplicates and matches the ERP brandwise sales figure.
 
-    Service items (ItemID LIKE 'S%', e.g. TCS, transport charges) are
-    excluded so only actual liquor line-items contribute to revenue.
+    IMPORTANT — params order must match ? placeholders left-to-right in SQL:
+        1. SALES_TYPES   → TransTypeID IN (...)        [WHERE]
+        2. fy_years      → FinancialYear IN (...)       [WHERE]
+        3. brand_ids     → BrandID IN (...)             [WHERE, optional]
+        4. salesman_ids  → SalesManID IN (...)          [WHERE, optional]
+        5. start, end    → VoucherDate BETWEEN          [WHERE]
+
+    The FinancialYear IN clause lives in WHERE (not the JOIN) so its
+    placeholders come after the TransTypeID placeholders — keeping the
+    params tuple in the same left-to-right order as the SQL.
     """
     type_ph   = ",".join("?" * len(SALES_TYPES))
     fy_ph     = ",".join("?" * len(fy_years))
-    brand_sql = sm_sql = ""
-    extra: tuple = tuple(fy_years)   # FinancialYear params come first in extra
+    brand_sql = sm_sql = fy_sql = ""
+    extra: tuple = ()
 
+    if fy_years:
+        fy_sql = f"AND vi.FinancialYear IN ({fy_ph})"
+        extra += tuple(fy_years)
     if brand_ids:
         brand_sql = f"AND vi.BrandID IN ({','.join('?' * len(brand_ids))})"
         extra += brand_ids
@@ -117,7 +156,6 @@ def _build_query(
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID LIKE 'I%'          -- exclude service/charge rows (S%)
-            AND vi.FinancialYear IN ({fy_ph}) -- key dedup: one FY row per item line
         LEFT JOIN (
             -- One party per voucher: pick the largest debit (= the customer)
             SELECT TransTypeID, VoucherNo, PartyID
@@ -134,11 +172,12 @@ def _build_query(
         ) d  ON  d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
         LEFT JOIN MsPartyMaster    p  ON p.PartyID    = d.PartyID
         LEFT JOIN MsItemMaster     im ON im.ItemID    = vi.ItemID
-        LEFT JOIN MsBrandMaster    b  ON b.BrandID    = im.BrandID   -- brand from item master, not voucher item
+        LEFT JOIN MsBrandMaster    b  ON b.BrandID    = im.BrandID
         LEFT JOIN MsSalesmanMaster sm ON sm.SalesManID = h.SalesManID
         WHERE h.TransTypeID IN ({type_ph})
           AND h.Cancelled   = 'N'
           AND vi.FreeItemYN = 'N'
+          {fy_sql}
           {brand_sql}
           {sm_sql}
           AND CAST(h.VoucherDate AS date) BETWEEN CAST(? AS date) AND CAST(? AS date)
@@ -153,12 +192,9 @@ def _load_sales(
     brand_ids: tuple = (),
     salesman_ids: tuple = (),
 ) -> pd.DataFrame:
-    fy_years = _financial_years(start, end)
+    fy_years = _load_fy_years(start, end)
     sql, extra = _build_query(brand_ids, salesman_ids, fy_years)
-    # params order must match SQL placeholders:
-    #   1. SALES_TYPES  → TransTypeID IN (...)
-    #   2. extra        → FinancialYear IN (...), then brand_ids, then salesman_ids
-    #   3. start, end   → VoucherDate BETWEEN
+    # params order: SALES_TYPES → extra (fy, brand, sm) → start, end
     params = SALES_TYPES + extra + (str(start), str(end))
     df = run_query(sql, params)
     if df.empty:
