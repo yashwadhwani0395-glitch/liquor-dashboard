@@ -56,52 +56,48 @@ CHANNEL_ORDER = [
 
 # ── Short display labels for salesman bar chart Y-axis ─────────────────────
 _SHORT_LABELS: dict[str, str] = {
-    # Institution teams (AcType3ID-driven — highest priority)
-    "Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Institution)":
-        "SD/Pranav/DP/AR — KW Institution",
-    "Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)":
-        "Amol/Gajendra/Rahul — PCMC",
-    # Cross Supply — USL
+    # USL teams
+    "Shashank / Sachin (USL - Wine Shops FL-II)":
+        "Shashank/Sachin — USL Wine Shops",
+    "Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Permit Rooms FL-III)":
+        "Tulsiram+Team — USL Permit Rooms",
     "Shashank / Sachin (USL - Cross Supply Wine Shop)":
         "Shashank/Sachin — USL CS Wine Shop",
     "Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Cross Supply Permit Room)":
         "Tulsiram+Team — USL CS Permit Room",
-    "Shashank / Sachin (USL - Cross Supply Other)":
-        "Shashank/Sachin — USL CS Other",
-    # Cross Supply — Diageo
+    "Shashank / Sachin (USL - Other)":
+        "Shashank/Sachin — USL Other",
+    # Diageo teams
+    "Ajay / Deepak Patil (Diageo - Wine Shops FL-II)":
+        "Ajay/DP — Diageo Wine Shops",
+    "Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Permit Rooms FL-III)":
+        "Tulsiram+Team — Diageo Permit Rooms",
     "Ajay / Deepak Patil (Diageo - Cross Supply Wine Shop)":
         "Ajay/DP — Diageo CS Wine Shop",
     "Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Cross Supply Permit Room)":
         "Tulsiram+Team — Diageo CS Permit Room",
-    "Ajay / Deepak Patil (Diageo - Cross Supply Other)":
-        "Ajay/DP — Diageo CS Other",
-    # Cross Supply — unassigned
+    "Ajay / Deepak Patil (Diageo - Other)":
+        "Ajay/DP — Diageo Other",
+    # BF teams
+    "Ajay / Deepak Patil / Aabid / Omkar (BF - Wine Shops FL-II)":
+        "Ajay/DP/Aabid/Omkar — BF Wine Shops",
+    "Anand Raj / Deepak Pangare / Shashank Desai / Pranav (BF - KW Institution)":
+        "AR/DP/SD/Pranav — BF KW Insti",
+    "Gajendra Das / Amol Sathe / Rahul Ghone (BF - PCMC Institution)":
+        "GD/Amol/Rahul — BF PCMC",
+    "Anand Raj / Deepak Pangare / Shashank Desai / Pranav (BF - FL-III KW Beer)":
+        "AR/DP/SD/Pranav — BF FL-III",
+    "Ajay / Deepak Patil / Aabid / Omkar (BF - Other)":
+        "Ajay/DP/Aabid/Omkar — BF Other",
+    # UBL teams
+    "Anand Raj / Deepak Pangare / Shashank Desai / Pranav (UBL - KW Institution)":
+        "AR/DP/SD/Pranav — UBL KW Insti",
+    "Gajendra Das / Amol Sathe / Rahul Ghone (UBL - PCMC Institution)":
+        "GD/Amol/Rahul — UBL PCMC",
     "Cross Supply - No Assigned Salesman (UBL)":
         "Cross Supply — UBL (no salesman)",
-    "Cross Supply - No Assigned Salesman":
-        "Cross Supply — No Salesman",
-    # KW Beer
     "Aabid / Omkar (UBL - KW Beer)":
         "Aabid/Omkar — UBL KW Beer",
-    # USL / Diageo / BF — Wine Shops & Retail
-    "Shashank / Sachin (USL - Wine Shops)":
-        "Shashank/Sachin — USL Wine Shops",
-    "Ajay / Deepak (Diageo - Wine Shops)":
-        "Ajay/Deepak — Diageo Wine Shops",
-    "Ajay / Deepak (BF - Wine Shops)":
-        "Ajay/Deepak — BF Wine Shops",
-    # Permit Room teams
-    "Aabid / Omkar (BF - Permit Rooms)":
-        "Aabid/Omkar — BF Permit Rooms",
-    "Miran / Rohit / Tulsi / Atish / Saurabh / Prashant (USL+Diageo - POP)":
-        "Miran+Team — USL+Diageo POP",
-    # UBL teams
-    "Aabid / Omkar (UBL - Wine Shops)":
-        "Aabid/Omkar — UBL Wine Shops",
-    "Aabid / Omkar (UBL - Beer Shopee)":
-        "Aabid/Omkar — UBL Beer Shopee",
-    "Aabid / Omkar (UBL - Permit Rooms)":
-        "Aabid/Omkar — UBL Permit Rooms",
     "Other / Unassigned": "Other / Unassigned",
 }
 
@@ -195,70 +191,54 @@ def _load_data(start: date, end: date) -> pd.DataFrame:
             CAST(vi.TotalAmount AS FLOAT)                AS TotalAmount,
 
             /* ── Salesman Team attribution ── */
+            /* Priority: principal ALWAYS wins for USL & Diageo.
+               For UBL & BF, AcType3ID (institution) overrides channel. */
             CASE
-              -- KW INSTITUTION (130004 or 130006) — institution team always wins
-              WHEN p.AcType3ID IN ('130004','130006')
-                THEN 'Shashank Desai / Pranav / Deepak Pangare / Anand Raj (KW Institution)'
-
-              -- PCMC INSTITUTION (130002)
-              WHEN p.AcType3ID = '130002'
-                THEN 'Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)'
-
-              -- BEER CROSS SUPPLY (130007) — split by principal + license type
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025' AND p.LicenseTypeID = '180001'
+              -- USL (C00025) — principal always wins, LicenseTypeID determines team
+              WHEN b.CompanyID = 'C00025' AND p.LicenseTypeID = '180001'
+                THEN 'Shashank / Sachin (USL - Wine Shops FL-II)'
+              WHEN b.CompanyID = 'C00025' AND p.LicenseTypeID = '180002'
+                THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Permit Rooms FL-III)'
+              WHEN b.CompanyID = 'C00025' AND p.AcType3ID = '130007' AND p.LicenseTypeID = '180001'
                 THEN 'Shashank / Sachin (USL - Cross Supply Wine Shop)'
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025' AND p.LicenseTypeID = '180002'
+              WHEN b.CompanyID = 'C00025' AND p.AcType3ID = '130007' AND p.LicenseTypeID = '180002'
                 THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Cross Supply Permit Room)'
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025'
-                THEN 'Shashank / Sachin (USL - Cross Supply Other)'
+              WHEN b.CompanyID = 'C00025'
+                THEN 'Shashank / Sachin (USL - Other)'
 
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040' AND p.LicenseTypeID = '180001'
+              -- DIAGEO (C00040) — principal always wins
+              WHEN b.CompanyID = 'C00040' AND p.LicenseTypeID = '180001'
+                THEN 'Ajay / Deepak Patil (Diageo - Wine Shops FL-II)'
+              WHEN b.CompanyID = 'C00040' AND p.LicenseTypeID = '180002'
+                THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Permit Rooms FL-III)'
+              WHEN b.CompanyID = 'C00040' AND p.AcType3ID = '130007' AND p.LicenseTypeID = '180001'
                 THEN 'Ajay / Deepak Patil (Diageo - Cross Supply Wine Shop)'
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040' AND p.LicenseTypeID = '180002'
+              WHEN b.CompanyID = 'C00040' AND p.AcType3ID = '130007' AND p.LicenseTypeID = '180002'
                 THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Cross Supply Permit Room)'
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040'
-                THEN 'Ajay / Deepak Patil (Diageo - Cross Supply Other)'
+              WHEN b.CompanyID = 'C00040'
+                THEN 'Ajay / Deepak Patil (Diageo - Other)'
 
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00039'
+              -- BROWN-FORMAN (C00056) — AcType3ID overrides for institution
+              WHEN b.CompanyID = 'C00056' AND p.LicenseTypeID = '180001'
+                THEN 'Ajay / Deepak Patil / Aabid / Omkar (BF - Wine Shops FL-II)'
+              WHEN b.CompanyID = 'C00056' AND p.AcType3ID = '130004'
+                THEN 'Anand Raj / Deepak Pangare / Shashank Desai / Pranav (BF - KW Institution)'
+              WHEN b.CompanyID = 'C00056' AND p.AcType3ID = '130002'
+                THEN 'Gajendra Das / Amol Sathe / Rahul Ghone (BF - PCMC Institution)'
+              WHEN b.CompanyID = 'C00056' AND p.LicenseTypeID = '180002'
+                THEN 'Anand Raj / Deepak Pangare / Shashank Desai / Pranav (BF - FL-III KW Beer)'
+              WHEN b.CompanyID = 'C00056'
+                THEN 'Ajay / Deepak Patil / Aabid / Omkar (BF - Other)'
+
+              -- UNITED BREWERIES (C00039) — AcType3ID determines team
+              WHEN b.CompanyID = 'C00039' AND p.AcType3ID IN ('130004','130006')
+                THEN 'Anand Raj / Deepak Pangare / Shashank Desai / Pranav (UBL - KW Institution)'
+              WHEN b.CompanyID = 'C00039' AND p.AcType3ID = '130002'
+                THEN 'Gajendra Das / Amol Sathe / Rahul Ghone (UBL - PCMC Institution)'
+              WHEN b.CompanyID = 'C00039' AND p.AcType3ID = '130007'
                 THEN 'Cross Supply - No Assigned Salesman (UBL)'
-              WHEN p.AcType3ID = '130007'
-                THEN 'Cross Supply - No Assigned Salesman'
-
-              -- KW BEER (130001) — Aabid & Omkar all channels
-              WHEN p.AcType3ID = '130001'
+              WHEN b.CompanyID = 'C00039'
                 THEN 'Aabid / Omkar (UBL - KW Beer)'
-
-              -- UNITED SPIRITS (C00025) — Wine shops & Retail
-              WHEN b.CompanyID = 'C00025' AND p.ClassID IN ('060021','060020')
-                THEN 'Shashank / Sachin (USL - Wine Shops)'
-
-              -- DIAGEO (C00040) — Wine shops & Retail
-              WHEN b.CompanyID = 'C00040' AND p.ClassID IN ('060021','060020')
-                THEN 'Ajay / Deepak (Diageo - Wine Shops)'
-
-              -- BROWN-FORMAN (C00056) — Wine shops & Retail
-              WHEN b.CompanyID = 'C00056' AND p.ClassID IN ('060021','060020')
-                THEN 'Ajay / Deepak (BF - Wine Shops)'
-
-              -- BROWN-FORMAN — Permit Rooms
-              WHEN b.CompanyID = 'C00056' AND p.ClassID = '060004'
-                THEN 'Aabid / Omkar (BF - Permit Rooms)'
-
-              -- USL + DIAGEO — regular Permit Rooms
-              WHEN b.CompanyID IN ('C00025','C00040') AND p.ClassID = '060004'
-                THEN 'Miran / Rohit / Tulsi / Atish / Saurabh / Prashant (USL+Diageo - POP)'
-
-              -- UBL — Wine Shops & Retail
-              WHEN b.CompanyID = 'C00039' AND p.ClassID IN ('060021','060020')
-                THEN 'Aabid / Omkar (UBL - Wine Shops)'
-
-              -- UBL — Beer Shopee
-              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060008'
-                THEN 'Aabid / Omkar (UBL - Beer Shopee)'
-
-              -- UBL — regular Permit Rooms
-              WHEN b.CompanyID = 'C00039' AND p.ClassID = '060004'
-                THEN 'Aabid / Omkar (UBL - Permit Rooms)'
 
               ELSE 'Other / Unassigned'
             END AS SalesmanTeam,
@@ -339,23 +319,31 @@ def _chart_salesman_bar(df: pd.DataFrame) -> go.Figure:
     agg["ShortLabel"] = agg["SalesmanTeam"].map(
         lambda x: _SHORT_LABELS.get(x, x)
     )
+    agg["RevText"] = agg["TotalAmount"].apply(format_inr)
+    # X-axis in Crores for clean tick labels
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
+
     fig = px.bar(
         agg,
-        x="TotalAmount", y="ShortLabel",
+        x="RevCr", y="ShortLabel",
         orientation="h",
-        color="TotalAmount",
+        color="RevCr",
         color_continuous_scale=["#1A3A5C", _GOLD],
-        text_auto=".2s",
-        labels={"TotalAmount": "Revenue (₹)", "ShortLabel": ""},
+        text="RevText",
+        custom_data=["RevText"],
+        labels={"RevCr": "Revenue (₹ Cr)", "ShortLabel": ""},
     )
     fig.update_layout(
         **_LAYOUT,
         coloraxis_showscale=False,
         height=max(320, len(agg) * 48),
-        xaxis=_GRID,
+        xaxis=dict(ticksuffix=" Cr", **_GRID),
         yaxis=dict(**_GRID),
     )
-    fig.update_traces(textposition="outside")
+    fig.update_traces(
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>%{customdata[0]}<extra></extra>",
+    )
     return fig
 
 
@@ -399,67 +387,24 @@ def _chart_principal_bar(df: pd.DataFrame) -> go.Figure:
         .reset_index()
     )
     colors = [PRINCIPAL_COLORS.get(p, "#888888") for p in agg["Principal"]]
+    rev_cr = agg["TotalAmount"] / 1e7
     fig = go.Figure(go.Bar(
         x=agg["Principal"],
-        y=agg["TotalAmount"],
+        y=rev_cr,
         marker_color=colors,
-        text=[f"₹{v/1e7:.2f}Cr" for v in agg["TotalAmount"]],
+        text=[f"₹{v:.2f} Cr" for v in rev_cr],
         textposition="outside",
+        customdata=agg["TotalAmount"].apply(format_inr),
+        hovertemplate="<b>%{x}</b><br>%{customdata}<extra></extra>",
     ))
     fig.update_layout(
         **_LAYOUT,
         showlegend=False,
         xaxis=dict(tickangle=-20, **_GRID),
-        yaxis=dict(title="Revenue (₹)", **_GRID),
+        yaxis=dict(title="Revenue (₹ Cr)", ticksuffix=" Cr", **_GRID),
     )
     return fig
 
-
-def _chart_heatmap(df: pd.DataFrame) -> go.Figure:
-    """Principal × Channel revenue heatmap."""
-    pivot = (
-        df.groupby(["Principal", "Channel"])["TotalAmount"]
-        .sum()
-        .unstack(fill_value=0)
-    )
-    # Order columns
-    ordered_cols = [c for c in CHANNEL_ORDER if c in pivot.columns]
-    extra_cols   = [c for c in pivot.columns if c not in CHANNEL_ORDER]
-    pivot = pivot[ordered_cols + extra_cols]
-
-    # Order rows: known principals first
-    known_rows  = [p for p in PRINCIPAL_COLORS if p in pivot.index]
-    other_rows  = sorted(p for p in pivot.index if p not in known_rows)
-    pivot = pivot.loc[known_rows + other_rows]
-
-    z    = pivot.values.tolist()
-    text = [
-        [f"₹{v/1e5:.1f}L" if v > 1_000 else ("" if v == 0 else f"₹{v:,.0f}")
-         for v in row]
-        for row in z
-    ]
-
-    fig = go.Figure(go.Heatmap(
-        z=z,
-        x=pivot.columns.tolist(),
-        y=pivot.index.tolist(),
-        text=text,
-        texttemplate="%{text}",
-        colorscale="Blues",
-        showscale=True,
-        hoverongaps=False,
-        colorbar=dict(tickfont=dict(color="#FAFAFA")),
-    ))
-    fig.update_layout(
-        paper_bgcolor=_BG,
-        plot_bgcolor=_BG,
-        font=dict(color="#FAFAFA"),
-        height=max(260, len(pivot) * 65 + 80),
-        margin=dict(t=40, b=90, l=160, r=20),
-        xaxis=dict(side="bottom", tickangle=-30, **_GRID),
-        yaxis=dict(**_GRID),
-    )
-    return fig
 
 
 def _chart_institution_bar(df: pd.DataFrame) -> go.Figure:
@@ -471,15 +416,25 @@ def _chart_institution_bar(df: pd.DataFrame) -> go.Figure:
         .sum()
         .reset_index()
     )
+    agg["RevCr"]   = agg["TotalAmount"] / 1e7
+    agg["RevText"] = agg["TotalAmount"].apply(format_inr)
     fig = px.bar(
-        agg, x="Channel", y="TotalAmount", color="Principal",
+        agg, x="Channel", y="RevCr", color="Principal",
         barmode="group",
         color_discrete_map=PRINCIPAL_COLORS,
-        text_auto=".2s",
-        labels={"TotalAmount": "Revenue (₹)", "Channel": ""},
+        text="RevText",
+        custom_data=["RevText"],
+        labels={"RevCr": "Revenue (₹ Cr)", "Channel": ""},
     )
-    fig.update_layout(**_LAYOUT, xaxis=_GRID, yaxis=_GRID)
-    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        **_LAYOUT,
+        xaxis=_GRID,
+        yaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
+    fig.update_traces(
+        textposition="outside",
+        hovertemplate="<b>%{x}</b> · %{fullData.name}<br>%{customdata[0]}<extra></extra>",
+    )
     return fig
 
 
@@ -497,19 +452,31 @@ def _chart_daily_by_principal(df: pd.DataFrame) -> go.Figure:
         .sort_values(ascending=False).head(6).index.tolist()
     )
     agg = agg[agg["Principal"].isin(top_principals)]
+    # Convert to Crores for readable Y-axis
+    agg["RevCr"]   = agg["TotalAmount"] / 1e7
+    agg["RevText"] = agg["TotalAmount"].apply(format_inr)
 
     color_map = {
         p: PRINCIPAL_COLORS.get(p, _PAL[i % len(_PAL)])
         for i, p in enumerate(top_principals)
     }
     fig = px.line(
-        agg, x="Date", y="TotalAmount", color="Principal",
+        agg, x="Date", y="RevCr", color="Principal",
         markers=True,
         color_discrete_map=color_map,
-        labels={"TotalAmount": "Revenue (₹)", "Date": ""},
+        custom_data=["RevText"],
+        labels={"RevCr": "Revenue (₹ Cr)", "Date": ""},
     )
-    fig.update_layout(**_LAYOUT, xaxis=_GRID, yaxis=_GRID)
-    fig.update_traces(line_width=2.5, marker_size=4)
+    fig.update_layout(
+        **_LAYOUT,
+        xaxis=_GRID,
+        yaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
+    fig.update_traces(
+        line_width=2.5,
+        marker_size=4,
+        hovertemplate="<b>%{x}</b><br>%{customdata[0]}<extra></extra>",
+    )
     return fig
 
 
@@ -652,13 +619,7 @@ def render():
         st.subheader("Revenue by Principal")
         st.plotly_chart(_chart_principal_bar(df), use_container_width=True)
 
-    # ── Chart 4: Principal × Channel heatmap ──────────────────────────────
-    st.markdown("---")
-    section_header("Principal × Channel Heatmap",
-                   "Revenue in ₹ Lakhs per cell")
-    st.plotly_chart(_chart_heatmap(df), use_container_width=True)
-
-    # ── Chart 5: Institution breakdown (shown only when data exists) ───────
+    # ── Chart 4: Institution breakdown (shown only when data exists) ───────
     inst_df = df[df["Channel"].isin(
         ["KW Institution", "PCMC Institution"]
     )]
@@ -670,7 +631,7 @@ def render():
         )
         st.plotly_chart(_chart_institution_bar(df), use_container_width=True)
 
-    # ── Chart 6: Daily revenue trend by principal ──────────────────────────
+    # ── Chart 5: Daily revenue trend by principal ──────────────────────────
     st.markdown("---")
     section_header("Daily Revenue Trend by Principal")
     st.plotly_chart(_chart_daily_by_principal(df), use_container_width=True)
