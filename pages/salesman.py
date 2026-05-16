@@ -61,13 +61,21 @@ _SHORT_LABELS: dict[str, str] = {
         "SD/Pranav/DP/AR — KW Institution",
     "Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)":
         "Amol/Gajendra/Rahul — PCMC",
-    # Cross Supply teams
-    "Shashank / Sachin (USL - Cross Supply)":
-        "Shashank/Sachin — USL Cross Supply",
-    "Ajay / Deepak (Diageo - Cross Supply)":
-        "Ajay/Deepak — Diageo Cross Supply",
-    "Ajay / Deepak (BF - Cross Supply)":
-        "Ajay/Deepak — BF Cross Supply",
+    # Cross Supply — USL
+    "Shashank / Sachin (USL - Cross Supply Wine Shop)":
+        "Shashank/Sachin — USL CS Wine Shop",
+    "Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Cross Supply Permit Room)":
+        "Tulsiram+Team — USL CS Permit Room",
+    "Shashank / Sachin (USL - Cross Supply Other)":
+        "Shashank/Sachin — USL CS Other",
+    # Cross Supply — Diageo
+    "Ajay / Deepak Patil (Diageo - Cross Supply Wine Shop)":
+        "Ajay/DP — Diageo CS Wine Shop",
+    "Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Cross Supply Permit Room)":
+        "Tulsiram+Team — Diageo CS Permit Room",
+    "Ajay / Deepak Patil (Diageo - Cross Supply Other)":
+        "Ajay/DP — Diageo CS Other",
+    # Cross Supply — unassigned
     "Cross Supply - No Assigned Salesman (UBL)":
         "Cross Supply — UBL (no salesman)",
     "Cross Supply - No Assigned Salesman":
@@ -196,13 +204,21 @@ def _load_data(start: date, end: date) -> pd.DataFrame:
               WHEN p.AcType3ID = '130002'
                 THEN 'Amol Sathe / Gajendra Das / Rahul Ghone (PCMC Institution)'
 
-              -- BEER CROSS SUPPLY (130007) — by principal
+              -- BEER CROSS SUPPLY (130007) — split by principal + license type
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025' AND p.LicenseTypeID = '180001'
+                THEN 'Shashank / Sachin (USL - Cross Supply Wine Shop)'
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025' AND p.LicenseTypeID = '180002'
+                THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (USL - Cross Supply Permit Room)'
               WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00025'
-                THEN 'Shashank / Sachin (USL - Cross Supply)'
+                THEN 'Shashank / Sachin (USL - Cross Supply Other)'
+
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040' AND p.LicenseTypeID = '180001'
+                THEN 'Ajay / Deepak Patil (Diageo - Cross Supply Wine Shop)'
+              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040' AND p.LicenseTypeID = '180002'
+                THEN 'Tulsiram / Saurabh / Miran / Prashant / Atish (Diageo - Cross Supply Permit Room)'
               WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00040'
-                THEN 'Ajay / Deepak (Diageo - Cross Supply)'
-              WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00056'
-                THEN 'Ajay / Deepak (BF - Cross Supply)'
+                THEN 'Ajay / Deepak Patil (Diageo - Cross Supply Other)'
+
               WHEN p.AcType3ID = '130007' AND b.CompanyID = 'C00039'
                 THEN 'Cross Supply - No Assigned Salesman (UBL)'
               WHEN p.AcType3ID = '130007'
