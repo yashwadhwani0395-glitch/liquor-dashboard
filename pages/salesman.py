@@ -243,17 +243,19 @@ def _load_data(start: date, end: date) -> pd.DataFrame:
               ELSE 'Other / Unassigned'
             END AS SalesmanTeam,
 
-            /* ── Channel label ── */
+            /* ── Channel label (LicenseTypeID-first, then AcType3ID fallback) ── */
             CASE
-              WHEN p.AcType3ID = '130007'               THEN 'Beer Cross Supply'
-              WHEN p.AcType3ID = '130001'               THEN 'KW Beer'
-              WHEN p.AcType3ID IN ('130004','130006')   THEN 'KW Institution'
-              WHEN p.AcType3ID = '130002'               THEN 'PCMC Institution'
-              WHEN p.ClassID   = '060021'               THEN 'MOP - Wine Shops'
-              WHEN p.ClassID   = '060020'               THEN 'Retail'
-              WHEN p.ClassID   = '060004'               THEN 'POP - Permit Rooms'
-              WHEN p.ClassID   = '060008'               THEN 'Beer Shopee'
-              WHEN p.ClassID   = '060005'               THEN 'FL-IV Club'
+              WHEN p.LicenseTypeID = '180001'                                THEN 'FL-II Wine Shop'
+              WHEN p.LicenseTypeID = '180004'                                THEN 'FL-BR-II Beer Shopee'
+              WHEN p.LicenseTypeID = '180005'                                THEN 'FL-IV Club'
+              WHEN p.LicenseTypeID = '180007'                                THEN 'FL-IV One Day'
+              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130004'    THEN 'FL-III KW Institution'
+              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130006'    THEN 'FL-III KW Insti One Day'
+              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130002'    THEN 'FL-III PCMC Institution'
+              WHEN p.LicenseTypeID = '180002'                                THEN 'FL-III Permit Room (Regular)'
+              WHEN p.LicenseTypeID = '180003'                                THEN 'Form E'
+              WHEN p.LicenseTypeID = '180008'                                THEN 'FL-I'
+              WHEN p.AcType3ID     = '130007'                                THEN 'Beer Cross Supply'
               ELSE 'Other'
             END AS Channel,
 
@@ -347,34 +349,125 @@ def _chart_salesman_bar(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def _chart_channel_donut(df: pd.DataFrame) -> go.Figure:
-    """Donut chart — revenue share by channel."""
+_CHANNEL_ORDER = [
+    "FL-II Wine Shop",
+    "FL-BR-II Beer Shopee",
+    "FL-III Permit Room (Regular)",
+    "FL-III KW Institution",
+    "FL-III KW Insti One Day",
+    "FL-III PCMC Institution",
+    "FL-IV Club",
+    "FL-IV One Day",
+    "Beer Cross Supply",
+    "Form E",
+    "FL-I",
+    "Other",
+]
+
+_CHANNEL_COLORS = {
+    "FL-II Wine Shop":              "#1f77b4",   # blue
+    "FL-BR-II Beer Shopee":         "#26C6DA",   # teal
+    "FL-III Permit Room (Regular)": "#FF7F0E",   # orange
+    "FL-III KW Institution":        "#E8A838",   # amber
+    "FL-III KW Insti One Day":      "#FFD54F",   # amber lighter
+    "FL-III PCMC Institution":      "#FFEB3B",   # yellow
+    "FL-IV Club":                   "#9467bd",   # purple
+    "FL-IV One Day":                "#CE93D8",   # purple lighter
+    "Beer Cross Supply":            "#E53935",   # red
+    "Form E":                       "#9E9E9E",   # grey
+    "FL-I":                         "#757575",   # grey medium
+    "Other":                        "#616161",   # grey dark
+}
+
+_FL3_CHANNELS = [
+    "FL-III Permit Room (Regular)",
+    "FL-III KW Institution",
+    "FL-III KW Insti One Day",
+    "FL-III PCMC Institution",
+]
+
+
+def _chart_channel_bar(df: pd.DataFrame) -> go.Figure:
+    """Horizontal bar — revenue by channel in fixed license-type order."""
     agg = (
         df.groupby("Channel")["TotalAmount"].sum()
-        .sort_values(ascending=False)
         .reset_index()
     )
     total = agg["TotalAmount"].sum()
-    agg["label"] = agg.apply(
-        lambda r: f"{r['Channel']}<br>₹{r['TotalAmount']/1e5:.1f}L", axis=1
+    # Build ordered frame — include all channels in spec order, skip zeros
+    ordered = [c for c in _CHANNEL_ORDER if c in agg["Channel"].values]
+    agg = agg.set_index("Channel").reindex(ordered).dropna().reset_index()
+    agg["RevCr"]   = agg["TotalAmount"] / 1e7
+    agg["Pct"]     = (agg["TotalAmount"] / total * 100).round(1)
+    agg["RevText"] = agg["TotalAmount"].apply(format_inr)
+    agg["HoverTxt"] = agg.apply(
+        lambda r: f"{r['Channel']}<br>{r['RevText']} ({r['Pct']}%)", axis=1
     )
-    fig = px.pie(
-        agg, names="Channel", values="TotalAmount",
-        hole=0.44,
-        color_discrete_sequence=_PAL,
-    )
+    colors = [_CHANNEL_COLORS.get(c, "#888888") for c in agg["Channel"]]
+
+    fig = go.Figure(go.Bar(
+        x=agg["RevCr"],
+        y=agg["Channel"],
+        orientation="h",
+        marker_color=colors,
+        text=[f"₹{v:.2f} Cr  {p}%" for v, p in zip(agg["RevCr"], agg["Pct"])],
+        textposition="outside",
+        customdata=list(zip(agg["RevText"], agg["Pct"])),
+        hovertemplate="<b>%{y}</b><br>%{customdata[0]}  (%{customdata[1]}%)<extra></extra>",
+    ))
     fig.update_layout(
         **_LAYOUT,
+        height=max(300, len(agg) * 44),
+        xaxis=dict(title="Revenue (₹ Cr)", ticksuffix=" Cr", **_GRID),
+        yaxis=dict(autorange="reversed", **_GRID),  # top-to-bottom ordering
+    )
+    return fig
+
+
+def _chart_fl3_donut(df: pd.DataFrame) -> go.Figure | None:
+    """Donut — FL-III Regular vs Institution breakdown. Returns None if no data."""
+    fl3 = df[df["Channel"].isin(_FL3_CHANNELS)]
+    if fl3.empty:
+        return None
+    agg = (
+        fl3.groupby("Channel")["TotalAmount"].sum()
+        .reset_index()
+    )
+    total = agg["TotalAmount"].sum()
+    # Keep spec order, only present segments
+    ordered = [c for c in _FL3_CHANNELS if c in agg["Channel"].values]
+    agg = agg.set_index("Channel").reindex(ordered).dropna().reset_index()
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
+    agg["Pct"]   = (agg["TotalAmount"] / total * 100).round(1)
+    colors = [_CHANNEL_COLORS[c] for c in agg["Channel"]]
+
+    fig = go.Figure(go.Pie(
+        labels=agg["Channel"],
+        values=agg["TotalAmount"],
+        hole=0.44,
+        marker_colors=colors,
+        text=[f"₹{v:.2f} Cr" for v in agg["RevCr"]],
+        customdata=list(zip(agg["RevCr"], agg["Pct"])),
+        textinfo="label+percent",
+        hovertemplate=(
+            "<b>%{label}</b><br>₹%{customdata[0]:.2f} Cr "
+            "(%{customdata[1]:.1f}%)<extra></extra>"
+        ),
+        pull=[0.05 if "Regular" in c else 0 for c in agg["Channel"]],
+    ))
+    fig.update_layout(
+        **_LAYOUT,
+        title=dict(
+            text="FL-III Breakdown — Regular vs Institution",
+            font=dict(size=14, color="#FAFAFA"),
+            x=0.5,
+        ),
         annotations=[dict(
             text=f"<b>{format_inr(total)}</b>",
-            x=0.5, y=0.5, font_size=14,
+            x=0.5, y=0.5, font_size=13,
             showarrow=False, font_color="#FAFAFA",
         )],
         legend=dict(font=dict(size=11)),
-    )
-    fig.update_traces(
-        textinfo="label+percent",
-        pull=[0.05] + [0] * (len(agg) - 1),
     )
     return fig
 
@@ -408,10 +501,9 @@ def _chart_principal_bar(df: pd.DataFrame) -> go.Figure:
 
 
 def _chart_institution_bar(df: pd.DataFrame) -> go.Figure:
-    """Side-by-side bar — KW vs PCMC Institution revenue by principal."""
-    inst_channels = ["KW Institution", "PCMC Institution"]
+    """Side-by-side bar — FL-III institution revenue by channel × principal."""
     agg = (
-        df[df["Channel"].isin(inst_channels)]
+        df[df["Channel"].isin(_FL3_CHANNELS)]
         .groupby(["Channel", "Principal"])["TotalAmount"]
         .sum()
         .reset_index()
@@ -512,12 +604,7 @@ def render():
         )
         sel_channels = st.multiselect(
             "Channel",
-            options=[
-                "MOP - Wine Shops", "Retail", "POP - Permit Rooms",
-                "Beer Shopee", "KW Beer", "Beer Cross Supply",
-                "KW Institution", "PCMC Institution",
-                "FL-IV Club", "Others",
-            ],
+            options=_CHANNEL_ORDER[:-1] + ["Others"],   # exclude "Other", add "Others"
             key="sm_channels",
         )
 
@@ -609,25 +696,34 @@ def render():
     section_header("Revenue by Salesman Team")
     st.plotly_chart(_chart_salesman_bar(df), use_container_width=True)
 
-    # ── Charts 2 & 3: Channel donut + Principal bar ────────────────────────
+    # ── Chart 2: Revenue by Channel (fixed license-type order) ───────────
     st.markdown("---")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("Revenue by Channel")
-        st.plotly_chart(_chart_channel_donut(df), use_container_width=True)
-    with col_b:
-        st.subheader("Revenue by Principal")
+    section_header("Revenue by Channel",
+                   "Ordered by license type · bars coloured by category")
+    st.plotly_chart(_chart_channel_bar(df), use_container_width=True)
+
+    # ── Chart 3: FL-III breakdown donut (conditional) ─────────────────────
+    fl3_fig = _chart_fl3_donut(df)
+    if fl3_fig is not None:
+        st.markdown("---")
+        col_fl3, col_pr = st.columns(2)
+        with col_fl3:
+            st.plotly_chart(fl3_fig, use_container_width=True)
+        with col_pr:
+            st.subheader("Revenue by Principal")
+            st.plotly_chart(_chart_principal_bar(df), use_container_width=True)
+    else:
+        st.markdown("---")
+        section_header("Revenue by Principal")
         st.plotly_chart(_chart_principal_bar(df), use_container_width=True)
 
     # ── Chart 4: Institution breakdown (shown only when data exists) ───────
-    inst_df = df[df["Channel"].isin(
-        ["KW Institution", "PCMC Institution"]
-    )]
+    inst_df = df[df["Channel"].isin(_FL3_CHANNELS)]
     if not inst_df.empty:
         st.markdown("---")
         section_header(
             "Institution Breakdown",
-            "KW & PCMC institutional revenue by principal",
+            "FL-III KW & PCMC institutional revenue by principal",
         )
         st.plotly_chart(_chart_institution_bar(df), use_container_width=True)
 
