@@ -104,11 +104,12 @@ _SHORT_LABELS: dict[str, str] = {
 # ── Chart theme (matches sales.py) ─────────────────────────────────────────
 _BG     = "rgba(0,0,0,0)"
 _GOLD   = "#E8A838"
-_GRID   = dict(gridcolor="#2a2d3e")
+_GRID   = dict(gridcolor="#E8E8E8")
 _LAYOUT = dict(
     paper_bgcolor=_BG,
     plot_bgcolor=_BG,
-    font=dict(color="#FAFAFA"),
+    font=dict(color="#1A1A1A"),
+    template="plotly_white",
     margin=dict(t=30, b=20),
 )
 _PAL = px.colors.qualitative.Bold
@@ -330,7 +331,7 @@ def _chart_salesman_bar(df: pd.DataFrame) -> go.Figure:
         x="RevCr", y="ShortLabel",
         orientation="h",
         color="RevCr",
-        color_continuous_scale=["#1A3A5C", _GOLD],
+        color_continuous_scale=["#D6E8F7", _GOLD],
         text="RevText",
         custom_data=["RevText"],
         labels={"RevCr": "Revenue (₹ Cr)", "ShortLabel": ""},
@@ -459,13 +460,13 @@ def _chart_fl3_donut(df: pd.DataFrame) -> go.Figure | None:
         **_LAYOUT,
         title=dict(
             text="FL-III Breakdown — Regular vs Institution",
-            font=dict(size=14, color="#FAFAFA"),
+            font=dict(size=14, color="#1A1A1A"),
             x=0.5,
         ),
         annotations=[dict(
             text=f"<b>{format_inr(total)}</b>",
             x=0.5, y=0.5, font_size=13,
-            showarrow=False, font_color="#FAFAFA",
+            showarrow=False, font_color="#1A1A1A",
         )],
         legend=dict(font=dict(size=11)),
     )
@@ -575,7 +576,9 @@ def _chart_daily_by_principal(df: pd.DataFrame) -> go.Figure:
 # ── Page entry point ────────────────────────────────────────────────────────
 
 def render():
-    st.title("Salesman & Channels")
+    st.title("Salesman & Channel Performance")
+    st.caption("Revenue attribution by salesman team and channel | Source: TEKNIK ERP")
+    st.divider()
 
     # ── Sidebar filters ───────────────────────────────────────────────────
     with st.sidebar:

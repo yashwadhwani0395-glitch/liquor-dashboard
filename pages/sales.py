@@ -16,9 +16,13 @@ SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 
 # ── Chart theme constants
 _BG     = "rgba(0,0,0,0)"
 _GOLD   = "#E8A838"
-_GRID   = dict(gridcolor="#2a2d3e")
-_LAYOUT = dict(paper_bgcolor=_BG, plot_bgcolor=_BG,
-               font=dict(color="#FAFAFA"), margin=dict(t=30, b=20))
+_GRID   = dict(gridcolor="#E8E8E8")
+_LAYOUT = dict(
+    paper_bgcolor=_BG, plot_bgcolor=_BG,
+    font=dict(color="#1A1A1A"),
+    template="plotly_white",
+    margin=dict(t=30, b=20),
+)
 _PAL    = px.colors.qualitative.Bold
 
 
@@ -231,7 +235,7 @@ def _brand_bar(df: pd.DataFrame) -> go.Figure:
     )
     fig = px.bar(
         agg, x="TotalAmount", y="BrandName", orientation="h",
-        color="TotalAmount", color_continuous_scale=["#1A3A5C", _GOLD],
+        color="TotalAmount", color_continuous_scale=["#D6E8F7", _GOLD],
         text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "BrandName": ""},
     )
     fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
@@ -286,7 +290,7 @@ def _customer_bar(df: pd.DataFrame) -> go.Figure:
     )
     fig = px.bar(
         agg, x="TotalAmount", y="PartyName", orientation="h",
-        color="TotalAmount", color_continuous_scale=["#1A3A5C", _GOLD],
+        color="TotalAmount", color_continuous_scale=["#D6E8F7", _GOLD],
         text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "PartyName": ""},
     )
     fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
@@ -316,6 +320,8 @@ def _size_bar(df: pd.DataFrame) -> go.Figure:
 
 def render():
     st.title("Sales & Revenue")
+    st.caption("Invoicewise sales performance for KWPL | Source: TEKNIK ERP")
+    st.divider()
 
     # ── Pre-load filter option lists ──────────────────────────────────────
     brands_df   = _load_brands()

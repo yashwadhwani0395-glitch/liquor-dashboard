@@ -1,7 +1,7 @@
 import streamlit as st
 
 st.set_page_config(
-    page_title="LiquorBiz Dashboard",
+    page_title="KWPL Dashboard",
     page_icon="🥃",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,56 +29,76 @@ def _db_status() -> tuple[bool, str]:
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    # Logo
+    # Branding header
     st.markdown(
         """
-        <div style='text-align:center; padding: 1rem 0 1.5rem 0;'>
-            <span style='font-size:2.5rem;'>🥃</span><br>
-            <span style='font-size:1.3rem; font-weight:700; color:#E8A838;'>
-                LiquorBiz
-            </span><br>
-            <span style='font-size:0.75rem; color:#888;'>Distribution Dashboard</span>
+        <div style='text-align:center; padding: 1.2rem 0 1.4rem 0;'>
+            <span style='font-size:2.2rem; font-weight:800; color:#1B4F72;
+                         letter-spacing:0.05em;'>KWPL</span><br>
+            <span style='font-size:0.8rem; color:#555; font-weight:500;'>
+                Kranti Wines Pvt. Ltd.
+            </span>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.divider()
 
-    st.markdown("#### Navigation")
-    page = st.radio(
-        label="page",
-        options=["Sales & Revenue", "Salesman & Channels", "Distribution"],
-        label_visibility="collapsed",
-    )
+    # ── Navigation via session_state ────────────────────────────────────────
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Sales & Revenue"
+
+    def _nav(label: str):
+        st.session_state["page"] = label
+
+    with st.expander("📈  Sales", expanded=st.session_state["page"] in ("Sales & Revenue",)):
+        if st.button("Sales & Revenue", use_container_width=True,
+                     type="primary" if st.session_state["page"] == "Sales & Revenue" else "secondary"):
+            _nav("Sales & Revenue")
+
+    with st.expander("👥  Team Performance",
+                     expanded=st.session_state["page"] in ("Salesman & Channels", "Distribution")):
+        if st.button("Salesman & Channels", use_container_width=True,
+                     type="primary" if st.session_state["page"] == "Salesman & Channels" else "secondary"):
+            _nav("Salesman & Channels")
+        if st.button("Distribution Analytics", use_container_width=True,
+                     type="primary" if st.session_state["page"] == "Distribution" else "secondary"):
+            _nav("Distribution")
 
     st.divider()
 
-    # DB status indicator
+    # DB status
     ok, err = _db_status()
     if ok:
         st.markdown(
-            "<span style='color:#2ecc71; font-size:0.85rem;'>&#9679; DB Connected</span>",
+            "<span style='color:#27ae60; font-size:0.82rem;'>&#9679;&nbsp;DB Connected</span>",
             unsafe_allow_html=True,
         )
     else:
         st.markdown(
-            "<span style='color:#e74c3c; font-size:0.85rem;'>&#9679; DB Offline</span>",
+            "<span style='color:#e74c3c; font-size:0.82rem;'>&#9679;&nbsp;DB Offline</span>",
             unsafe_allow_html=True,
         )
         if err:
             st.caption(f"_{err}_")
 
-    st.divider()
-    st.caption("v1.0.0 · LiquorBiz")
+    st.markdown(
+        "<div style='font-size:0.72rem; color:#888; margin-top:4px;'>"
+        "Data refreshes every 5 min</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("v1.0 · KWPL")
 
 
 # ── Page routing ───────────────────────────────────────────────────────────
-if page == "Sales & Revenue":
+_page = st.session_state.get("page", "Sales & Revenue")
+
+if _page == "Sales & Revenue":
     from pages.sales import render
     render()
-elif page == "Salesman & Channels":
+elif _page == "Salesman & Channels":
     from pages.salesman import render
     render()
-elif page == "Distribution":
+elif _page == "Distribution":
     from pages.distribution import render
     render()

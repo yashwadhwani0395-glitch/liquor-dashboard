@@ -28,12 +28,14 @@ from utils.helpers import format_inr, section_header
 # ── Sales types ─────────────────────────────────────────────────────────────
 SALES_TYPES = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
-# ── Dark chart theme ─────────────────────────────────────────────────────────
+# ── Light chart theme ────────────────────────────────────────────────────────
 _BG     = "rgba(0,0,0,0)"
-_GRID   = dict(gridcolor="#2a2d3e")
+_GRID   = dict(gridcolor="#E8E8E8")
 _LAYOUT = dict(
     paper_bgcolor=_BG, plot_bgcolor=_BG,
-    font=dict(color="#FAFAFA"), margin=dict(t=40, b=20),
+    font=dict(color="#1A1A1A"),
+    template="plotly_white",
+    margin=dict(t=40, b=20),
 )
 _PAL = px.colors.qualitative.Bold
 
@@ -112,15 +114,19 @@ def _last_complete_month() -> str:
 def _filter_sm(df: pd.DataFrame, sm_key: str) -> pd.DataFrame:
     """Filter master billing DataFrame to a salesman's territory."""
     cfg  = SALESMAN_MAP[sm_key]
+    # Ensure NaN → '' so isin() comparisons work reliably
+    d = df.copy()
+    d["AcType3ID"]     = d["AcType3ID"].fillna("").astype(str)
+    d["LicenseTypeID"] = d["LicenseTypeID"].fillna("").astype(str)
     mask = (
-        df["CompanyID"].isin(cfg["principals"])
-        & df["LicenseTypeID"].isin(cfg["license_types"])
+        d["CompanyID"].isin(cfg["principals"])
+        & d["LicenseTypeID"].isin(cfg["license_types"])
     )
     if cfg["ac3_include"]:
-        mask &= df["AcType3ID"].isin(cfg["ac3_include"])
-    elif cfg["ac3_exclude"]:
-        mask &= ~df["AcType3ID"].isin(cfg["ac3_exclude"])
-    return df[mask]
+        mask &= d["AcType3ID"].isin(cfg["ac3_include"])
+    if cfg["ac3_exclude"]:
+        mask &= ~d["AcType3ID"].isin(cfg["ac3_exclude"])
+    return d[mask]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -363,7 +369,7 @@ def _chart_dod_trend(
             marker=dict(size=4),
         ))
     fig.update_layout(
-        **_LAYOUT,
+        **{k: v for k, v in _LAYOUT.items() if k != "margin"},
         title=title,
         xaxis=dict(categoryorder="array", categoryarray=ordered, tickangle=-30, **_GRID),
         yaxis=dict(ticksuffix=y_fmt, **_GRID),
@@ -406,10 +412,10 @@ def _style_wod_table(df: pd.DataFrame, target: float) -> "pd.io.formats.style.St
         except Exception:
             return ""
         if p >= target:
-            return "background-color:#1b3a27;color:#2ecc71"
+            return "background-color:#d4edda;color:#155724"
         if p >= target - 10:
-            return "background-color:#3a2d00;color:#f1c40f"
-        return "background-color:#3a1a1a;color:#e74c3c"
+            return "background-color:#fff3cd;color:#856404"
+        return "background-color:#f8d7da;color:#721c24"
 
     def _c_sr(v: str) -> str:
         try:
@@ -417,10 +423,10 @@ def _style_wod_table(df: pd.DataFrame, target: float) -> "pd.io.formats.style.St
         except Exception:
             return ""
         if p > 30:
-            return "background-color:#1b3a27;color:#2ecc71"
+            return "background-color:#d4edda;color:#155724"
         if p >= 15:
-            return "background-color:#3a2d00;color:#f1c40f"
-        return "background-color:#3a1a1a;color:#e74c3c"
+            return "background-color:#fff3cd;color:#856404"
+        return "background-color:#f8d7da;color:#721c24"
 
     return (
         df.style
@@ -440,7 +446,9 @@ def _delta_arrow(v: float, fmt: str = ".1f") -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render():  # noqa: C901 (complexity — intentional for a single-page analytics hub)
-    st.title("🚚 Distribution Analytics — WOD · DOD · Outlets")
+    st.title("Distribution Analytics")
+    st.caption("Width & Depth of Distribution · Outlet Intelligence · Salesman Scorecard | Source: TEKNIK ERP")
+    st.divider()
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     all_sm  = sorted(SALESMAN_MAP.keys())
