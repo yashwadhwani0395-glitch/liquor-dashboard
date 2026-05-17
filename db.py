@@ -64,6 +64,17 @@ def get_connection() -> pymssql.Connection | None:
         return None
 
 
+# ── Connection status helper ───────────────────────────────────────────────
+
+def get_connection_status() -> bool:
+    """Return True if the DB is reachable, False otherwise."""
+    try:
+        conn = get_connection()
+        return conn is not None
+    except Exception:
+        return False
+
+
 # ── Query runner ───────────────────────────────────────────────────────────
 
 def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
