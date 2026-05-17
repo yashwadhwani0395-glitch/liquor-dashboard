@@ -1,16 +1,21 @@
-"""pages/distribution.py — Width of Distribution (WOD) and Depth of Distribution (DOD).
+"""pages/distribution.py — Comprehensive Field Sales Analytics Dashboard
 
-Universe definition (per salesman):
-    Distinct outlets (PartyIDs) that billed their principal's products
-    in their assigned channel AT ANY POINT in the last 12 months.
-    100 % derived from billing history — MsPartyMaster is NOT the source.
+Tracks Width of Distribution (WOD), Depth of Distribution (DOD),
+outlet lapse/recovery, and individual salesman scorecards.
 
-WOD % = Unique billed outlets in a month / Universe (12-month baseline) × 100
-DOD   = Revenue / Cases / Invoices per billed outlet in the month
+Universe per salesman = distinct outlets that billed their principal's
+products in their assigned channel at any point in the last 13 months.
+Derived 100 % from billing history (not MsPartyMaster static list).
+
+NOTE on query:
+  - Party IDs in this DB are D-prefixed (D00001 etc.) — no LIKE filter.
+  - FinancialYear computed from VoucherDate to avoid TrVocItem duplication
+    at the fiscal-year boundary (both '2025-2026' and '2026-2027' tags can
+    exist for the same voucher around March/April).
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -20,10 +25,10 @@ import streamlit as st
 from db import run_query
 from utils.helpers import format_inr, section_header
 
-# ── Sales transaction type IDs ─────────────────────────────────────────────
-SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
+# ── Sales types ─────────────────────────────────────────────────────────────
+SALES_TYPES = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
-# ── Chart theme ────────────────────────────────────────────────────────────
+# ── Dark chart theme ─────────────────────────────────────────────────────────
 _BG     = "rgba(0,0,0,0)"
 _GRID   = dict(gridcolor="#2a2d3e")
 _LAYOUT = dict(
@@ -32,7 +37,7 @@ _LAYOUT = dict(
 )
 _PAL = px.colors.qualitative.Bold
 
-# ── License type → display label ──────────────────────────────────────────
+# ── Channel labels ───────────────────────────────────────────────────────────
 _LT_LABEL: dict[str, str] = {
     "180001": "FL-II Wine Shop",
     "180002": "FL-III Permit Room",
@@ -41,104 +46,105 @@ _LT_LABEL: dict[str, str] = {
     "180007": "FL-IV One Day",
 }
 
-# ── Salesman territory definitions ─────────────────────────────────────────
-# principals   : CompanyIDs whose products count for this salesman
-# license_types: LicenseTypeIDs (party classification) that count
-# ac_include   : if present, AcType3ID MUST be in this set
-# ac_exclude   : if present, AcType3ID must NOT be in this set
-SALESMAN_TERRITORY: dict[str, dict] = {
-    # USL Wine Shop team
-    "Shashank":       dict(principals={"C00025"},           license_types={"180001"},                    ac_exclude={"130004","130002"}),
-    "Sachin":         dict(principals={"C00025"},           license_types={"180001"},                    ac_exclude={"130004","130002"}),
-    # Diageo + BF Wine Shop team
-    "Ajay":           dict(principals={"C00040","C00056"},  license_types={"180001"},                    ac_exclude={"130004","130002"}),
-    "Deepak Patil":   dict(principals={"C00040","C00056"},  license_types={"180001"},                    ac_exclude={"130004","130002"}),
-    # USL + Diageo Permit Room team (regular only)
-    "Tulsiram":       dict(principals={"C00025","C00040"},  license_types={"180002"},                    ac_exclude={"130004","130002","130006"}),
-    "Saurabh":        dict(principals={"C00025","C00040"},  license_types={"180002"},                    ac_exclude={"130004","130002","130006"}),
-    "Miran":          dict(principals={"C00025","C00040"},  license_types={"180002"},                    ac_exclude={"130004","130002","130006"}),
-    "Prashant":       dict(principals={"C00025","C00040"},  license_types={"180002"},                    ac_exclude={"130004","130002","130006"}),
-    "Atish":          dict(principals={"C00025","C00040"},  license_types={"180002"},                    ac_exclude={"130004","130002","130006"}),
-    # UBL all channels (non-institution)
-    "Aabid":          dict(principals={"C00039"},           license_types={"180001","180002","180004"},  ac_exclude={"130004","130002","130006"}),
-    "Omkar":          dict(principals={"C00039"},           license_types={"180001","180002","180004"},  ac_exclude={"130004","130002","130006"}),
-    # KW Institution team (UBL + BF)
-    "Anand Raj":      dict(principals={"C00039","C00056"},  license_types={"180002"},                    ac_include={"130004","130006"}),
-    "Deepak Pangare": dict(principals={"C00039","C00056"},  license_types={"180002"},                    ac_include={"130004","130006"}),
-    "Shashank Desai": dict(principals={"C00039","C00056"},  license_types={"180002"},                    ac_include={"130004","130006"}),
-    "Pranav":         dict(principals={"C00039","C00056"},  license_types={"180002"},                    ac_include={"130004","130006"}),
-    # PCMC Institution team (UBL)
-    "Gajendra Das":   dict(principals={"C00039"},           license_types={"180002"},                    ac_include={"130002"}),
-    "Amol Sathe":     dict(principals={"C00039"},           license_types={"180002"},                    ac_include={"130002"}),
-    "Rahul Ghone":    dict(principals={"C00039"},           license_types={"180002"},                    ac_include={"130002"}),
+# ═══════════════════════════════════════════════════════════════════════════════
+# SALESMAN MAP
+# ═══════════════════════════════════════════════════════════════════════════════
+SALESMAN_MAP: dict[str, dict] = {
+    "Shashank":       {"team": "USL Wine Shops",       "principals": ["C00025"],           "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Sachin":         {"team": "USL Wine Shops",       "principals": ["C00025"],           "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Tulsiram":       {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Saurabh":        {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Miran":          {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Prashant":       {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Atish":          {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Ajay":           {"team": "Diageo+BF Wine Shops", "principals": ["C00040", "C00056"], "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Deepak Patil":   {"team": "Diageo+BF Wine Shops", "principals": ["C00040", "C00056"], "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Aabid":          {"team": "UBL KW Beer",          "principals": ["C00039"],           "license_types": ["180001", "180002", "180004"], "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Omkar":          {"team": "UBL KW Beer",          "principals": ["C00039"],           "license_types": ["180001", "180002", "180004"], "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
+    "Anand Raj":      {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
+    "Deepak Pangare": {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
+    "Shashank Desai": {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
+    "Pranav":         {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
+    "Gajendra Das":   {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
+    "Amol Sathe":     {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
+    "Rahul Ghone":    {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
 }
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _month_label(yr: int, mo: int) -> str:
-    return date(yr, mo, 1).strftime("%b %Y")
+def _fmt_month(ym: str) -> str:
+    """'2026-04' → 'Apr-26'"""
+    yr, mo = int(ym[:4]), int(ym[5:])
+    return date(yr, mo, 1).strftime("%b-%y")
 
 
-def _last_n_months(n: int = 12) -> list[tuple[int, int]]:
-    """Return (year, month) tuples for the last n months, oldest → newest."""
+def _prev_month_str(ym: str) -> str:
+    yr, mo = int(ym[:4]), int(ym[5:])
+    return f"{yr - 1:04d}-12" if mo == 1 else f"{yr:04d}-{mo - 1:02d}"
+
+
+def _last_n_month_strs(n: int = 12) -> list[str]:
+    """Last n months as 'yyyy-MM' strings, oldest → newest."""
     today = date.today()
-    result = []
+    out   = []
     for i in range(n - 1, -1, -1):
+        d = (today.replace(day=1) - timedelta(days=1)) if i == 0 else today
+        # safer: subtract months properly
         mo = today.month - i
         yr = today.year
         while mo <= 0:
             mo += 12
             yr -= 1
-        result.append((yr, mo))
-    return result
+        out.append(f"{yr:04d}-{mo:02d}")
+    return out
 
 
-def _prev_month(yr: int, mo: int) -> tuple[int, int]:
-    return (yr, mo - 1) if mo > 1 else (yr - 1, 12)
+def _last_complete_month() -> str:
+    """Return last fully-elapsed month as 'yyyy-MM'."""
+    first_this_month = date.today().replace(day=1)
+    last_prev        = first_this_month - timedelta(days=1)
+    return f"{last_prev.year:04d}-{last_prev.month:02d}"
 
 
-def _filter_billing(billing: pd.DataFrame, sm_key: str) -> pd.DataFrame:
-    """Filter billing to rows matching this salesman's territory."""
-    t    = SALESMAN_TERRITORY[sm_key]
+def _filter_sm(df: pd.DataFrame, sm_key: str) -> pd.DataFrame:
+    """Filter master billing DataFrame to a salesman's territory."""
+    cfg  = SALESMAN_MAP[sm_key]
     mask = (
-        billing["CompanyID"].isin(t["principals"])
-        & billing["LicenseTypeID"].isin(t["license_types"])
+        df["CompanyID"].isin(cfg["principals"])
+        & df["LicenseTypeID"].isin(cfg["license_types"])
     )
-    if "ac_include" in t:
-        mask &= billing["AcType3ID"].isin(t["ac_include"])
-    elif "ac_exclude" in t:
-        mask &= ~billing["AcType3ID"].isin(t["ac_exclude"])
-    return billing[mask]
+    if cfg["ac3_include"]:
+        mask &= df["AcType3ID"].isin(cfg["ac3_include"])
+    elif cfg["ac3_exclude"]:
+        mask &= ~df["AcType3ID"].isin(cfg["ac3_exclude"])
+    return df[mask]
 
 
-# ── Data loader ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA LOADER  (single master query, cached 1 hour)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_billing(months_back: int = 13) -> pd.DataFrame:
-    """Load billing history: (yr, mo, PartyID, PartyName, LicenseTypeID,
-    AcType3ID, CompanyID, Invoices, Cases, Revenue).
-
-    Grouped by month × party × principal — so a party billed for USL *and*
-    UBL in the same month produces two rows (one per principal).  This lets
-    each salesman's territory filter work correctly in Python.
-
-    Notes:
-    - Party IDs are D-prefixed in this DB — no LIKE filter applied.
-    - SalesManID is blank in TrVocHead, so attribution is territory-based.
-    - FY deduplication on TrVocItem via computed FinancialYear.
+def _load_master(months_back: int = 13) -> pd.DataFrame:
+    """
+    Single master query covering last 13 months.
+    One row per (BillMonth, PartyID, CompanyID).
+    Used for all analytics on this page.
     """
     type_ph = ",".join(str(t) for t in SALES_TYPES)
     df = run_query(f"""
         SELECT
-            YEAR(h.VoucherDate)                    AS yr,
-            MONTH(h.VoucherDate)                   AS mo,
+            FORMAT(h.VoucherDate,'yyyy-MM')        AS BillMonth,
+            MAX(h.VoucherDate)                     AS LastBillDate,
             d.PartyID,
-            ISNULL(p.PartyName,    'Unknown')      AS PartyName,
+            p.PartyName,
             ISNULL(p.LicenseTypeID,'')             AS LicenseTypeID,
             ISNULL(p.AcType3ID,    '')             AS AcType3ID,
             b.CompanyID,
-            COUNT(DISTINCT h.VoucherNo)            AS Invoices,
+            COUNT(DISTINCT h.VoucherNo)            AS InvoiceCount,
             SUM(CAST(vi.CaseQty     AS BIGINT))    AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))     AS Revenue
         FROM TrVocHead h
@@ -172,360 +178,789 @@ def _load_billing(months_back: int = 13) -> pd.DataFrame:
         WHERE h.TransTypeID IN ({type_ph})
           AND h.Cancelled   = 'N'
           AND d.PartyID     IS NOT NULL
-          AND p.LicenseTypeID IN ('180001','180002','180004','180005')
+          AND p.LicenseTypeID IN ('180001','180002','180004','180005','180007')
           AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
         GROUP BY
-            YEAR(h.VoucherDate), MONTH(h.VoucherDate),
+            FORMAT(h.VoucherDate,'yyyy-MM'),
             d.PartyID, p.PartyName, p.LicenseTypeID, p.AcType3ID, b.CompanyID
     """)
     if df.empty:
         return df
-    for col in ("yr", "mo", "Invoices", "Cases"):
+    for col in ("InvoiceCount", "Cases"):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     df["Revenue"]       = pd.to_numeric(df["Revenue"],       errors="coerce").fillna(0.0)
     df["LicenseTypeID"] = df["LicenseTypeID"].fillna("").astype(str)
     df["AcType3ID"]     = df["AcType3ID"].fillna("").astype(str)
     df["CompanyID"]     = df["CompanyID"].fillna("").astype(str)
+    df["LastBillDate"]  = pd.to_datetime(df["LastBillDate"],  errors="coerce")
     return df
 
 
-# ── Analytics ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANALYTICS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _compute_wod(
-    billing: pd.DataFrame,
-    months: list[tuple[int, int]],
-    sel_sm: list[str],
-) -> pd.DataFrame:
-    """Compute WOD per (salesman, month).
-
-    Universe  = distinct PartyIDs that billed the salesman's principal's
-                products in their channel any time in the 13-month window.
-    Billed(m) = those PartyIDs that billed in month m specifically.
-    Revenue / Cases / Invoices from that salesman's principal's products only.
-    """
-    # Pre-filter once per salesman; build frozen universe sets
-    sm_bill: dict[str, pd.DataFrame] = {}
-    uni_ids: dict[str, frozenset]    = {}
-    for sm in sel_sm:
-        tb          = _filter_billing(billing, sm)
-        sm_bill[sm] = tb
-        uni_ids[sm] = frozenset(tb["PartyID"].unique())
-
-    rows = []
-    for yr, mo in months:
-        for sm in sel_sm:
-            tb         = sm_bill[sm]
-            universe   = uni_ids[sm]
-            uni_size   = len(universe)
-            month_tb   = tb[(tb["yr"] == yr) & (tb["mo"] == mo)]
-            billed_ids = frozenset(month_tb["PartyID"].unique())
-            billed_cnt = len(billed_ids)
-            wod_pct    = billed_cnt / uni_size * 100 if uni_size else 0.0
-            rows.append({
-                "sm_key":      sm,
-                "month_label": _month_label(yr, mo),
-                "yr":          yr,
-                "mo":          mo,
-                "universe":    uni_size,
-                "billed":      billed_cnt,
-                "unbilled":    uni_size - billed_cnt,
-                "wod_pct":     round(wod_pct, 1),
-                "revenue":     float(month_tb["Revenue"].sum()),
-                "cases":       int(month_tb["Cases"].sum()),
-                "invoices":    int(month_tb["Invoices"].sum()),
-            })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-
-def _unbilled_outlets(
-    billing: pd.DataFrame,
-    sel_month: tuple[int, int],
-    sm_key: str,
-) -> pd.DataFrame:
-    """Universe outlets that did NOT bill in sel_month for this salesman."""
-    yr, mo = sel_month
-    tb      = _filter_billing(billing, sm_key)
-    universe = (
-        tb[["PartyID","PartyName","LicenseTypeID","AcType3ID"]]
-        .drop_duplicates("PartyID")
-    )
-    billed_ids = frozenset(tb[(tb["yr"] == yr) & (tb["mo"] == mo)]["PartyID"])
-    unbilled   = universe[~universe["PartyID"].isin(billed_ids)].copy()
-
-    if unbilled.empty:
-        return unbilled
-
-    # Last billed month from history (any month in window)
-    tb2          = tb.copy()
-    tb2["yrmo"]  = tb2["yr"] * 100 + tb2["mo"]
-    last_bill    = tb2.groupby("PartyID")["yrmo"].max().reset_index()
-    last_bill["last_bill_date"] = last_bill["yrmo"].apply(
-        lambda v: date(int(v) // 100, int(v) % 100, 1)
-    )
-    unbilled = unbilled.merge(last_bill[["PartyID","last_bill_date"]], on="PartyID", how="left")
-
-    today = date.today()
-    unbilled["last_bill_date"] = pd.to_datetime(unbilled["last_bill_date"], errors="coerce")
-    unbilled["DaysSince"]  = unbilled["last_bill_date"].apply(
-        lambda d: (today - d.date()).days if pd.notna(d) else 9999
-    )
-    unbilled["LastBilled"] = unbilled["last_bill_date"].apply(
-        lambda d: d.strftime("%b %Y") if pd.notna(d) else "Never"
-    )
-    unbilled["Channel"]    = unbilled["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
-    return unbilled.sort_values("DaysSince", ascending=False)
-
-
-def _outlet_detail(
-    billing: pd.DataFrame,
-    sel_month: tuple[int, int],
-    sm_key: str,
-) -> pd.DataFrame:
-    """Per-outlet billing detail for a salesman in one month (universe only)."""
-    yr, mo   = sel_month
-    tb       = _filter_billing(billing, sm_key)
-    month_tb = tb[(tb["yr"] == yr) & (tb["mo"] == mo)].copy()
-    if month_tb.empty:
-        return month_tb
-
-    detail = (
-        month_tb
-        .groupby(["PartyID","PartyName","LicenseTypeID"], as_index=False)
-        .agg(Invoices=("Invoices","sum"), Cases=("Cases","sum"), Revenue=("Revenue","sum"))
-    )
-    detail["AvgOrder"] = detail["Revenue"] / detail["Invoices"].clip(lower=1)
-    detail["Channel"]  = detail["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+def _party_month_agg(sm_df: pd.DataFrame, month_str: str) -> pd.DataFrame:
+    """Aggregate to (PartyID, PartyName, LicenseTypeID) level for one month."""
+    month_df = sm_df[sm_df["BillMonth"] == month_str]
+    if month_df.empty:
+        return pd.DataFrame(
+            columns=["PartyID", "PartyName", "LicenseTypeID", "InvoiceCount", "Cases", "Revenue"]
+        )
     return (
-        detail[["PartyName","Channel","Invoices","Cases","Revenue","AvgOrder"]]
-        .rename(columns={"PartyName":"Party","AvgOrder":"Avg Order Value"})
-        .sort_values("Revenue", ascending=False)
+        month_df
+        .groupby(["PartyID", "PartyName", "LicenseTypeID"], as_index=False)
+        .agg(
+            InvoiceCount=("InvoiceCount", "sum"),
+            Cases=("Cases", "sum"),
+            Revenue=("Revenue", "sum"),
+        )
     )
 
 
-# ── Chart builders ─────────────────────────────────────────────────────────
+def _monthly_metrics(sm_df: pd.DataFrame, months: list[str], uni_ids: frozenset) -> pd.DataFrame:
+    """Per-month WOD, strike rate, DOD for one salesman."""
+    rows = []
+    for mo in months:
+        pa = _party_month_agg(sm_df, mo)
+        billed_ids   = frozenset(pa["PartyID"])
+        billed_cnt   = len(billed_ids)
+        uni_size     = len(uni_ids)
+        wod_pct      = billed_cnt / uni_size * 100 if uni_size else 0.0
+        multi_bill   = int((pa["InvoiceCount"] >= 2).sum())
+        strike_rate  = multi_bill / billed_cnt * 100 if billed_cnt else 0.0
+        revenue      = float(pa["Revenue"].sum())
+        cases        = int(pa["Cases"].sum())
+        invoices     = int(pa["InvoiceCount"].sum())
+        billed_safe  = max(billed_cnt, 1)
+        rows.append({
+            "BillMonth":   mo,
+            "month_label": _fmt_month(mo),
+            "universe":    uni_size,
+            "billed":      billed_cnt,
+            "unbilled":    uni_size - billed_cnt,
+            "wod_pct":     round(wod_pct, 1),
+            "strike_rate": round(strike_rate, 1),
+            "revenue":     revenue,
+            "cases":       cases,
+            "invoices":    invoices,
+            "avg_rev":     revenue / billed_safe,
+            "avg_cas":     cases   / billed_safe,
+            "avg_inv":     invoices / billed_safe,
+        })
+    return pd.DataFrame(rows)
+
+
+def _lapsed_new_ids(
+    sm_df: pd.DataFrame, sel_mo: str, prev_mo: str
+) -> dict[str, frozenset]:
+    sel_ids  = frozenset(sm_df[sm_df["BillMonth"] == sel_mo]["PartyID"])
+    prev_ids = frozenset(sm_df[sm_df["BillMonth"] == prev_mo]["PartyID"])
+    return {
+        "lapsed":   prev_ids - sel_ids,
+        "new":      sel_ids  - prev_ids,
+        "retained": sel_ids  & prev_ids,
+    }
+
+
+def _concentration(sm_df: pd.DataFrame, month_str: str) -> dict:
+    pa = sm_df[sm_df["BillMonth"] == month_str].groupby("PartyID")["Revenue"].sum()
+    pa = pa.sort_values(ascending=False)
+    total = pa.sum()
+    if total == 0 or pa.empty:
+        return {"top10_pct": 0.0, "next40_pct": 0.0, "bot50_pct": 100.0, "concentrated": False}
+    n      = len(pa)
+    top10n = max(1, round(n * 0.10))
+    nxt40n = max(1, round(n * 0.40))
+    top10_rev  = pa.iloc[:top10n].sum()
+    next40_rev = pa.iloc[top10n : top10n + nxt40n].sum()
+    bot50_rev  = pa.iloc[top10n + nxt40n :].sum()
+    return {
+        "top10_pct":  top10_rev  / total * 100,
+        "next40_pct": next40_rev / total * 100,
+        "bot50_pct":  bot50_rev  / total * 100,
+        "concentrated": (top10_rev / total) > 0.60,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHART BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _chart_wod_trend(
-    wod_df: pd.DataFrame,
-    months: list[tuple[int, int]],
+    all_metrics: dict[str, pd.DataFrame],
+    months: list[str],
+    sel_sm: list[str],
     target_pct: float,
 ) -> go.Figure:
-    ordered_labels = [_month_label(y, m) for y, m in months]
-    plot_df = wod_df.copy()
-    plot_df["month_ord"] = plot_df["yr"] * 100 + plot_df["mo"]
-    plot_df = plot_df.sort_values("month_ord")
-
-    fig = px.line(
-        plot_df,
-        x="month_label", y="wod_pct", color="sm_key",
-        markers=True,
-        labels={"wod_pct": "WOD %", "month_label": "", "sm_key": "Salesman"},
-        color_discrete_sequence=_PAL,
-        category_orders={"month_label": ordered_labels},
-    )
+    ordered = [_fmt_month(m) for m in months]
+    fig = go.Figure()
+    for i, sm in enumerate(sel_sm):
+        df = all_metrics[sm].sort_values("BillMonth")
+        fig.add_trace(go.Scatter(
+            x=df["month_label"], y=df["wod_pct"],
+            mode="lines+markers", name=sm,
+            line=dict(color=_PAL[i % len(_PAL)], width=2),
+            marker=dict(size=5),
+            hovertemplate=f"<b>{sm}</b><br>%{{x}}: %{{y:.1f}}%<extra></extra>",
+        ))
     fig.add_hline(
-        y=target_pct,
-        line_dash="dash", line_color="#FF4444", line_width=1.5,
-        annotation_text=f"Target {target_pct:.0f}%",
-        annotation_font_color="#FF4444",
+        y=target_pct, line_dash="dash", line_color="#FF4444", line_width=1.5,
+        annotation_text=f"Target {target_pct:.0f}%", annotation_font_color="#FF4444",
     )
     fig.update_layout(
         **_LAYOUT,
-        xaxis=dict(tickangle=-30, **_GRID),
+        title="Width of Distribution — 12-Month Trend",
+        xaxis=dict(categoryorder="array", categoryarray=ordered, tickangle=-30, **_GRID),
         yaxis=dict(range=[0, 105], ticksuffix="%", **_GRID),
         legend=dict(font=dict(size=10), title=""),
     )
-    fig.update_traces(line_width=2, marker_size=5)
     return fig
 
 
-# ── Page entry point ───────────────────────────────────────────────────────
+def _chart_outlet_movement(
+    movement: dict[str, dict[str, int]],
+    sel_sm: list[str],
+) -> go.Figure:
+    labels = sel_sm
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Retained", x=labels,
+                         y=[movement[s]["retained"] for s in labels],
+                         marker_color="#3498db"))
+    fig.add_trace(go.Bar(name="🟢 New Active", x=labels,
+                         y=[movement[s]["new"] for s in labels],
+                         marker_color="#2ecc71"))
+    fig.add_trace(go.Bar(name="🔴 Lapsed", x=labels,
+                         y=[movement[s]["lapsed"] for s in labels],
+                         marker_color="#e74c3c"))
+    fig.update_layout(
+        **_LAYOUT,
+        title="Outlet Movement vs Previous Month",
+        barmode="group",
+        xaxis=dict(**_GRID),
+        yaxis=dict(title="Outlets", **_GRID),
+        legend=dict(font=dict(size=10)),
+    )
+    return fig
 
-def render():
-    st.title("Distribution — WOD & DOD")
 
-    all_sm = sorted(SALESMAN_TERRITORY.keys())
+def _chart_dod_trend(
+    all_metrics: dict[str, pd.DataFrame],
+    months: list[str],
+    metric: str,
+    title: str,
+    sel_sm: list[str],
+    y_fmt: str = "",
+) -> go.Figure:
+    ordered = [_fmt_month(m) for m in months]
+    fig = go.Figure()
+    for i, sm in enumerate(sel_sm):
+        df = all_metrics[sm].sort_values("BillMonth")
+        fig.add_trace(go.Scatter(
+            x=df["month_label"], y=df[metric],
+            mode="lines+markers", name=sm,
+            line=dict(color=_PAL[i % len(_PAL)], width=2),
+            marker=dict(size=4),
+        ))
+    fig.update_layout(
+        **_LAYOUT,
+        title=title,
+        xaxis=dict(categoryorder="array", categoryarray=ordered, tickangle=-30, **_GRID),
+        yaxis=dict(ticksuffix=y_fmt, **_GRID),
+        legend=dict(font=dict(size=9), title=""),
+        margin=dict(t=50, b=30),
+    )
+    return fig
 
-    # ── Sidebar ───────────────────────────────────────────────────────────
+
+def _chart_concentration(
+    concentration: dict[str, dict],
+    sel_sm: list[str],
+) -> go.Figure:
+    top10  = [concentration[s]["top10_pct"]  for s in sel_sm]
+    next40 = [concentration[s]["next40_pct"] for s in sel_sm]
+    bot50  = [concentration[s]["bot50_pct"]  for s in sel_sm]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Top 10% outlets",  x=sel_sm, y=top10,  marker_color="#e74c3c", orientation="v"))
+    fig.add_trace(go.Bar(name="Next 40% outlets", x=sel_sm, y=next40, marker_color="#f39c12", orientation="v"))
+    fig.add_trace(go.Bar(name="Bottom 50%",       x=sel_sm, y=bot50,  marker_color="#2ecc71", orientation="v"))
+    fig.update_layout(
+        **_LAYOUT,
+        title="Revenue Concentration Risk",
+        barmode="stack",
+        xaxis=dict(**_GRID),
+        yaxis=dict(ticksuffix="%", range=[0, 105], **_GRID),
+        legend=dict(font=dict(size=10)),
+    )
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED STYLE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _style_wod_table(df: pd.DataFrame, target: float) -> "pd.io.formats.style.Styler":
+    def _c_wod(v: str) -> str:
+        try:
+            p = float(str(v).replace("%", ""))
+        except Exception:
+            return ""
+        if p >= target:
+            return "background-color:#1b3a27;color:#2ecc71"
+        if p >= target - 10:
+            return "background-color:#3a2d00;color:#f1c40f"
+        return "background-color:#3a1a1a;color:#e74c3c"
+
+    def _c_sr(v: str) -> str:
+        try:
+            p = float(str(v).replace("%", ""))
+        except Exception:
+            return ""
+        if p > 30:
+            return "background-color:#1b3a27;color:#2ecc71"
+        if p >= 15:
+            return "background-color:#3a2d00;color:#f1c40f"
+        return "background-color:#3a1a1a;color:#e74c3c"
+
+    return (
+        df.style
+        .map(_c_wod, subset=["WOD %"])
+        .map(_c_sr,  subset=["Strike Rate"])
+    )
+
+
+def _delta_arrow(v: float, fmt: str = ".1f") -> str:
+    sym = "↑" if v >= 0 else "↓"
+    col = "#2ecc71" if v >= 0 else "#e74c3c"
+    return f'<span style="color:{col}">{sym} {abs(v):{fmt}}</span>'
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render():  # noqa: C901 (complexity — intentional for a single-page analytics hub)
+    st.title("🚚 Distribution Analytics — WOD · DOD · Outlets")
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
+    all_sm  = sorted(SALESMAN_MAP.keys())
+    months_12 = _last_n_month_strs(12)  # last 12 months, oldest → newest
+    months_13 = _last_n_month_strs(13)  # 13 for universe (extra month lapse detection)
+
     with st.sidebar:
-        st.markdown("#### Filters")
-        sel_sm = st.multiselect("Salesman", options=all_sm, default=all_sm, key="dist_sm")
+        st.markdown("#### Distribution Filters")
+
+        sel_sm = st.multiselect(
+            "Salesman", options=all_sm, default=all_sm, key="dist_sm"
+        )
         if not sel_sm:
             sel_sm = all_sm
 
-        months_12    = _last_n_months(12)
-        month_labels = [_month_label(y, m) for y, m in months_12]
-        label_newest = list(reversed(month_labels))
+        default_month = _last_complete_month()
+        avail_months  = list(reversed(months_12))           # newest first for picker
+        try:
+            default_idx = avail_months.index(default_month)
+        except ValueError:
+            default_idx = 0
 
-        sel_label = st.selectbox(
-            "Detail Month", options=label_newest, index=0, key="dist_month"
+        sel_month_str = st.selectbox(
+            "Reference Month",
+            options=avail_months,
+            index=default_idx,
+            format_func=_fmt_month,
+            key="dist_month",
         )
-        sel_month = months_12[month_labels.index(sel_label)]
+        prev_month_str = _prev_month_str(sel_month_str)
 
-        target_wod = st.number_input(
-            "Target WOD %",
-            min_value=10.0, max_value=100.0, value=70.0, step=5.0,
+        target_wod = st.slider(
+            "WOD Target %", min_value=50, max_value=95, value=70, step=5,
             key="dist_target",
         )
 
-    # ── Load billing data ─────────────────────────────────────────────────
-    with st.spinner("Loading 13-month billing data…"):
-        billing = _load_billing(13)
+    # ── Load data ─────────────────────────────────────────────────────────────
+    with st.spinner("Loading distribution analytics…"):
+        master = _load_master(13)
 
-    if billing.empty:
-        st.error("No billing data returned. Check database connection.")
+    if master.empty:
+        st.error("No billing data returned. Check DB connection.")
         return
 
-    # ── Compute WOD ───────────────────────────────────────────────────────
-    with st.spinner("Computing WOD…"):
-        wod_df = _compute_wod(billing, months_12, sel_sm)
+    # ── Pre-compute per-salesman slices & metrics ────────────────────────────
+    sm_data: dict[str, pd.DataFrame]         = {}
+    uni_ids: dict[str, frozenset]            = {}
+    all_metrics: dict[str, pd.DataFrame]     = {}
+    movement:    dict[str, dict[str, int]]   = {}
+    concentration: dict[str, dict]           = {}
 
-    sel_yr, sel_mo   = sel_month
-    prev_yr, prev_mo = _prev_month(sel_yr, sel_mo)
+    for sm in SALESMAN_MAP:           # compute for ALL salesmen (scorecard tab needs full set)
+        df_sm         = _filter_sm(master, sm)
+        sm_data[sm]   = df_sm
+        uni_ids[sm]   = frozenset(df_sm["PartyID"].unique())
+        all_metrics[sm] = _monthly_metrics(df_sm, months_12, uni_ids[sm])
+        ids = _lapsed_new_ids(df_sm, sel_month_str, prev_month_str)
+        movement[sm] = {k: len(v) for k, v in ids.items()}
+        movement[sm]["lapsed_ids"] = ids["lapsed"]    # keep sets for detail tables
+        movement[sm]["new_ids"]    = ids["new"]
+        concentration[sm] = _concentration(df_sm, sel_month_str)
 
-    # ── KPI row: unique parties across selected salesmen's territories ────
-    all_uni_ids = set()
+    # ── Print universe sizes for verification ─────────────────────────────────
+    # (visible in terminal; remove in production if needed)
+    print("\n=== UNIVERSE VERIFICATION ===")
+    for sm in sorted(SALESMAN_MAP.keys()):
+        u = len(uni_ids[sm])
+        sel_row = all_metrics[sm][all_metrics[sm]["BillMonth"] == sel_month_str]
+        b  = int(sel_row["billed"].iloc[0])  if not sel_row.empty else 0
+        wp = sel_row["wod_pct"].iloc[0]      if not sel_row.empty else 0.0
+        print(f"  {sm:<20} universe={u:>4}  billed={b:>4}  WOD={wp:.1f}%")
+
+    # ── Aggregate KPI (unique parties across selected salesmen) ───────────────
+    all_uni_union     = set()
+    all_billed_union  = set()
+    all_lapsed_union  = set()
     for sm in sel_sm:
-        all_uni_ids |= set(_filter_billing(billing, sm)["PartyID"].unique())
+        all_uni_union    |= uni_ids[sm]
+        mo_df = sm_data[sm][sm_data[sm]["BillMonth"] == sel_month_str]
+        all_billed_union |= set(mo_df["PartyID"].unique())
+        all_lapsed_union |= movement[sm]["lapsed_ids"]
 
-    billed_this_month = set(
-        billing[(billing["yr"] == sel_yr) & (billing["mo"] == sel_mo)]["PartyID"]
-    )
-    total_uni      = len(all_uni_ids)
-    total_billed   = len(all_uni_ids & billed_this_month)
+    total_uni      = len(all_uni_union)
+    total_billed   = len(all_uni_union & all_billed_union)
+    total_lapsed   = len(all_lapsed_union)
     total_unbilled = total_uni - total_billed
     overall_wod    = total_billed / total_uni * 100 if total_uni else 0.0
 
-    section_header("Width & Depth of Distribution", f"Detail month: {sel_label}")
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("Total Universe", f"{total_uni:,}")
-    with k2:
-        st.metric("Billed Outlets", f"{total_billed:,}")
-    with k3:
-        st.metric(
-            "Overall WOD %", f"{overall_wod:.1f}%",
-            delta=f"{overall_wod - target_wod:+.1f}% vs target",
-            delta_color="normal",
+    # ════════════════════════════════════════════════════════════════════════════
+    # 4 TABS
+    # ════════════════════════════════════════════════════════════════════════════
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Overview",
+        "📈 Depth of Distribution",
+        "🔍 Outlet Intelligence",
+        "👤 Salesman Scorecard",
+    ])
+
+    # ══════════════════════════════════════════
+    # TAB 1 — OVERVIEW
+    # ══════════════════════════════════════════
+    with tab1:
+        section_header(
+            f"Overview — {_fmt_month(sel_month_str)}",
+            "Aggregate across selected salesmen",
         )
-    with k4:
-        st.metric("Unbilled Outlets", f"{total_unbilled:,}")
 
-    st.divider()
-
-    # ── Section 1: WOD Trend ──────────────────────────────────────────────
-    section_header("Width of Distribution — Monthly Trend")
-    if not wod_df.empty:
-        st.plotly_chart(_chart_wod_trend(wod_df, months_12, target_wod), use_container_width=True)
-    else:
-        st.info("No WOD data to chart.")
-
-    # ── Section 2: WOD Summary Table ─────────────────────────────────────
-    st.markdown("---")
-    section_header("WOD Summary", f"{sel_label} · sorted worst first")
-    sum_df = (
-        wod_df[(wod_df["yr"] == sel_yr) & (wod_df["mo"] == sel_mo)]
-        .copy()
-        .sort_values("wod_pct")
-    )
-    if not sum_df.empty:
-        sum_df["Target %"]  = target_wod
-        sum_df["vs Target"] = (sum_df["wod_pct"] - target_wod).round(1)
-        disp = sum_df[[
-            "sm_key","universe","billed","unbilled","wod_pct","Target %","vs Target"
-        ]].copy()
-        disp.columns = ["Salesman","Universe","Billed","Unbilled","WOD %","Target %","vs Target"]
-        disp["WOD %"]     = disp["WOD %"].apply(lambda x: f"{x:.1f}%")
-        disp["Target %"]  = disp["Target %"].apply(lambda x: f"{x:.0f}%")
-        disp["vs Target"] = disp["vs Target"].apply(lambda x: f"{x:+.1f}%")
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-    else:
-        st.info("No data for selected month.")
-
-    # ── Section 3: DOD Metrics ────────────────────────────────────────────
-    st.markdown("---")
-    section_header(
-        "Depth of Distribution — Avg per Billed Outlet",
-        f"{sel_label} vs {_month_label(prev_yr, prev_mo)}",
-    )
-
-    def _dod(df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        bs  = out["billed"].clip(lower=1)
-        out["rev_out"] = out["revenue"] / bs
-        out["cas_out"] = out["cases"]   / bs
-        out["inv_out"] = out["invoices"] / bs
-        return out[["sm_key","rev_out","cas_out","inv_out"]]
-
-    cur_dod  = _dod(wod_df[(wod_df["yr"] == sel_yr)  & (wod_df["mo"] == sel_mo)])
-    prev_dod = _dod(wod_df[(wod_df["yr"] == prev_yr) & (wod_df["mo"] == prev_mo)])
-
-    if not cur_dod.empty:
-        dod = cur_dod.merge(
-            prev_dod.rename(columns={
-                "rev_out":"prev_rev","cas_out":"prev_cas","inv_out":"prev_inv"
-            }),
-            on="sm_key", how="left",
-        )
-        dod["delta_rev"] = dod["rev_out"] - dod["prev_rev"].fillna(0)
-        dod["delta_cas"] = dod["cas_out"] - dod["prev_cas"].fillna(0)
-
-        disp_dod = dod[["sm_key","rev_out","cas_out","inv_out","delta_rev","delta_cas"]].copy()
-        disp_dod.columns = [
-            "Salesman","Avg Rev/Outlet","Avg Cases/Outlet",
-            "Avg Inv/Outlet","Δ Rev/Outlet","Δ Cases/Outlet",
-        ]
-        disp_dod["Avg Rev/Outlet"]   = disp_dod["Avg Rev/Outlet"].apply(format_inr)
-        disp_dod["Avg Cases/Outlet"] = disp_dod["Avg Cases/Outlet"].apply(lambda x: f"{x:.1f}")
-        disp_dod["Avg Inv/Outlet"]   = disp_dod["Avg Inv/Outlet"].apply(lambda x: f"{x:.1f}")
-        disp_dod["Δ Rev/Outlet"]     = disp_dod["Δ Rev/Outlet"].apply(
-            lambda x: ("+" if x >= 0 else "−") + format_inr(abs(x))
-        )
-        disp_dod["Δ Cases/Outlet"]   = disp_dod["Δ Cases/Outlet"].apply(lambda x: f"{x:+.1f}")
-        st.dataframe(disp_dod, use_container_width=True, hide_index=True)
-    else:
-        st.info("No DOD data for selected month.")
-
-    # ── Section 4: Unbilled Outlets (Action List) ─────────────────────────
-    st.markdown("---")
-    focus_sm = sel_sm[0] if sel_sm else None
-    section_header(
-        f"Unbilled Outlets — {focus_sm or '—'}",
-        f"{sel_label} · longest gap first · select one salesman in sidebar for focus",
-    )
-    if focus_sm:
-        with st.spinner("Computing unbilled outlets…"):
-            unbilled_df = _unbilled_outlets(billing, sel_month, focus_sm)
-        if unbilled_df.empty:
-            st.success(f"All universe outlets billed in {sel_label}!")
-        else:
-            uni_size = int(wod_df[
-                (wod_df["yr"] == sel_yr) & (wod_df["mo"] == sel_mo)
-                & (wod_df["sm_key"] == focus_sm)
-            ]["universe"].sum()) or len(_filter_billing(billing, focus_sm)["PartyID"].unique())
-            disp_ub = unbilled_df[["PartyName","Channel","LastBilled","DaysSince"]].copy()
-            disp_ub["DaysSince"] = disp_ub["DaysSince"].apply(
-                lambda x: "—" if x == 9999 else str(x)
+        # KPI row
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Total Universe", f"{total_uni:,}")
+        with k2:
+            st.metric("Billed This Month", f"{total_billed:,}")
+        with k3:
+            wod_delta = overall_wod - target_wod
+            wod_color = "normal" if wod_delta >= 0 else "inverse"
+            st.metric(
+                "Overall WOD %", f"{overall_wod:.1f}%",
+                delta=f"{wod_delta:+.1f}% vs target",
+                delta_color=wod_color,
             )
-            disp_ub.columns = ["Party","Channel","Last Billed","Days Since Last Bill"]
-            st.dataframe(disp_ub, use_container_width=True, hide_index=True)
-            st.caption(
-                f"{len(disp_ub)} unbilled out of {uni_size} universe outlets "
-                f"({len(disp_ub)/uni_size*100:.1f}% not covered)" if uni_size else ""
+        with k4:
+            st.metric("Lapsed This Month", f"{total_lapsed:,}")
+
+        st.divider()
+
+        # WOD Trend chart
+        st.plotly_chart(
+            _chart_wod_trend(all_metrics, months_12, sel_sm, target_wod),
+            use_container_width=True,
+        )
+
+        st.divider()
+
+        # WOD Summary Table
+        st.markdown("#### WOD Summary — sorted worst first")
+        rows = []
+        for sm in sel_sm:
+            mo_row = all_metrics[sm][all_metrics[sm]["BillMonth"] == sel_month_str]
+            if mo_row.empty:
+                continue
+            r = mo_row.iloc[0]
+            rows.append({
+                "Salesman":     sm,
+                "Team":         SALESMAN_MAP[sm]["team"],
+                "Universe":     int(r["universe"]),
+                "Billed":       int(r["billed"]),
+                "Unbilled":     int(r["unbilled"]),
+                "WOD %":        f"{r['wod_pct']:.1f}%",
+                "Strike Rate":  f"{r['strike_rate']:.1f}%",
+                "vs Target":    f"{r['wod_pct'] - target_wod:+.1f}%",
+            })
+        if rows:
+            summary_df = pd.DataFrame(rows).sort_values("WOD %")
+            st.dataframe(
+                _style_wod_table(summary_df, target_wod),
+                use_container_width=True,
+                hide_index=True,
             )
 
-    # ── Section 5: Outlet-level Detail (expander) ─────────────────────────
-    st.markdown("---")
-    with st.expander(
-        f"Outlet Detail — {focus_sm or '—'} · {sel_label}", expanded=False
-    ):
+        st.divider()
+
+        # Lapsed vs New vs Retained chart
+        st.plotly_chart(
+            _chart_outlet_movement(movement, sel_sm),
+            use_container_width=True,
+        )
+
+    # ══════════════════════════════════════════
+    # TAB 2 — DEPTH OF DISTRIBUTION
+    # ══════════════════════════════════════════
+    with tab2:
+        section_header(
+            f"Depth of Distribution — {_fmt_month(sel_month_str)}",
+            f"vs {_fmt_month(prev_month_str)}",
+        )
+
+        # DOD Metrics Table
+        dod_rows = []
+        for sm in sel_sm:
+            cur  = all_metrics[sm][all_metrics[sm]["BillMonth"] == sel_month_str]
+            prev = all_metrics[sm][all_metrics[sm]["BillMonth"] == prev_month_str]
+            if cur.empty:
+                continue
+            c = cur.iloc[0]
+            p = prev.iloc[0] if not prev.empty else None
+            dod_rows.append({
+                "Salesman":          sm,
+                "Avg Rev/Outlet":    format_inr(c["avg_rev"]),
+                "Avg Cases/Outlet":  f"{c['avg_cas']:.1f}",
+                "Avg Inv/Outlet":    f"{c['avg_inv']:.1f}",
+                "MoM Rev Δ":         (
+                    ("↑ " if c["avg_rev"] >= (p["avg_rev"] if p is not None else 0) else "↓ ") +
+                    format_inr(abs(c["avg_rev"] - (p["avg_rev"] if p is not None else 0)))
+                ),
+                "MoM Cases Δ":       (
+                    f"{'↑' if p is None or c['avg_cas'] >= p['avg_cas'] else '↓'} "
+                    f"{abs(c['avg_cas'] - (p['avg_cas'] if p is not None else 0)):.1f}"
+                ),
+            })
+        if dod_rows:
+            st.dataframe(pd.DataFrame(dod_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # DOD Trend charts — 3 side by side
+        st.markdown("#### DOD Trends — Last 12 Months")
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            st.plotly_chart(
+                _chart_dod_trend(all_metrics, months_12, "avg_rev",
+                                 "Avg Revenue / Outlet", sel_sm),
+                use_container_width=True,
+            )
+        with dc2:
+            st.plotly_chart(
+                _chart_dod_trend(all_metrics, months_12, "avg_cas",
+                                 "Avg Cases / Outlet", sel_sm, y_fmt=" cs"),
+                use_container_width=True,
+            )
+        with dc3:
+            st.plotly_chart(
+                _chart_dod_trend(all_metrics, months_12, "avg_inv",
+                                 "Avg Invoices / Outlet", sel_sm),
+                use_container_width=True,
+            )
+
+        st.divider()
+
+        # Revenue Concentration chart
+        st.plotly_chart(
+            _chart_concentration(concentration, sel_sm),
+            use_container_width=True,
+        )
+        # Flag concentrated salesmen
+        flagged = [sm for sm in sel_sm if concentration[sm]["concentrated"]]
+        if flagged:
+            st.warning(
+                f"⚠️ High concentration risk (top 10% outlets > 60% revenue): "
+                f"{', '.join(flagged)}"
+            )
+
+    # ══════════════════════════════════════════
+    # TAB 3 — OUTLET INTELLIGENCE
+    # ══════════════════════════════════════════
+    with tab3:
+        section_header("Outlet Intelligence", f"Reference month: {_fmt_month(sel_month_str)}")
+
+        focus_sm = st.selectbox(
+            "Focus Salesman",
+            options=sel_sm,
+            key="dist_focus_sm_t3",
+        )
+
         if focus_sm:
-            det_df = _outlet_detail(billing, sel_month, focus_sm)
-            if not det_df.empty:
-                d = det_df.copy()
-                d["Revenue"]         = d["Revenue"].apply(format_inr)
-                d["Avg Order Value"] = d["Avg Order Value"].apply(format_inr)
-                st.dataframe(d, use_container_width=True, hide_index=True)
+            df_sm    = sm_data[focus_sm]
+            uni_set  = uni_ids[focus_sm]
+            today    = date.today()
+
+            # Last bill date per party (across all history)
+            last_date_ser = (
+                df_sm.groupby("PartyID")["LastBillDate"].max()
+            )
+            # Per-party info
+            party_info = (
+                df_sm[["PartyID", "PartyName", "LicenseTypeID"]]
+                .drop_duplicates("PartyID")
+                .set_index("PartyID")
+            )
+
+            def _days_since(pid: str) -> int:
+                d = last_date_ser.get(pid)
+                if pd.isna(d) or d is None:
+                    return 9999
+                return (today - pd.Timestamp(d).date()).days
+
+            def _last_bill_str(pid: str) -> str:
+                d = last_date_ser.get(pid)
+                if pd.isna(d) or d is None:
+                    return "Never"
+                return pd.Timestamp(d).strftime("%d %b %Y")
+
+            # ── Lapsed Outlets ─────────────────────────────────────────────
+            st.markdown("### 🔴 Lapsed This Month — Needs Immediate Visit")
+            lapsed_ids = movement[focus_sm]["lapsed_ids"]
+            if not lapsed_ids:
+                st.success("No lapsed outlets this month!")
             else:
-                st.info(f"No billed outlets for {focus_sm} in {sel_label}.")
-        else:
-            st.info("Select a salesman to see outlet detail.")
+                # Previous month revenue per lapsed outlet
+                prev_rev = (
+                    df_sm[(df_sm["BillMonth"] == prev_month_str)
+                          & df_sm["PartyID"].isin(lapsed_ids)]
+                    .groupby("PartyID")["Revenue"].sum()
+                )
+                # Avg monthly revenue (all months)
+                avg_rev = (
+                    df_sm[df_sm["PartyID"].isin(lapsed_ids)]
+                    .groupby(["PartyID", "BillMonth"])["Revenue"].sum()
+                    .groupby("PartyID").mean()
+                )
+                lapsed_rows = []
+                for pid in lapsed_ids:
+                    info = party_info.loc[pid] if pid in party_info.index else None
+                    lapsed_rows.append({
+                        "Party Name":        info["PartyName"]    if info is not None else pid,
+                        "Channel":           _LT_LABEL.get(info["LicenseTypeID"], "Other") if info is not None else "—",
+                        "Last Bill Date":    _last_bill_str(pid),
+                        "Days Since":        _days_since(pid),
+                        "Last Mo Revenue":   format_inr(float(prev_rev.get(pid, 0))),
+                        "Avg Monthly Rev":   format_inr(float(avg_rev.get(pid, 0))),
+                    })
+                lapsed_df = (
+                    pd.DataFrame(lapsed_rows)
+                    .sort_values("Days Since", ascending=False)
+                    .reset_index(drop=True)
+                )
+                st.dataframe(lapsed_df, use_container_width=True, hide_index=True)
+                csv_bytes = lapsed_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download Lapsed Outlets CSV",
+                    data=csv_bytes,
+                    file_name=f"lapsed_{focus_sm}_{sel_month_str}.csv",
+                    mime="text/csv",
+                )
+
+            st.divider()
+
+            # ── Never Billed in Last 3 Months ─────────────────────────────
+            st.markdown("### ⚠️ Not Billed in Last 3 Months")
+            last_3 = months_12[-3:]
+            active_3mo = frozenset(df_sm[df_sm["BillMonth"].isin(last_3)]["PartyID"])
+            cold_ids   = uni_set - active_3mo
+
+            if not cold_ids:
+                st.success("All universe outlets billed in at least one of the last 3 months!")
+            else:
+                cold_rows = []
+                for pid in cold_ids:
+                    info = party_info.loc[pid] if pid in party_info.index else None
+                    ds   = _days_since(pid)
+                    cold_rows.append({
+                        "Party Name":     info["PartyName"]    if info is not None else pid,
+                        "Channel":        _LT_LABEL.get(info["LicenseTypeID"], "Other") if info is not None else "—",
+                        "Last Bill Date": _last_bill_str(pid),
+                        "Days Since":     ds if ds < 9999 else "Never",
+                    })
+                cold_df = (
+                    pd.DataFrame(cold_rows)
+                    .sort_values("Days Since", ascending=False)
+                    .reset_index(drop=True)
+                )
+                st.dataframe(cold_df, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # ── New Outlets This Month ─────────────────────────────────────
+            st.markdown("### 🟢 New Outlets This Month")
+            new_ids = movement[focus_sm]["new_ids"]
+            # "New" = never appeared in any prior month in the 13-month window
+            first_seen = df_sm.groupby("PartyID")["BillMonth"].min()
+            truly_new  = frozenset(
+                pid for pid in new_ids
+                if first_seen.get(pid, "9999-99") == sel_month_str
+            )
+            if not truly_new:
+                st.info("No brand-new outlets this month (all new-active outlets were seen before).")
+            else:
+                new_mo_df = df_sm[
+                    df_sm["BillMonth"].eq(sel_month_str) & df_sm["PartyID"].isin(truly_new)
+                ]
+                new_party = (
+                    new_mo_df
+                    .groupby(["PartyID", "PartyName", "LicenseTypeID"], as_index=False)
+                    .agg(Revenue=("Revenue", "sum"), Cases=("Cases", "sum"))
+                )
+                new_party["Channel"]        = new_party["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+                new_party["First Bill Date"] = new_party["PartyID"].apply(_last_bill_str)
+                new_party["Revenue"]        = new_party["Revenue"].apply(format_inr)
+                st.dataframe(
+                    new_party[["PartyName", "Channel", "First Bill Date", "Revenue", "Cases"]]
+                    .rename(columns={"PartyName": "Party Name"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    # ══════════════════════════════════════════
+    # TAB 4 — SALESMAN SCORECARD
+    # ══════════════════════════════════════════
+    with tab4:
+        card_sm = st.selectbox(
+            "Select Salesman",
+            options=all_sm,
+            key="dist_card_sm",
+        )
+
+        if card_sm:
+            df_sm    = sm_data[card_sm]
+            uni_set  = uni_ids[card_sm]
+            metrics  = all_metrics[card_sm]
+            mo_row   = metrics[metrics["BillMonth"] == sel_month_str]
+            mv       = movement[card_sm]
+
+            uni_size   = len(uni_set)
+            cur_billed = int(mo_row["billed"].iloc[0])   if not mo_row.empty else 0
+            cur_wod    = mo_row["wod_pct"].iloc[0]        if not mo_row.empty else 0.0
+            cur_sr     = mo_row["strike_rate"].iloc[0]    if not mo_row.empty else 0.0
+
+            st.markdown(
+                f"## {card_sm}  "
+                f"<span style='font-size:1rem;color:#888;'>{SALESMAN_MAP[card_sm]['team']}</span>  "
+                f"<span style='font-size:0.9rem;color:#E8A838;'>Universe: {uni_size:,} outlets</span>",
+                unsafe_allow_html=True,
+            )
+            st.divider()
+
+            # KPI cards
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1:
+                st.metric("WOD %",      f"{cur_wod:.1f}%",
+                          delta=f"{cur_wod - target_wod:+.1f}% vs target",
+                          delta_color="normal" if cur_wod >= target_wod else "inverse")
+            with sc2:
+                st.metric("Strike Rate", f"{cur_sr:.1f}%")
+            with sc3:
+                st.metric("Lapsed",     mv["lapsed"])
+            with sc4:
+                st.metric("New Outlets", mv["new"])
+
+            st.divider()
+
+            # Mini charts 2×2
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.plotly_chart(
+                    _chart_wod_trend(all_metrics, months_12, [card_sm], target_wod),
+                    use_container_width=True,
+                )
+                st.plotly_chart(
+                    _chart_dod_trend(all_metrics, months_12, "avg_cas",
+                                     "Avg Cases / Outlet", [card_sm], " cs"),
+                    use_container_width=True,
+                )
+            with mc2:
+                st.plotly_chart(
+                    _chart_dod_trend(all_metrics, months_12, "avg_rev",
+                                     "Avg Revenue / Outlet", [card_sm]),
+                    use_container_width=True,
+                )
+                # Lapsed vs New trend
+                lapsed_trend = []
+                for mo in months_12:
+                    ids = _lapsed_new_ids(df_sm, mo, _prev_month_str(mo))
+                    lapsed_trend.append({
+                        "month_label": _fmt_month(mo),
+                        "Lapsed": len(ids["lapsed"]),
+                        "New":    len(ids["new"]),
+                    })
+                lt_df = pd.DataFrame(lapsed_trend)
+                fig_lt = px.line(
+                    lt_df.melt("month_label", var_name="Type", value_name="Outlets"),
+                    x="month_label", y="Outlets", color="Type",
+                    title="Lapsed vs New Outlets Trend",
+                    color_discrete_map={"Lapsed": "#e74c3c", "New": "#2ecc71"},
+                )
+                fig_lt.update_layout(**_LAYOUT,
+                                     xaxis=dict(tickangle=-30, **_GRID),
+                                     yaxis=dict(**_GRID))
+                st.plotly_chart(fig_lt, use_container_width=True)
+
+            st.divider()
+
+            # Top 10 outlets by revenue this month
+            st.markdown(f"#### Top 10 Outlets — {_fmt_month(sel_month_str)}")
+            top10_df = _party_month_agg(df_sm, sel_month_str).nlargest(10, "Revenue").copy()
+            if not top10_df.empty:
+                top10_df.insert(0, "Rank", range(1, len(top10_df) + 1))
+                top10_df["Channel"] = top10_df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+                top10_df["Revenue"] = top10_df["Revenue"].apply(format_inr)
+                st.dataframe(
+                    top10_df[["Rank", "PartyName", "Channel", "InvoiceCount", "Cases", "Revenue"]]
+                    .rename(columns={"PartyName": "Party", "InvoiceCount": "Invoices"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+            st.divider()
+
+            # Bottom 10 — low frequency outlets (billed only once in last 3 months)
+            st.markdown("#### ⚠️ Low-Frequency Outlets — Billed Once in Last 3 Months")
+            last_3 = months_12[-3:]
+            lo_df = (
+                df_sm[df_sm["BillMonth"].isin(last_3)]
+                .groupby(["PartyID", "PartyName", "LicenseTypeID"])
+                .agg(months_active=("BillMonth", "nunique"), Revenue=("Revenue", "sum"))
+                .reset_index()
+            )
+            lo_df = lo_df[lo_df["months_active"] == 1].copy()
+            if lo_df.empty:
+                st.success("All outlets billed in 2+ of the last 3 months!")
+            else:
+                today = date.today()
+                lo_df["Last Bill Date"] = lo_df["PartyID"].apply(
+                    lambda pid: (
+                        df_sm[df_sm["PartyID"] == pid]["LastBillDate"].max()
+                    )
+                )
+                lo_df["Days Since"] = lo_df["Last Bill Date"].apply(
+                    lambda d: (today - pd.Timestamp(d).date()).days
+                    if not pd.isna(d) else 9999
+                )
+                lo_df["Risk"] = lo_df["Days Since"].apply(
+                    lambda d: "🔴 High" if d > 60 else ("🟡 Medium" if d > 30 else "🟢 Low")
+                )
+                lo_df["Last Bill Date"] = lo_df["Last Bill Date"].apply(
+                    lambda d: pd.Timestamp(d).strftime("%d %b %Y") if not pd.isna(d) else "—"
+                )
+                lo_df["Channel"] = lo_df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+                lo_df["Revenue"] = lo_df["Revenue"].apply(format_inr)
+                st.dataframe(
+                    lo_df[["PartyName", "Channel", "Last Bill Date", "Days Since", "Revenue", "Risk"]]
+                    .rename(columns={"PartyName": "Party"})
+                    .sort_values("Days Since", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
