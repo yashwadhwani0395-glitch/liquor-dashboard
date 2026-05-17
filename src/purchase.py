@@ -24,6 +24,13 @@ from utils.helpers import format_inr
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
 SALES_TYPES:    tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
+# ── GL Account heads (the Balance-Sheet truth) ──────────────────────────────
+_GL_PURCHASES        = "000005"   # PURCHASES - TRADING
+_GL_EXCISE_IMPORT    = "000403"   # EXCISE DUTY ON IMPORT
+_GL_EXCISE_DIAGEO    = "000555"   # EXCISE DUTY ON IMPORT-DIAGEO
+_GL_EXCISE_SUPERV    = "000035"   # EXCISE SUPERVISION
+_GL_EXCISE_ALL       = (_GL_EXCISE_IMPORT, _GL_EXCISE_DIAGEO, _GL_EXCISE_SUPERV)
+
 # ── Principal config ─────────────────────────────────────────────────────────
 _PRINCIPAL_NAMES: dict[str, str] = {
     "C00025": "United Spirits",
@@ -175,6 +182,74 @@ def _load_purchase_kpis(start: date, end: date,
         "sup":    int(r["Sup"]    or 0),
         "ly_sup": int(r["LySup"]  or 0),
     }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_purchase_gl(start: date, end: date,
+                      ly_start: date, ly_end: date) -> dict:
+    """GL-based purchase totals (canonical — matches Balance Sheet).
+
+    Returns dict keyed by AccHeadID with both current and LY net-debit
+    figures, plus convenience aggregates (purchases / excise / total).
+    """
+    sql = """
+        SELECT
+            ah.AccHeadID, ah.AccName,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ?
+                       THEN (CASE WHEN d.DrCrIndicator='D' THEN d.Amount ELSE -d.Amount END)
+                     ELSE 0 END) AS Curr,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ?
+                       THEN (CASE WHEN d.DrCrIndicator='D' THEN d.Amount ELSE -d.Amount END)
+                     ELSE 0 END) AS Ly
+        FROM TrVocDetail d
+        JOIN TrVocHead h
+            ON  h.TransTypeID = d.TransTypeID
+            AND h.VoucherNo   = d.VoucherNo
+        JOIN MsAccountHead ah ON ah.AccHeadID = d.AccHeadID
+        WHERE h.Cancelled = 'N'
+          AND ah.AccHeadID IN (?, ?, ?, ?)
+          AND h.VoucherDate BETWEEN ? AND ?
+        GROUP BY ah.AccHeadID, ah.AccName
+    """
+    s, e, ls, le = str(start), str(end), str(ly_start), str(ly_end)
+    params = (
+        s, e, ls, le,
+        _GL_PURCHASES, _GL_EXCISE_IMPORT, _GL_EXCISE_DIAGEO, _GL_EXCISE_SUPERV,
+        ls, e,
+    )
+    df = run_query(sql, params)
+
+    out = {
+        "purchases":      0.0, "ly_purchases":      0.0,
+        "excise_import":  0.0, "ly_excise_import":  0.0,
+        "excise_diageo":  0.0, "ly_excise_diageo":  0.0,
+        "excise_superv":  0.0, "ly_excise_superv":  0.0,
+        "accounts":       [],   # full list for the breakdown table
+    }
+    if df.empty:
+        return out
+
+    for _, r in df.iterrows():
+        aid  = str(r["AccHeadID"]).strip()
+        curr = float(r["Curr"] or 0)
+        ly   = float(r["Ly"]   or 0)
+        out["accounts"].append({
+            "AccHeadID": aid, "AccName": r["AccName"], "Curr": curr, "Ly": ly,
+        })
+        if aid == _GL_PURCHASES:
+            out["purchases"], out["ly_purchases"] = curr, ly
+        elif aid == _GL_EXCISE_IMPORT:
+            out["excise_import"], out["ly_excise_import"] = curr, ly
+        elif aid == _GL_EXCISE_DIAGEO:
+            out["excise_diageo"], out["ly_excise_diageo"] = curr, ly
+        elif aid == _GL_EXCISE_SUPERV:
+            out["excise_superv"], out["ly_excise_superv"] = curr, ly
+
+    out["excise_total"]    = out["excise_import"]    + out["excise_diageo"]    + out["excise_superv"]
+    out["ly_excise_total"] = out["ly_excise_import"] + out["ly_excise_diageo"] + out["ly_excise_superv"]
+    out["total_cost"]      = out["purchases"]    + out["excise_total"]
+    out["ly_total_cost"]   = out["ly_purchases"] + out["ly_excise_total"]
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -379,42 +454,105 @@ def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
 # SECTION RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _section_kpis(kpi: dict) -> None:
-    p_delta,  p_color  = _yoy_delta(kpi["p"], kpi["ly_p"])
-    c_delta,  c_color  = _yoy_delta(kpi["c"], kpi["ly_c"])
-    avg_inv    = (kpi["p"]    / kpi["i"])    if kpi["i"]    else 0
-    ly_avg_inv = (kpi["ly_p"] / kpi["ly_i"]) if kpi["ly_i"] else 0
-    ai_delta, ai_color = _yoy_delta(avg_inv, ly_avg_inv)
+def _section_kpis(kpi: dict, gl: dict) -> None:
+    """KPI row uses GL-based totals (matches BS); cases/suppliers stay item-based."""
+    tot_delta, tot_color = _yoy_delta(gl["total_cost"], gl["ly_total_cost"])
+    exc_delta, exc_color = _yoy_delta(gl["excise_total"], gl["ly_excise_total"])
+    c_delta,   c_color   = _yoy_delta(kpi["c"], kpi["ly_c"])
+
+    exc_pct = (gl["excise_total"] / gl["total_cost"] * 100) if gl["total_cost"] else 0
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(_kpi_card(
-            "Total Purchase",
-            f"₹{kpi['p']/1e7:.2f} Cr",
-            f"{p_delta} vs LY (₹{kpi['ly_p']/1e7:.2f} Cr)",
-            p_color, _KPI_COLORS[0],
+            "Total Purchase Cost",
+            f"₹{gl['total_cost']/1e7:.2f} Cr",
+            f"Invoice ₹{gl['purchases']/1e7:.2f} Cr + Excise ₹{gl['excise_total']/1e7:.2f} Cr  ·  {tot_delta} YoY",
+            tot_color, _KPI_COLORS[0],
         ), unsafe_allow_html=True)
     with c2:
         st.markdown(_kpi_card(
-            "Total Cases",
-            f"{kpi['c']:,}",
-            f"{c_delta} YoY (LY: {kpi['ly_c']:,})",
-            c_color, _KPI_COLORS[1],
+            "Excise Duty Paid",
+            f"₹{gl['excise_total']/1e7:.2f} Cr",
+            f"{exc_pct:.1f}% of total  ·  {exc_delta} YoY",
+            exc_color, _KPI_COLORS[1],
         ), unsafe_allow_html=True)
     with c3:
         st.markdown(_kpi_card(
-            "Avg Invoice Value",
-            f"₹{avg_inv:,.0f}",
-            f"{ai_delta} YoY (LY: ₹{ly_avg_inv:,.0f})",
-            ai_color, _KPI_COLORS[2],
+            "Cases Purchased",
+            f"{kpi['c']:,}",
+            f"{c_delta} YoY (LY: {kpi['ly_c']:,})",
+            c_color, _KPI_COLORS[2],
         ), unsafe_allow_html=True)
     with c4:
         st.markdown(_kpi_card(
-            "Active Suppliers",
-            f"{kpi['sup']}",
-            f"LY: {kpi['ly_sup']}",
+            "Invoices · Suppliers",
+            f"{kpi['i']}  ·  {kpi['sup']}",
+            f"LY: {kpi['ly_i']} invoices  ·  {kpi['ly_sup']} suppliers",
             "#6b7280", _KPI_COLORS[3],
         ), unsafe_allow_html=True)
+
+
+def _section_cost_breakdown(gl: dict) -> None:
+    """3 cards (Invoice / Excise / Total) + reconciliation table."""
+    st.markdown("##### Purchase Cost Breakdown")
+    st.caption("Reconciles to Balance Sheet — total cost of goods purchased")
+
+    total = gl["total_cost"] or 1.0  # avoid div0 in % calc
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        pct = gl["purchases"] / total * 100
+        st.markdown(_kpi_card(
+            "Invoice Value",
+            f"₹{gl['purchases']/1e7:.2f} Cr",
+            f"{pct:.1f}% of cost  ·  source: PURCHASES - TRADING (GL)",
+            "#6b7280", "#1B4F72",
+        ), unsafe_allow_html=True)
+    with m2:
+        pct = gl["excise_total"] / total * 100
+        st.markdown(_kpi_card(
+            "Excise Duty on Imports",
+            f"₹{gl['excise_total']/1e7:.2f} Cr",
+            f"{pct:.1f}% of cost  ·  paid directly to govt",
+            "#6b7280", "#EF9F27",
+        ), unsafe_allow_html=True)
+    with m3:
+        st.markdown(_kpi_card(
+            "Total Cost",
+            f"₹{gl['total_cost']/1e7:.2f} Cr",
+            "Invoice + Excise (matches Balance Sheet)",
+            "#16a34a", "#1D9E75",
+        ), unsafe_allow_html=True)
+
+    # Per-account breakdown table
+    rows = []
+    if gl["purchases"]:
+        rows.append({"Account": "PURCHASES - TRADING",
+                     "Amount": gl["purchases"], "% of Total": gl["purchases"]/total*100})
+    if gl["excise_import"]:
+        rows.append({"Account": "EXCISE DUTY ON IMPORT",
+                     "Amount": gl["excise_import"], "% of Total": gl["excise_import"]/total*100})
+    if gl["excise_diageo"]:
+        rows.append({"Account": "EXCISE DUTY ON IMPORT - DIAGEO",
+                     "Amount": gl["excise_diageo"], "% of Total": gl["excise_diageo"]/total*100})
+    if gl["excise_superv"]:
+        rows.append({"Account": "EXCISE SUPERVISION",
+                     "Amount": gl["excise_superv"], "% of Total": gl["excise_superv"]/total*100})
+    rows.append({"Account": "TOTAL COST", "Amount": gl["total_cost"], "% of Total": 100.0})
+
+    df = pd.DataFrame(rows)
+
+    def _bold_total(row):
+        return ["font-weight:700; background-color:#f3f4f6" if row["Account"] == "TOTAL COST" else ""
+                for _ in row]
+
+    styled = (
+        df.style
+        .apply(_bold_total, axis=1)
+        .format({"Amount": format_inr, "% of Total": "{:.1f}%"})
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def _section_reconciliation(rec_df: pd.DataFrame) -> None:
@@ -662,23 +800,31 @@ def render() -> None:
 
     with st.spinner("Loading purchase data…"):
         kpi          = _load_purchase_kpis(start, end, ly_start, ly_end, principal_ids)
+        gl           = _load_purchase_gl(start, end, ly_start, ly_end)
         p_df         = _load_purchase_by_principal(start, end, ly_start, ly_end)
         rec_df       = _load_purchase_vs_sales(start, end)
         monthly_df   = _load_purchase_monthly(24, principal_ids)
         brands_df    = _load_top_brands_purchased(start, end, principal_ids)
         vouchers_df  = _load_recent_vouchers(end)
 
-    if kpi["p"] == 0 and kpi["ly_p"] == 0:
+    if gl["total_cost"] == 0 and gl["ly_total_cost"] == 0 and kpi["p"] == 0:
         st.warning("No purchase data for the selected period or filters.")
         return
 
-    # Apply principal filter to data sets that came back unfiltered
+    # Apply principal filter to item-level data sets (GL is not principal-aware)
     if principal_ids:
         p_df   = p_df[p_df["CompanyID"].isin(principal_ids)]
         rec_df = rec_df[rec_df["CompanyID"].isin(principal_ids)]
 
-    _section_kpis(kpi)
+    _section_kpis(kpi, gl)
     st.divider()
+    _section_cost_breakdown(gl)
+    st.divider()
+    st.caption(
+        "Brand, principal, and reconciliation breakdowns below show "
+        "**invoice value only** (item-level, excludes excise paid to govt). "
+        "Total cost including excise is in the header above."
+    )
     _section_reconciliation(rec_df)
     st.divider()
     _section_principal_breakdown(p_df)
