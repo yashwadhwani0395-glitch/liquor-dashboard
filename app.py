@@ -128,8 +128,8 @@ with t1:
                 "Consolidated KPIs from every module")
 
 with t2:
-    coming_soon("Purchase Analytics",
-                "Principal-wise purchases and claim tracking")
+    from src.purchase import render as render_purchase
+    render_purchase()
 
 with t3:
     s1, s2, s3, s4, s5 = st.tabs([
@@ -153,7 +153,8 @@ with t3:
         render_operations()
 
 with t4:
-    coming_soon("Inventory Module", "Stock levels and movement")
+    from src.inventory import render as render_inventory
+    render_inventory()
 
 with t5:
     coming_soon("Expense Tracking", "Operating expenses by category")
