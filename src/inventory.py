@@ -21,6 +21,15 @@ import streamlit as st
 from db import run_query
 from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 
+
+def _safe_format(df: "pd.DataFrame", fmt: dict) -> dict:
+    """Drop any keys from the format dict that aren't columns of `df`.
+
+    Defensive guard: prevents KeyError crashes when a column is renamed
+    or absent. Pair with df.style.format(_safe_format(df, fmt)).
+    """
+    return {k: v for k, v in fmt.items() if k in df.columns}
+
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
 IMPORT_TYPES:   tuple[int, ...] = (22, 54)               # imports proper
 DAMAN_TYPES:    tuple[int, ...] = (42,)                  # Daman / cross-state
@@ -493,12 +502,6 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
     )
     slow = slow.sort_values("DaysCover", ascending=False).head(30)
 
-    def _row_style(row):
-        if row["DaysCover"] > 90:  bg = "background-color:#fee2e2"
-        elif row["DaysCover"] > 30: bg = "background-color:#fef3c7"
-        else: bg = ""
-        return [bg] * len(row)
-
     disp = slow[["BrandName", "ItemDescription", "ClosingCases",
                  "Sales30", "DaysCover", "Value"]].rename(columns={
         "BrandName":       "Brand",
@@ -508,15 +511,25 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
         "DaysCover":       "Days of Cover",
         "Value":           "Stock Value",
     })
+
+    # Row style uses the RENAMED column ("Days of Cover"), not the original.
+    def _row_style(row):
+        v = row["Days of Cover"]
+        if v > 90:    bg = "background-color:#fee2e2"
+        elif v > 30:  bg = "background-color:#fef3c7"
+        else:         bg = ""
+        return [bg] * len(row)
+
+    fmt = {
+        "Closing Cases":   "{:,.0f}",
+        "Last 30d Cases":  "{:,.2f}",
+        "Days of Cover":   lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
+        "Stock Value":     format_inr,
+    }
     styled = (
         disp.style
         .apply(_row_style, axis=1)
-        .format({
-            "Closing Cases":   "{:,.0f}",
-            "Last 30d Cases":  "{:,.2f}",
-            "Days of Cover":   lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
-            "Stock Value":     format_inr,
-        })
+        .format(_safe_format(disp, fmt))
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -592,14 +605,15 @@ def _section_days_of_cover(stock_df: pd.DataFrame, vel_df: pd.DataFrame) -> None
         "DailyAvg":        "Daily Avg Sales",
         "DaysCover":       "Days of Cover",
     })
+    fmt = {
+        "Stock (Cases)":    "{:,.0f}",
+        "Daily Avg Sales":  "{:.2f}",
+        "Days of Cover":    lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
+    }
     styled = (
         disp.style
         .apply(_doc_style, axis=1)
-        .format({
-            "Stock (Cases)":    "{:,.0f}",
-            "Daily Avg Sales":  "{:.2f}",
-            "Days of Cover":    lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
-        })
+        .format(_safe_format(disp, fmt))
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 

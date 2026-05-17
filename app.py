@@ -106,6 +106,14 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+# ── Construction notice ─────────────────────────────────────────────────────
+st.info(
+    "🔨 **Expenses**, **Cash Flow**, and **Balance Sheet** tabs are under "
+    "construction. The other tabs (Overview · Purchase · Sales · Inventory) "
+    "are fully operational.",
+    icon=None,
+)
+
 # ── Top-level tabs ───────────────────────────────────────────────────────────
 t1, t2, t3, t4, t5, t6, t7 = st.tabs([
     "Overview", "Purchase", "Sales", "Inventory",
