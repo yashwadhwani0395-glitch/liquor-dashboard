@@ -3,15 +3,21 @@
 Tracks Width of Distribution (WOD), Depth of Distribution (DOD),
 outlet lapse/recovery, and individual salesman scorecards.
 
-Universe per salesman = distinct outlets that billed their principal's
-products in their assigned channel at any point in the last 13 months.
-Derived 100 % from billing history (not MsPartyMaster static list).
+Universe per salesman = outlets directly assigned in MsPartyMaster via
+SalesManID / SalesManID1 / SalesManID2 fields, filtered by license type
+and AcType3 as per territory rules.  This is stable master data — not
+billing history — so outlets that happen to go silent in a month still
+remain in the universe denominator.
 
-NOTE on query:
-  - Party IDs in this DB are D-prefixed (D00001 etc.) — no LIKE filter.
+Billing data is a separate query (last 13 months) used only for WOD/DOD
+numerator calculations.
+
+NOTE:
+  - Party IDs are D-prefixed (D00001 etc.) — no LIKE filter.
   - FinancialYear computed from VoucherDate to avoid TrVocItem duplication
-    at the fiscal-year boundary (both '2025-2026' and '2026-2027' tags can
-    exist for the same voucher around March/April).
+    at the fiscal-year boundary.
+  - Miran's SalesManID = '000039' (person); C00039 = United Breweries
+    (company). Different tables, different ID formats — no collision.
 """
 from __future__ import annotations
 
@@ -52,24 +58,89 @@ _LT_LABEL: dict[str, str] = {
 # SALESMAN MAP
 # ═══════════════════════════════════════════════════════════════════════════════
 SALESMAN_MAP: dict[str, dict] = {
-    "Shashank":       {"team": "USL Wine Shops",       "principals": ["C00025"],           "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Sachin":         {"team": "USL Wine Shops",       "principals": ["C00025"],           "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Tulsiram":       {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Saurabh":        {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Miran":          {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Prashant":       {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Atish":          {"team": "USL+Diageo POP",       "principals": ["C00025", "C00040"], "license_types": ["180002"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Ajay":           {"team": "Diageo+BF Wine Shops", "principals": ["C00040", "C00056"], "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Deepak Patil":   {"team": "Diageo+BF Wine Shops", "principals": ["C00040", "C00056"], "license_types": ["180001"],                    "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Aabid":          {"team": "UBL KW Beer",          "principals": ["C00039"],           "license_types": ["180001", "180002", "180004"], "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Omkar":          {"team": "UBL KW Beer",          "principals": ["C00039"],           "license_types": ["180001", "180002", "180004"], "ac3_include": [],                  "ac3_exclude": ["130004", "130002", "130006"]},
-    "Anand Raj":      {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
-    "Deepak Pangare": {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
-    "Shashank Desai": {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
-    "Pranav":         {"team": "KW Institution",       "principals": ["C00039", "C00056"], "license_types": ["180002"],                    "ac3_include": ["130004", "130006"], "ac3_exclude": []},
-    "Gajendra Das":   {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
-    "Amol Sathe":     {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
-    "Rahul Ghone":    {"team": "PCMC Institution",     "principals": ["C00039"],           "license_types": ["180002"],                    "ac3_include": ["130002"],           "ac3_exclude": []},
+    # ── USL Wine Shops (SM0) ─────────────────────────────────────────────
+    # NOTE: 130007 (cross-supply wine shops) IS valid for USL/Diageo teams.
+    # Suresh Nair (000040) handles cross-supply UBL beer — he is in SM2 for
+    # these same outlets.  Shashank/Sachin still service them for USL wine.
+    "Shashank":       {"team": "USL Wine Shops",       "sm_id": "000014",
+                       "principals": ["C00025"],
+                       "license_types": ["180001"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Sachin":         {"team": "USL Wine Shops",       "sm_id": "000012",
+                       "principals": ["C00025"],
+                       "license_types": ["180001"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    # ── USL+Diageo Permit Rooms (SM0) ────────────────────────────────────
+    "Tulsiram":       {"team": "USL+Diageo POP",       "sm_id": "000024",
+                       "principals": ["C00025","C00040"],
+                       "license_types": ["180002"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Saurabh":        {"team": "USL+Diageo POP",       "sm_id": "000018",
+                       "principals": ["C00025","C00040"],
+                       "license_types": ["180002"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Miran":          {"team": "USL+Diageo POP",       "sm_id": "000039",
+                       "principals": ["C00025","C00040"],
+                       "license_types": ["180002"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Prashant":       {"team": "USL+Diageo POP",       "sm_id": "000025",
+                       "principals": ["C00025","C00040"],
+                       "license_types": ["180002"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Atish":          {"team": "USL+Diageo POP",       "sm_id": "000033",
+                       "principals": ["C00025","C00040"],
+                       "license_types": ["180002"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    # ── Diageo+BF Wine Shops (SM1) ────────────────────────────────────────
+    "Ajay":           {"team": "Diageo+BF Wine Shops", "sm_id": "000030",
+                       "principals": ["C00040","C00056"],
+                       "license_types": ["180001"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    "Deepak Patil":   {"team": "Diageo+BF Wine Shops", "sm_id": "000004",
+                       "principals": ["C00040","C00056"],
+                       "license_types": ["180001"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+    # ── UBL KW Beer (SM0 + SM2, regular outlets) ─────────────────────────
+    # Exclude 130007 cross-supply: those outlets are covered by Suresh Nair
+    # (000040) for UBL beer — Aabid/Omkar handle the regular KW Beer outlets.
+    "Aabid":          {"team": "UBL KW Beer",          "sm_id": "000028",
+                       "principals": ["C00039"],
+                       "license_types": ["180001","180002","180004"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006","130007"]},
+    "Omkar":          {"team": "UBL KW Beer",          "sm_id": "000032",
+                       "principals": ["C00039"],
+                       "license_types": ["180001","180002","180004"],
+                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006","130007"]},
+    # ── KW Institution (SM2) ─────────────────────────────────────────────
+    "Anand Raj":      {"team": "KW Institution",       "sm_id": "000037",
+                       "principals": ["C00039","C00056"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+    "Deepak Pangare": {"team": "KW Institution",       "sm_id": "000038",
+                       "principals": ["C00039","C00056"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+    "Shashank Desai": {"team": "KW Institution",       "sm_id": "000036",
+                       "principals": ["C00039","C00056"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+    "Pranav":         {"team": "KW Institution",       "sm_id": "000026",
+                       "principals": ["C00039","C00056"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+    # ── PCMC Institution (SM2) ────────────────────────────────────────────
+    "Gajendra Das":   {"team": "PCMC Institution",     "sm_id": "000042",
+                       "principals": ["C00039"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130002"], "ac3_exclude": []},
+    "Amol Sathe":     {"team": "PCMC Institution",     "sm_id": "000041",
+                       "principals": ["C00039"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130002"], "ac3_exclude": []},
+    "Rahul Ghone":    {"team": "PCMC Institution",     "sm_id": "000043",
+                       "principals": ["C00039"],
+                       "license_types": ["180002"],
+                       "ac3_include": ["130002"], "ac3_exclude": []},
 }
 
 
@@ -200,6 +271,68 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
     df["CompanyID"]     = df["CompanyID"].fillna("").astype(str)
     df["LastBillDate"]  = pd.to_datetime(df["LastBillDate"],  errors="coerce")
     return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSE LOADER  (MsPartyMaster-based, cached 1 hour)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_universe() -> pd.DataFrame:
+    """
+    Load salesman-assigned parties from MsPartyMaster.
+    Returns one row per party with SM0/SM1/SM2 columns (stripped strings).
+
+    Universe per salesman = parties where the salesman's ID appears in
+    ANY of SalesManID, SalesManID1, SalesManID2, filtered by the
+    salesman's license_types and ac3 rules.
+
+    This is stable master data — it does not fluctuate with billing
+    activity, so the denominator is consistent month to month.
+    """
+    df = run_query("""
+        SELECT
+            p.PartyID,
+            p.PartyName,
+            ISNULL(p.LicenseTypeID, '')             AS LicenseTypeID,
+            ISNULL(p.AcType3ID,     '')             AS AcType3ID,
+            RTRIM(ISNULL(p.SalesManID,  ''))        AS SM0,
+            RTRIM(ISNULL(p.SalesManID1, ''))        AS SM1,
+            RTRIM(ISNULL(p.SalesManID2, ''))        AS SM2
+        FROM MsPartyMaster p
+        WHERE p.BannedPartyYN = 'N'
+          AND p.LicenseTypeID IN ('180001','180002','180004','180005','180007')
+    """)
+    if df.empty:
+        return df
+    for col in ("LicenseTypeID", "AcType3ID", "SM0", "SM1", "SM2"):
+        df[col] = df[col].fillna("").str.strip().astype(str)
+    return df
+
+
+def _uni_ids_from_master(uni_df: pd.DataFrame, sm_key: str) -> frozenset:
+    """
+    Return the set of PartyIDs for a salesman's universe by matching
+    their sm_id against SM0, SM1, or SM2 in the party master, then
+    applying the same license_type / ac3 filters as the billing query.
+    """
+    cfg   = SALESMAN_MAP[sm_key]
+    sm_id = cfg["sm_id"]
+
+    # Outlet must have the salesman in at least one SM column
+    in_any_sm = (
+        (uni_df["SM0"] == sm_id) |
+        (uni_df["SM1"] == sm_id) |
+        (uni_df["SM2"] == sm_id)
+    )
+    mask = in_any_sm & uni_df["LicenseTypeID"].isin(cfg["license_types"])
+
+    if cfg["ac3_include"]:
+        mask &= uni_df["AcType3ID"].isin(cfg["ac3_include"])
+    if cfg["ac3_exclude"]:
+        mask &= ~uni_df["AcType3ID"].isin(cfg["ac3_exclude"])
+
+    return frozenset(uni_df.loc[mask, "PartyID"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -488,9 +621,13 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
     # ── Load data ─────────────────────────────────────────────────────────────
     with st.spinner("Loading distribution analytics…"):
         master = _load_master(13)
+        uni_df = _load_universe()
 
     if master.empty:
         st.error("No billing data returned. Check DB connection.")
+        return
+    if uni_df.empty:
+        st.error("No universe data returned from MsPartyMaster. Check DB connection.")
         return
 
     # ── Pre-compute per-salesman slices & metrics ────────────────────────────
@@ -503,7 +640,7 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
     for sm in SALESMAN_MAP:           # compute for ALL salesmen (scorecard tab needs full set)
         df_sm         = _filter_sm(master, sm)
         sm_data[sm]   = df_sm
-        uni_ids[sm]   = frozenset(df_sm["PartyID"].unique())
+        uni_ids[sm]   = _uni_ids_from_master(uni_df, sm)   # ← MsPartyMaster universe
         all_metrics[sm] = _monthly_metrics(df_sm, months_12, uni_ids[sm])
         ids = _lapsed_new_ids(df_sm, sel_month_str, prev_month_str)
         movement[sm] = {k: len(v) for k, v in ids.items()}
