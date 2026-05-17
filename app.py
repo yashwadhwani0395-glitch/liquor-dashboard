@@ -106,26 +106,57 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Tabs ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📈  Overview",
-    "👥  Team Performance",
-    "📦  Distribution",
-    "📊  Meeting Pack",
+# ── Top-level tabs ───────────────────────────────────────────────────────────
+t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    "Overview", "Purchase", "Sales", "Inventory",
+    "Expenses", "Cash Flow", "Balance Sheet",
 ])
 
-with tab1:
-    from src.sales import render as render_sales
-    render_sales()
 
-with tab2:
-    from src.salesman import render as render_salesman
-    render_salesman()
+def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
+    st.markdown(f"""
+    <div style='padding: 80px 0; text-align: center'>
+        <div style='font-size: 56px; margin-bottom: 16px; opacity: 0.25'>{icon}</div>
+        <div style='font-size: 20px; font-weight: 600; color: #1a1a1a; margin-bottom: 8px'>{title}</div>
+        <div style='font-size: 13px; color: #888; max-width: 500px; margin: 0 auto'>{desc}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-with tab3:
-    from src.distribution import render as render_distribution
-    render_distribution()
 
-with tab4:
-    from src.principal import render as render_principal
-    render_principal()
+with t1:
+    coming_soon("Overview Dashboard",
+                "Consolidated KPIs from every module")
+
+with t2:
+    coming_soon("Purchase Analytics",
+                "Principal-wise purchases and claim tracking")
+
+with t3:
+    s1, s2, s3, s4 = st.tabs([
+        "Sales Overview", "Team Performance",
+        "Distribution", "Meeting Pack",
+    ])
+    with s1:
+        from src.sales import render as render_sales
+        render_sales()
+    with s2:
+        from src.salesman import render as render_salesman
+        render_salesman()
+    with s3:
+        from src.distribution import render as render_distribution
+        render_distribution()
+    with s4:
+        from src.principal import render as render_principal
+        render_principal()
+
+with t4:
+    coming_soon("Inventory Module", "Stock levels and movement")
+
+with t5:
+    coming_soon("Expense Tracking", "Operating expenses by category")
+
+with t6:
+    coming_soon("Cash Flow & Outstanding", "Debtor and creditor ageing")
+
+with t7:
+    coming_soon("Balance Sheet", "Key ratios coming soon")
