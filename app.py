@@ -132,9 +132,9 @@ with t2:
                 "Principal-wise purchases and claim tracking")
 
 with t3:
-    s1, s2, s3, s4 = st.tabs([
+    s1, s2, s3, s4, s5 = st.tabs([
         "Sales Overview", "Team Performance",
-        "Distribution", "Meeting Pack",
+        "Distribution", "Meeting Pack", "Operations Rhythm",
     ])
     with s1:
         from src.sales import render as render_sales
@@ -148,6 +148,9 @@ with t3:
     with s4:
         from src.principal import render as render_principal
         render_principal()
+    with s5:
+        from src.operations import render as render_operations
+        render_operations()
 
 with t4:
     coming_soon("Inventory Module", "Stock levels and movement")
