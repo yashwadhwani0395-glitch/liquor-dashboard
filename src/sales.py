@@ -54,18 +54,55 @@ def _inr(value: float) -> str:
 # ── Data loaders (all cached 5 minutes) ────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _load_brands() -> pd.DataFrame:
-    return run_query(
-        "SELECT BrandID, BrandName FROM MsBrandMaster ORDER BY BrandName"
+def _load_active_brands(start: date, end: date) -> pd.DataFrame:
+    """Brands with actual sales in the selected date range (active only)."""
+    fy_years = _load_fy_years(start, end)
+    type_ph  = ",".join("?" * len(SALES_TYPES))
+    fy_clause, fy_params = "", ()
+    if fy_years:
+        fy_clause  = f"AND vi.FinancialYear IN ({','.join('?' * len(fy_years))})"
+        fy_params  = tuple(fy_years)
+    df = run_query(
+        f"""
+        SELECT DISTINCT b.BrandID, b.BrandName
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.FreeItemYN  = 'N'
+            AND vi.ItemID      LIKE 'I%'
+        JOIN MsItemMaster  im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID  = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          {fy_clause}
+          AND h.VoucherDate BETWEEN ? AND ?
+        ORDER BY b.BrandName
+        """,
+        SALES_TYPES + fy_params + (str(start), str(end)),
     )
+    return df
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _load_salesmen() -> pd.DataFrame:
-    return run_query(
-        "SELECT SalesManID, FullName FROM MsSalesmanMaster "
-        "WHERE ResignDate IS NULL ORDER BY FullName"
+def _load_active_salesmen(start: date, end: date) -> pd.DataFrame:
+    """Salesmen with actual sales in the selected date range (active only)."""
+    type_ph = ",".join("?" * len(SALES_TYPES))
+    df = run_query(
+        f"""
+        SELECT DISTINCT h.SalesManID,
+               ISNULL(sm.FullName, 'Unassigned') AS FullName
+        FROM TrVocHead h
+        JOIN MsSalesmanMaster sm ON sm.SalesManID = h.SalesManID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate BETWEEN ? AND ?
+        ORDER BY FullName
+        """,
+        SALES_TYPES + (str(start), str(end)),
     )
+    return df
+
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -383,11 +420,7 @@ def render():
     st.caption("Invoicewise sales performance for KWPL | Source: TEKNIK ERP")
     st.divider()
 
-    # ── Pre-load filter option lists ──────────────────────────────────────
-    brands_df   = _load_brands()
-    salesmen_df = _load_salesmen()
-
-    # ── Inline filter row ─────────────────────────────────────────────────
+    # ── Inline filter row — date inputs first, then active-only dropdowns ──
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
@@ -398,13 +431,31 @@ def render():
         with fc2:
             end = st.date_input("To", value=today, key="s_to")
 
-        # Brand filter
-        brand_map: dict[str, int] = {}
+    if start > end:
+        st.warning("Start date must be before end date.")
+        return
+
+    # Load filter options based on selected date range (active brands/salesmen only)
+    brands_df   = _load_active_brands(start, end)
+    salesmen_df = _load_active_salesmen(start, end)
+
+    with st.container():
+        fc3, fc4 = st.columns([2.4, 2.4])
+
+        # Brand filter — deduplicated names; filter uses ALL matching IDs
+        brand_names: list[str] = []
         if not brands_df.empty:
-            brand_map = dict(zip(brands_df["BrandName"], brands_df["BrandID"].astype(int)))
+            brand_names = sorted(brands_df["BrandName"].drop_duplicates().tolist())
         with fc3:
-            sel_brands = st.multiselect("Brand", options=sorted(brand_map), key="s_brands")
-        brand_ids = tuple(brand_map[b] for b in sel_brands)
+            sel_brands = st.multiselect("Brand", options=brand_names, key="s_brands")
+        # Collect ALL BrandIDs for selected names (handles ERP duplicates)
+        if sel_brands and not brands_df.empty:
+            brand_ids = tuple(
+                int(bid) for bid in
+                brands_df.loc[brands_df["BrandName"].isin(sel_brands), "BrandID"]
+            )
+        else:
+            brand_ids = ()
 
         # Salesman filter
         sm_map: dict[str, str] = {}
@@ -413,10 +464,6 @@ def render():
         with fc4:
             sel_sm = st.multiselect("Salesman", options=sorted(sm_map), key="s_sm")
         salesman_ids = tuple(sm_map[s] for s in sel_sm)
-
-    if start > end:
-        st.warning("Start date must be before end date.")
-        return
 
     # ── Fetch main period data ─────────────────────────────────────────────
     with st.spinner("Fetching sales data..."):

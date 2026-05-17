@@ -100,17 +100,22 @@ SALESMAN_MAP: dict[str, dict] = {
                        "principals": ["C00040","C00056"],
                        "license_types": ["180001"],
                        "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
-    # ── UBL KW Beer (SM0 + SM2, regular outlets) ─────────────────────────
-    # Exclude 130007 cross-supply: those outlets are covered by Suresh Nair
-    # (000040) for UBL beer — Aabid/Omkar handle the regular KW Beer outlets.
+    # ── UBL KW Beer ──────────────────────────────────────────────────────
+    # Aabid: SM2 only, wine shops + permit rooms (cross-supply beer outlets).
+    #   SM2 LT=['180001','180002'] = 25+92 = 117 (matches ERP).
+    #   sm_fields=['SM2'] prevents SM0 (only 2 non-beer outlets) from inflating.
+    # Omkar: SM0 + SM2, beer shopee (180004) territory only.
+    #   SM0∪SM2 with LT=['180004'] union = 114 (matches ERP).
     "Aabid":          {"team": "UBL KW Beer",          "sm_id": "000028",
                        "principals": ["C00039"],
-                       "license_types": ["180001","180002","180004"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006","130007"]},
+                       "sm_fields": ["SM2"],
+                       "license_types": ["180001","180002"],
+                       "ac3_include": [], "ac3_exclude": []},
     "Omkar":          {"team": "UBL KW Beer",          "sm_id": "000032",
                        "principals": ["C00039"],
-                       "license_types": ["180001","180002","180004"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006","130007"]},
+                       "sm_fields": ["SM0","SM2"],
+                       "license_types": ["180004"],
+                       "ac3_include": [], "ac3_exclude": []},
     # ── KW Institution (SM2) ─────────────────────────────────────────────
     "Anand Raj":      {"team": "KW Institution",       "sm_id": "000037",
                        "principals": ["C00039","C00056"],
@@ -247,6 +252,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
+                      AND PartyID LIKE 'D%'   -- customer outlets only
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
         JOIN MsPartyMaster p  ON p.PartyID  = d.PartyID
@@ -316,15 +322,15 @@ def _uni_ids_from_master(uni_df: pd.DataFrame, sm_key: str) -> frozenset:
     their sm_id against SM0, SM1, or SM2 in the party master, then
     applying the same license_type / ac3 filters as the billing query.
     """
-    cfg   = SALESMAN_MAP[sm_key]
-    sm_id = cfg["sm_id"]
+    cfg       = SALESMAN_MAP[sm_key]
+    sm_id     = cfg["sm_id"]
+    sm_fields = cfg.get("sm_fields", ["SM0", "SM1", "SM2"])  # default: all three
 
-    # Outlet must have the salesman in at least one SM column
-    in_any_sm = (
-        (uni_df["SM0"] == sm_id) |
-        (uni_df["SM1"] == sm_id) |
-        (uni_df["SM2"] == sm_id)
-    )
+    # Outlet must have the salesman in at least one of the specified SM columns
+    in_any_sm = pd.Series(False, index=uni_df.index)
+    for field in sm_fields:
+        in_any_sm |= (uni_df[field] == sm_id)
+
     mask = in_any_sm & uni_df["LicenseTypeID"].isin(cfg["license_types"])
 
     if cfg["ac3_include"]:
@@ -940,12 +946,16 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
                         "Party Name":     info["PartyName"]    if info is not None else pid,
                         "Channel":        _LT_LABEL.get(info["LicenseTypeID"], "Other") if info is not None else "—",
                         "Last Bill Date": _last_bill_str(pid),
-                        "Days Since":     ds if ds < 9999 else "Never",
+                        "Days Since":     ds,   # keep int; 9999 = never billed
                     })
                 cold_df = (
                     pd.DataFrame(cold_rows)
-                    .sort_values("Days Since", ascending=False)
+                    .sort_values("Days Since", ascending=False)  # sort by int first
                     .reset_index(drop=True)
+                )
+                # Format "Never" after sort to avoid mixed-type sort crash
+                cold_df["Days Since"] = cold_df["Days Since"].apply(
+                    lambda x: "Never" if x >= 9999 else x
                 )
                 st.dataframe(cold_df, use_container_width=True, hide_index=True)
 
