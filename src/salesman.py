@@ -285,6 +285,7 @@ def _load_data(start: date, end: date) -> pd.DataFrame:
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
+                      AND PartyID LIKE 'D%'   -- only customer (outlet) parties
             ) x
             WHERE rn = 1
         ) d  ON  d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo

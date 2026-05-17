@@ -25,6 +25,16 @@ _LAYOUT = dict(
 )
 _PAL    = px.colors.qualitative.Bold
 
+# ── Principal constants (for donut + mapping) ──────────────────────────────
+_PRINCIPAL_MAP: dict[str, str] = {
+    "C00025": "United Spirits",
+    "C00040": "Diageo",
+    "C00039": "United Breweries",
+    "C00056": "Brown-Forman",
+}
+_PRINCIPAL_ORDER  = ["United Spirits", "Diageo", "United Breweries", "Brown-Forman", "Others"]
+_PRINCIPAL_COLORS = ["#1B4F72", "#378ADD", "#1D9E75", "#EF9F27", "#B4B2A9"]
+
 
 # ── Indian rupee formatter for table cells (exact, with grouping) ──────────
 
@@ -149,6 +159,7 @@ def _build_query(
             ISNULL(d.PartyID,         '')            AS PartyID,
             ISNULL(p.PartyName,       'Unknown')     AS PartyName,
             ISNULL(b.BrandName,       'Unknown')     AS BrandName,
+            ISNULL(b.CompanyID,       '')             AS CompanyID,
             ISNULL(im.ItemDescription,'Unknown')     AS ItemDescription,
             ISNULL(im.LiquorSize,     '')            AS LiquorSize,
             CAST(vi.CaseQty        AS BIGINT) AS CaseQty,
@@ -207,6 +218,7 @@ def _load_sales(
     df["TotalAmount"] = pd.to_numeric(df["TotalAmount"], errors="coerce").fillna(0.0)
     df["CaseQty"]     = pd.to_numeric(df["CaseQty"],     errors="coerce").fillna(0).astype(int)
     df["BottleQty"]   = pd.to_numeric(df["BottleQty"],   errors="coerce").fillna(0).astype(int)
+    df["Principal"]   = df["CompanyID"].map(_PRINCIPAL_MAP).fillna("Others")
     return df
 
 
@@ -218,12 +230,17 @@ def _daily_trend(df: pd.DataFrame) -> go.Figure:
         .sum().reset_index()
         .rename(columns={"VoucherDate": "Date", "TotalAmount": "Sales"})
     )
+    agg["RevCr"] = agg["Sales"] / 1e7
     fig = px.line(
-        agg, x="Date", y="Sales", markers=True,
+        agg, x="Date", y="RevCr", markers=True,
         color_discrete_sequence=[_GOLD],
-        labels={"Sales": "Sales (₹)", "Date": ""},
+        labels={"RevCr": "Revenue (₹ Cr)", "Date": ""},
     )
-    fig.update_layout(**_LAYOUT, xaxis=_GRID, yaxis=_GRID)
+    fig.update_layout(
+        **_LAYOUT,
+        xaxis=_GRID,
+        yaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
     fig.update_traces(line_width=2.5, marker_size=5)
     return fig
 
@@ -233,36 +250,64 @@ def _brand_bar(df: pd.DataFrame) -> go.Figure:
         df.groupby("BrandName")["TotalAmount"].sum()
         .sort_values().tail(15).reset_index()
     )
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
     fig = px.bar(
-        agg, x="TotalAmount", y="BrandName", orientation="h",
-        color="TotalAmount", color_continuous_scale=["#D6E8F7", _GOLD],
-        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "BrandName": ""},
+        agg, x="RevCr", y="BrandName", orientation="h",
+        color="RevCr", color_continuous_scale=["#D6E8F7", _GOLD],
+        text=agg["RevCr"].map(lambda v: f"₹{v:.2f} Cr"),
+        labels={"RevCr": "Revenue (₹ Cr)", "BrandName": ""},
     )
-    fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
-                      yaxis=dict(autorange="reversed", **_GRID), xaxis=_GRID)
+    fig.update_layout(
+        **_LAYOUT, coloraxis_showscale=False,
+        yaxis=dict(autorange="reversed", **_GRID),
+        xaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
     fig.update_traces(textposition="outside")
     return fig
 
 
-def _brand_donut(df: pd.DataFrame) -> go.Figure:
+def _principal_donut(df: pd.DataFrame) -> go.Figure:
+    """Clean principal-level donut (5 segments max, legend-only labels)."""
     agg = (
-        df.groupby("BrandName")["TotalAmount"].sum()
-        .sort_values(ascending=False).reset_index()
+        df.groupby("Principal")["TotalAmount"].sum()
+        .reset_index()
+        .rename(columns={"TotalAmount": "Revenue"})
     )
-    if len(agg) > 10:
-        top   = agg.head(10)
-        other = pd.DataFrame([{
-            "BrandName": "Others",
-            "TotalAmount": agg.iloc[10:]["TotalAmount"].sum(),
-        }])
-        agg = pd.concat([top, other], ignore_index=True)
-    fig = px.pie(
-        agg, names="BrandName", values="TotalAmount",
-        hole=0.42, color_discrete_sequence=_PAL,
+    # Sort into fixed display order
+    order_idx = {name: i for i, name in enumerate(_PRINCIPAL_ORDER)}
+    agg["_ord"] = agg["Principal"].map(order_idx).fillna(len(_PRINCIPAL_ORDER))
+    agg = agg.sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
+
+    total = agg["Revenue"].sum()
+    legend_labels = [
+        f"{row['Principal']}  ({row['Revenue'] / total * 100:.1f}%)"
+        for _, row in agg.iterrows()
+    ]
+    colors = [
+        _PRINCIPAL_COLORS[_PRINCIPAL_ORDER.index(p)]
+        if p in _PRINCIPAL_ORDER else _PRINCIPAL_COLORS[-1]
+        for p in agg["Principal"]
+    ]
+
+    fig = go.Figure(go.Pie(
+        labels=legend_labels,
+        values=agg["Revenue"],
+        hole=0.55,
+        textinfo="none",
+        marker=dict(colors=colors),
+        hovertemplate="<b>%{label}</b><br>₹%{value:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        **{k: v for k, v in _LAYOUT.items() if k != "margin"},
+        margin=dict(l=16, r=16, t=36, b=16),
+        legend=dict(orientation="v", font=dict(size=11), bgcolor="rgba(0,0,0,0)"),
+        annotations=[dict(
+            text="Principal<br>Mix",
+            x=0.5, y=0.5,
+            font=dict(size=13, color="#1a1a1a"),
+            showarrow=False,
+        )],
     )
-    fig.update_layout(**_LAYOUT, legend=dict(font=dict(size=11)))
-    fig.update_traces(textinfo="label+percent",
-                      pull=[0.05] + [0] * (len(agg) - 1))
     return fig
 
 
@@ -271,13 +316,18 @@ def _salesman_bar(df: pd.DataFrame) -> go.Figure:
         df.groupby("SalesmanName")["TotalAmount"].sum()
         .sort_values(ascending=False).reset_index()
     )
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
     fig = px.bar(
-        agg, x="SalesmanName", y="TotalAmount",
+        agg, x="SalesmanName", y="RevCr",
         color="SalesmanName", color_discrete_sequence=_PAL,
-        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "SalesmanName": ""},
+        text=agg["RevCr"].map(lambda v: f"₹{v:.2f} Cr"),
+        labels={"RevCr": "Revenue (₹ Cr)", "SalesmanName": ""},
     )
-    fig.update_layout(**_LAYOUT, showlegend=False,
-                      xaxis=dict(tickangle=-30, **_GRID), yaxis=_GRID)
+    fig.update_layout(
+        **_LAYOUT, showlegend=False,
+        xaxis=dict(tickangle=-30, **_GRID),
+        yaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
     fig.update_traces(textposition="outside")
     return fig
 
@@ -288,13 +338,18 @@ def _customer_bar(df: pd.DataFrame) -> go.Figure:
         .groupby("PartyName")["TotalAmount"].sum()
         .sort_values().tail(10).reset_index()
     )
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
     fig = px.bar(
-        agg, x="TotalAmount", y="PartyName", orientation="h",
-        color="TotalAmount", color_continuous_scale=["#D6E8F7", _GOLD],
-        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "PartyName": ""},
+        agg, x="RevCr", y="PartyName", orientation="h",
+        color="RevCr", color_continuous_scale=["#D6E8F7", _GOLD],
+        text=agg["RevCr"].map(lambda v: f"₹{v:.2f} Cr"),
+        labels={"RevCr": "Revenue (₹ Cr)", "PartyName": ""},
     )
-    fig.update_layout(**_LAYOUT, coloraxis_showscale=False,
-                      yaxis=dict(autorange="reversed", **_GRID), xaxis=_GRID)
+    fig.update_layout(
+        **_LAYOUT, coloraxis_showscale=False,
+        yaxis=dict(autorange="reversed", **_GRID),
+        xaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
     fig.update_traces(textposition="outside")
     return fig
 
@@ -305,13 +360,18 @@ def _size_bar(df: pd.DataFrame) -> go.Figure:
         .groupby("LiquorSize")["TotalAmount"].sum()
         .sort_values(ascending=False).reset_index()
     )
+    agg["RevCr"] = agg["TotalAmount"] / 1e7
     fig = px.bar(
-        agg, x="LiquorSize", y="TotalAmount",
+        agg, x="LiquorSize", y="RevCr",
         color="LiquorSize", color_discrete_sequence=_PAL,
-        text_auto=".2s", labels={"TotalAmount": "Sales (₹)", "LiquorSize": "Size"},
+        text=agg["RevCr"].map(lambda v: f"₹{v:.2f} Cr"),
+        labels={"RevCr": "Revenue (₹ Cr)", "LiquorSize": "Size"},
     )
-    fig.update_layout(**_LAYOUT, showlegend=False,
-                      xaxis=_GRID, yaxis=_GRID)
+    fig.update_layout(
+        **_LAYOUT, showlegend=False,
+        xaxis=_GRID,
+        yaxis=dict(ticksuffix=" Cr", **_GRID),
+    )
     fig.update_traces(textposition="outside")
     return fig
 
@@ -417,8 +477,8 @@ def render():
         st.subheader("Sales by Brand (Top 15)")
         st.plotly_chart(_brand_bar(df), use_container_width=True)
     with col_b:
-        st.subheader("Brand Mix")
-        st.plotly_chart(_brand_donut(df), use_container_width=True)
+        st.subheader("Principal Mix")
+        st.plotly_chart(_principal_donut(df), use_container_width=True)
 
     # ── Salesman (full width) ──────────────────────────────────────────────
     st.markdown("---")
