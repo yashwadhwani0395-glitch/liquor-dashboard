@@ -107,7 +107,12 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📈  Overview", "👥  Team Performance", "📦  Distribution"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈  Overview",
+    "👥  Team Performance",
+    "📦  Distribution",
+    "📊  Meeting Pack",
+])
 
 with tab1:
     from src.sales import render as render_sales
@@ -120,3 +125,7 @@ with tab2:
 with tab3:
     from src.distribution import render as render_distribution
     render_distribution()
+
+with tab4:
+    from src.principal import render as render_principal
+    render_principal()
