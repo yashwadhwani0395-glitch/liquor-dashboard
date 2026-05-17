@@ -41,3 +41,30 @@ def section_header(title: str, subtitle: str = ""):
     if subtitle:
         st.caption(subtitle)
     st.divider()
+
+
+# ── KEG-aware case-equivalent SQL fragment ────────────────────────────────────
+# Standard 1 case = 7.8 litres. KEG items have BottlesPerCase=1 in the ERP
+# (each row's TotalBottleQty is the count of kegs sold). Use volume conversion
+# for kegs; standard bottles-per-case math for everything else.
+#
+# Requires `vi` (TrVocItem) and `im` (MsItemMaster) to be the aliases in scope.
+CASES_SQL_EXPR: str = """(CASE
+    WHEN im.ItemDescription LIKE '%50 LT%' OR im.ItemDescription LIKE '%50LT%' OR im.ItemDescription LIKE '%50LTR%'
+        THEN vi.TotalBottleQty * (50.0/7.8)
+    WHEN im.ItemDescription LIKE '%30 LT%' OR im.ItemDescription LIKE '%30LT%' OR im.ItemDescription LIKE '%30LTR%'
+        THEN vi.TotalBottleQty * (30.0/7.8)
+    WHEN im.ItemDescription LIKE '%20 LT%' OR im.ItemDescription LIKE '%20LT%' OR im.ItemDescription LIKE '%20LTR%'
+        THEN vi.TotalBottleQty * (20.0/7.8)
+    ELSE CAST(vi.TotalBottleQty AS decimal(18,4)) / NULLIF(im.BottlesPerCase, 0)
+END)"""
+
+
+def cases_sql_expr() -> str:
+    """Return the KEG-aware case-equivalent SQL fragment (constant string).
+
+    Wraps every SUM/aggregation that previously used CaseQty or
+    TotalBottleQty/BottlesPerCase. Kegs are reported as 1 "bottle" each
+    in TrVocItem but represent volume that maps to multiple standard cases.
+    """
+    return CASES_SQL_EXPR

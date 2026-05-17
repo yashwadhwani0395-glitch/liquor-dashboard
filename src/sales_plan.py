@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 from src.distribution import (
     SALESMAN_MAP,
     _load_master,
@@ -112,8 +112,7 @@ def _load_outlet_history(company_id: str,
             ISNULL(p.LicenseTypeID, '')               AS LicenseTypeID,
             ISNULL(p.AcType3ID,     '')               AS AcType3ID,
             FORMAT(h.VoucherDate, 'yyyy-MM')           AS BillMonth,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
-                / NULLIF(im.BottlesPerCase, 0))        AS Cases,
+            SUM({_CASES})        AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))         AS Revenue,
             MAX(h.VoucherDate)                          AS LastBill
         FROM TrVocHead h
@@ -167,11 +166,9 @@ def _load_brand_buyers(company_id: str,
             ISNULL(p.LicenseTypeID, '')                        AS LicenseTypeID,
             FORMAT(h.VoucherDate, 'yyyy-MM')                    AS BillMonth,
             SUM(CASE WHEN b.BrandID = ?
-                THEN CAST(vi.TotalBottleQty AS decimal(18,4))
-                     / NULLIF(im.BottlesPerCase, 0)
+                THEN {_CASES}
                 ELSE 0 END)                                     AS BrandCases,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
-                / NULLIF(im.BottlesPerCase, 0))                 AS PrincipalCases,
+            SUM({_CASES})                                       AS PrincipalCases,
             MAX(CASE WHEN b.BrandID = ? THEN h.VoucherDate END) AS BrandLastBill
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -702,7 +699,7 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
     df["LastBillStr"] = pd.to_datetime(df["LastBill"], errors="coerce") \
         .dt.strftime("%d %b %Y").fillna("Never")
     df["TargetDisp"] = df["Target"].apply(
-        lambda v: "—" if v is None else f"{int(v):,}"
+        lambda v: "—" if v is None or pd.isna(v) else f"{int(v):,}"
     )
 
     display = df[[
@@ -753,7 +750,7 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
 
             d1, d2 = st.columns([2, 1])
             with d1:
-                tgt_label = "—" if row["Target"] is None else f"{int(row['Target']):,}"
+                tgt_label = "—" if row["Target"] is None or pd.isna(row["Target"]) else f"{int(row['Target']):,}"
                 st.markdown(f"**Target:** {tgt_label} cases  ·  **Reason:** {row['Reason']}")
                 if row.get("CeilingApplied"):
                     st.warning(f"Ceiling applied at 1.5 × best month ({row['Best12']:.0f})")

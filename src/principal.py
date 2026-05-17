@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 from src.distribution import (
     SALESMAN_MAP,
     _load_master,
@@ -91,7 +91,7 @@ def _load_principal_brands(company_id: str, start: date, end: date) -> pd.DataFr
     sql = f"""
         SELECT b.BrandName,
                SUM(CAST(vi.TotalAmount AS FLOAT))  AS Revenue,
-               SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases
+               SUM({_CASES}) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID

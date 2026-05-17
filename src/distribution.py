@@ -29,7 +29,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr, section_header
+from utils.helpers import format_inr, section_header, CASES_SQL_EXPR as _CASES
 
 # ── Sales types ─────────────────────────────────────────────────────────────
 SALES_TYPES = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
@@ -191,7 +191,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
             ISNULL(p.AcType3ID,    '')             AS AcType3ID,
             b.CompanyID,
             COUNT(DISTINCT h.VoucherNo)            AS InvoiceCount,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
+            SUM({_CASES}) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))     AS Revenue
         FROM TrVocHead h
         JOIN TrVocItem vi

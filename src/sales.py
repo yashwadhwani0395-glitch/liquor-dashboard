@@ -18,7 +18,7 @@ except ImportError:  # fallback if dateutil missing
     relativedelta = None
 
 from db import run_query
-from utils.helpers import format_inr
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 
 # ── Sales transaction type IDs ──────────────────────────────────────────────
 SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
@@ -94,8 +94,8 @@ def _load_period_kpis(start: date, end: date,
         SELECT
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS Cases,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyCases,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS Invoices,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS LyInvoices,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN d.PartyID END) AS Cust,
@@ -173,7 +173,7 @@ def _load_monthly_revenue(months: int = 24,
         SELECT
             FORMAT(h.VoucherDate, 'yyyy-MM') AS Month,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Revenue,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4)) / NULLIF(im.BottlesPerCase,0)) AS Cases
+            SUM({_CASES}) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -213,8 +213,8 @@ def _load_principal_growth(start: date, end: date,
             b.CompanyID,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS Cases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyCases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -343,8 +343,8 @@ def _load_brand_growth(start: date, end: date,
             b.BrandName,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS Cases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyCases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID

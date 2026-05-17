@@ -19,7 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
 IMPORT_TYPES:   tuple[int, ...] = (22, 54)               # imports proper
@@ -108,8 +108,8 @@ def _load_movements(start: date, end: date) -> pd.DataFrame:
             vi.ItemID,
             SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS InBottles,
             SUM(CASE WHEN mt.QtyInOut='O' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS OutBottles,
-            SUM(CASE WHEN mt.QtyInOut='I' THEN CAST(ISNULL(vi.TotalBottleQty,0) AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS InCases,
-            SUM(CASE WHEN mt.QtyInOut='O' THEN CAST(ISNULL(vi.TotalBottleQty,0) AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS OutCases
+            SUM(CASE WHEN mt.QtyInOut='I' THEN {_CASES} ELSE 0 END) AS InCases,
+            SUM(CASE WHEN mt.QtyInOut='O' THEN {_CASES} ELSE 0 END) AS OutCases
         FROM TrVocItem vi
         JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
         JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID

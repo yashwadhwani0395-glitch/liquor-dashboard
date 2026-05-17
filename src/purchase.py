@@ -18,7 +18,7 @@ except ImportError:
     relativedelta = None
 
 from db import run_query
-from utils.helpers import format_inr
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
 
 # ── Transaction types ────────────────────────────────────────────────────────
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
@@ -141,8 +141,8 @@ def _load_purchase_kpis(start: date, end: date,
         SELECT
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS C,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyC,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS C,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyC,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS LyI,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN b.CompanyID END) AS Sup,
@@ -261,8 +261,8 @@ def _load_purchase_by_principal(start: date, end: date,
             b.CompanyID,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS C,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyC,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS C,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyC,
             COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -299,9 +299,9 @@ def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
     sql = f"""
         SELECT
             b.CompanyID,
-            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS BCases,
+            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN {_CASES} ELSE 0 END) AS BCases,
             SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN vi.TotalAmount ELSE 0 END) AS BVal,
-            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS SCases,
+            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN {_CASES} ELSE 0 END) AS SCases,
             SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN vi.TotalAmount ELSE 0 END) AS SVal
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -342,7 +342,7 @@ def _load_purchase_monthly(months: int = 24,
         SELECT
             FORMAT(h.VoucherDate, 'yyyy-MM') AS Month,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases
+            SUM({_CASES}) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -379,7 +379,7 @@ def _load_top_brands_purchased(start: date, end: date,
     sql = f"""
         SELECT TOP 15
             b.BrandName, b.CompanyID,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
+            SUM({_CASES}) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -413,7 +413,7 @@ def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
             h.VoucherDate,
             h.VoucherNo,
             h.TransTypeID,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
+            SUM({_CASES}) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Amount,
             -- Principal inferred from brand CompanyID majority on the voucher
             (
