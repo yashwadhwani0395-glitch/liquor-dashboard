@@ -358,19 +358,27 @@ def _party_month_agg(sm_df: pd.DataFrame, month_str: str) -> pd.DataFrame:
 
 
 def _monthly_metrics(sm_df: pd.DataFrame, months: list[str], uni_ids: frozenset) -> pd.DataFrame:
-    """Per-month WOD, strike rate, DOD for one salesman."""
+    """Per-month WOD, strike rate, DOD for one salesman.
+
+    billed_ids is intersected with uni_ids so that out-of-territory
+    billing rows (same principal, different salesman's outlet) are never
+    counted toward this salesman's WOD numerator.
+    """
     rows = []
+    uni_size = len(uni_ids)
     for mo in months:
         pa = _party_month_agg(sm_df, mo)
-        billed_ids   = frozenset(pa["PartyID"])
+        # Restrict to universe parties only ← critical intersection
+        billed_ids   = frozenset(pa["PartyID"]) & uni_ids
         billed_cnt   = len(billed_ids)
-        uni_size     = len(uni_ids)
         wod_pct      = billed_cnt / uni_size * 100 if uni_size else 0.0
-        multi_bill   = int((pa["InvoiceCount"] >= 2).sum())
+        # Strike rate: only over billed universe parties
+        billed_pa    = pa[pa["PartyID"].isin(billed_ids)]
+        multi_bill   = int((billed_pa["InvoiceCount"] >= 2).sum())
         strike_rate  = multi_bill / billed_cnt * 100 if billed_cnt else 0.0
-        revenue      = float(pa["Revenue"].sum())
-        cases        = int(pa["Cases"].sum())
-        invoices     = int(pa["InvoiceCount"].sum())
+        revenue      = float(billed_pa["Revenue"].sum())
+        cases        = int(billed_pa["Cases"].sum())
+        invoices     = int(billed_pa["InvoiceCount"].sum())
         billed_safe  = max(billed_cnt, 1)
         rows.append({
             "BillMonth":   mo,
@@ -391,10 +399,11 @@ def _monthly_metrics(sm_df: pd.DataFrame, months: list[str], uni_ids: frozenset)
 
 
 def _lapsed_new_ids(
-    sm_df: pd.DataFrame, sel_mo: str, prev_mo: str
+    sm_df: pd.DataFrame, sel_mo: str, prev_mo: str, uni_ids: frozenset
 ) -> dict[str, frozenset]:
-    sel_ids  = frozenset(sm_df[sm_df["BillMonth"] == sel_mo]["PartyID"])
-    prev_ids = frozenset(sm_df[sm_df["BillMonth"] == prev_mo]["PartyID"])
+    """Lapsed/new/retained outlet sets — restricted to universe parties."""
+    sel_ids  = frozenset(sm_df[sm_df["BillMonth"] == sel_mo]["PartyID"])  & uni_ids
+    prev_ids = frozenset(sm_df[sm_df["BillMonth"] == prev_mo]["PartyID"]) & uni_ids
     return {
         "lapsed":   prev_ids - sel_ids,
         "new":      sel_ids  - prev_ids,
@@ -642,7 +651,7 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
         sm_data[sm]   = df_sm
         uni_ids[sm]   = _uni_ids_from_master(uni_df, sm)   # ← MsPartyMaster universe
         all_metrics[sm] = _monthly_metrics(df_sm, months_12, uni_ids[sm])
-        ids = _lapsed_new_ids(df_sm, sel_month_str, prev_month_str)
+        ids = _lapsed_new_ids(df_sm, sel_month_str, prev_month_str, uni_ids[sm])
         movement[sm] = {k: len(v) for k, v in ids.items()}
         movement[sm]["lapsed_ids"] = ids["lapsed"]    # keep sets for detail tables
         movement[sm]["new_ids"]    = ids["new"]
@@ -1037,7 +1046,7 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
                 # Lapsed vs New trend
                 lapsed_trend = []
                 for mo in months_12:
-                    ids = _lapsed_new_ids(df_sm, mo, _prev_month_str(mo))
+                    ids = _lapsed_new_ids(df_sm, mo, _prev_month_str(mo), uni_ids[card_sm])
                     lapsed_trend.append({
                         "month_label": _fmt_month(mo),
                         "Lapsed": len(ids["lapsed"]),
