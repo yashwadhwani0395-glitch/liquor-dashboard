@@ -108,11 +108,12 @@ def _load_movements(start: date, end: date) -> pd.DataFrame:
             vi.ItemID,
             SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS InBottles,
             SUM(CASE WHEN mt.QtyInOut='O' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS OutBottles,
-            SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.CaseQty,       0) ELSE 0 END) AS InCases,
-            SUM(CASE WHEN mt.QtyInOut='O' THEN ISNULL(vi.CaseQty,       0) ELSE 0 END) AS OutCases
+            SUM(CASE WHEN mt.QtyInOut='I' THEN CAST(ISNULL(vi.TotalBottleQty,0) AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS InCases,
+            SUM(CASE WHEN mt.QtyInOut='O' THEN CAST(ISNULL(vi.TotalBottleQty,0) AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS OutCases
         FROM TrVocItem vi
         JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
         JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
+        JOIN MsItemMaster im ON im.ItemID    = vi.ItemID
         WHERE h.Cancelled  = 'N'
           AND vi.FreeItemYN = 'N'
           AND vi.ItemID     LIKE 'I%'
@@ -124,8 +125,10 @@ def _load_movements(start: date, end: date) -> pd.DataFrame:
     """
     df = run_query(sql, (str(start), str(end)))
     if not df.empty:
-        for c in ("InBottles", "OutBottles", "InCases", "OutCases"):
+        for c in ("InBottles", "OutBottles"):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+        for c in ("InCases", "OutCases"):
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return df
 
 
@@ -156,7 +159,7 @@ def _load_item_origin() -> pd.DataFrame:
         WITH PerTT AS (
             SELECT
                 vi.ItemID, h.TransTypeID,
-                SUM(ISNULL(vi.CaseQty,0)) AS Cases
+                SUM(ISNULL(vi.TotalBottleQty, 0)) AS Bottles
             FROM TrVocItem vi
             JOIN TrVocHead h ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
             WHERE h.Cancelled  = 'N'
@@ -170,8 +173,8 @@ def _load_item_origin() -> pd.DataFrame:
         SELECT
             ItemID,
             CASE
-              WHEN MAX(CASE WHEN TransTypeID IN ({imp_ph})   THEN Cases ELSE 0 END) > 0 THEN 'Import'
-              WHEN MAX(CASE WHEN TransTypeID IN ({daman_ph}) THEN Cases ELSE 0 END) > 0 THEN 'Daman'
+              WHEN MAX(CASE WHEN TransTypeID IN ({imp_ph})   THEN Bottles ELSE 0 END) > 0 THEN 'Import'
+              WHEN MAX(CASE WHEN TransTypeID IN ({daman_ph}) THEN Bottles ELSE 0 END) > 0 THEN 'Daman'
               ELSE 'Domestic'
             END AS Origin
         FROM PerTT
@@ -186,11 +189,13 @@ def _load_sales_velocity(as_of_date: date, days_back: int = 30) -> pd.DataFrame:
     sql = f"""
         SELECT
             vi.ItemID,
-            SUM(CAST(vi.CaseQty AS BIGINT))  AS Cases,
-            MAX(h.VoucherDate)                AS LastSale
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
+                / NULLIF(im.BottlesPerCase, 0))      AS Cases,
+            MAX(h.VoucherDate)                        AS LastSale
         FROM TrVocItem vi
-        JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
-        JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
+        JOIN TrVocHead    h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
+        JOIN MsTransType  mt ON mt.TransTypeID = vi.TransTypeID
+        JOIN MsItemMaster im ON im.ItemID      = vi.ItemID
         WHERE h.Cancelled  = 'N'
           AND mt.QtyInOut  = 'O'
           AND vi.FreeItemYN = 'N'
@@ -201,7 +206,7 @@ def _load_sales_velocity(as_of_date: date, days_back: int = 30) -> pd.DataFrame:
     """
     df = run_query(sql, (str(as_of_date), str(as_of_date)))
     if not df.empty:
-        df["Cases"]    = pd.to_numeric(df["Cases"], errors="coerce").fillna(0).astype(int)
+        df["Cases"]    = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
         df["LastSale"] = pd.to_datetime(df["LastSale"], errors="coerce")
     return df
 
@@ -472,7 +477,7 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
 
     merged = stock_df.merge(vel_df[["ItemID", "Cases", "LastSale"]],
                             on="ItemID", how="left").rename(columns={"Cases": "Sales30"})
-    merged["Sales30"] = pd.to_numeric(merged["Sales30"], errors="coerce").fillna(0).astype(int)
+    merged["Sales30"] = pd.to_numeric(merged["Sales30"], errors="coerce").fillna(0.0)
     merged["Value"]   = merged["ClosingCases"] * merged["ValRateCase"]
 
     slow = merged[
@@ -508,7 +513,7 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
         .apply(_row_style, axis=1)
         .format({
             "Closing Cases":   "{:,.0f}",
-            "Last 30d Cases":  "{:,}",
+            "Last 30d Cases":  "{:,.2f}",
             "Days of Cover":   lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
             "Stock Value":     format_inr,
         })
@@ -525,10 +530,10 @@ def _section_out_of_stock(stock_df: pd.DataFrame, vel_30: pd.DataFrame,
 
     s = stock_df.merge(vel_30[["ItemID", "Cases", "LastSale"]],
                        on="ItemID", how="left").rename(columns={"Cases": "Sales30"})
-    s["Sales30"] = pd.to_numeric(s["Sales30"], errors="coerce").fillna(0).astype(int)
+    s["Sales30"] = pd.to_numeric(s["Sales30"], errors="coerce").fillna(0.0)
     s = s.merge(vel_90[["ItemID", "Cases"]].rename(columns={"Cases": "Sales90"}),
                 on="ItemID", how="left")
-    s["Sales90"] = pd.to_numeric(s["Sales90"], errors="coerce").fillna(0).astype(int)
+    s["Sales90"] = pd.to_numeric(s["Sales90"], errors="coerce").fillna(0.0)
 
     risk = s[(s["ClosingCases"] <= 0) & (s["Sales30"] > 5)].copy()
     if risk.empty:
@@ -545,7 +550,7 @@ def _section_out_of_stock(stock_df: pd.DataFrame, vel_30: pd.DataFrame,
         "Sales90":         "Last 90d Cases",
     })
     st.dataframe(
-        disp.style.format({"Last 30d Cases": "{:,}", "Last 90d Cases": "{:,}"}),
+        disp.style.format({"Last 30d Cases": "{:,.2f}", "Last 90d Cases": "{:,.2f}"}),
         use_container_width=True, hide_index=True,
     )
 
@@ -558,7 +563,7 @@ def _section_days_of_cover(stock_df: pd.DataFrame, vel_df: pd.DataFrame) -> None
 
     merged = stock_df.merge(vel_df[["ItemID", "Cases"]],
                             on="ItemID", how="left").rename(columns={"Cases": "Sales30"})
-    merged["Sales30"] = pd.to_numeric(merged["Sales30"], errors="coerce").fillna(0).astype(int)
+    merged["Sales30"] = pd.to_numeric(merged["Sales30"], errors="coerce").fillna(0.0)
     sellers = merged[merged["Sales30"] > 0].copy()
     if sellers.empty:
         st.info("No selling items in the last 30 days."); return

@@ -191,7 +191,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
             ISNULL(p.AcType3ID,    '')             AS AcType3ID,
             b.CompanyID,
             COUNT(DISTINCT h.VoucherNo)            AS InvoiceCount,
-            SUM(CAST(vi.CaseQty     AS BIGINT))    AS Cases,
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))     AS Revenue
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -233,8 +233,8 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
     """)
     if df.empty:
         return df
-    for col in ("InvoiceCount", "Cases"):
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    df["InvoiceCount"] = pd.to_numeric(df["InvoiceCount"], errors="coerce").fillna(0).astype(int)
+    df["Cases"]        = pd.to_numeric(df["Cases"],        errors="coerce").fillna(0.0)
     df["Revenue"]       = pd.to_numeric(df["Revenue"],       errors="coerce").fillna(0.0)
     df["LicenseTypeID"] = df["LicenseTypeID"].fillna("").astype(str)
     df["AcType3ID"]     = df["AcType3ID"].fillna("").astype(str)
@@ -385,7 +385,7 @@ def _monthly_metrics(sm_df: pd.DataFrame, months: list[str], uni_ids: frozenset)
         multi_bill   = int((billed_pa["InvoiceCount"] >= 2).sum())
         strike_rate  = multi_bill / billed_cnt * 100 if billed_cnt else 0.0
         revenue      = float(billed_pa["Revenue"].sum())
-        cases        = int(billed_pa["Cases"].sum())
+        cases        = float(billed_pa["Cases"].sum())
         invoices     = int(billed_pa["InvoiceCount"].sum())
         billed_safe  = max(billed_cnt, 1)
         rows.append({

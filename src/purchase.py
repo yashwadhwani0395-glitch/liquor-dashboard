@@ -141,8 +141,8 @@ def _load_purchase_kpis(start: date, end: date,
         SELECT
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS C,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS LyC,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS C,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyC,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS LyI,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN b.CompanyID END) AS Sup,
@@ -175,8 +175,8 @@ def _load_purchase_kpis(start: date, end: date,
     return {
         "p":      float(r["P"]    or 0),
         "ly_p":   float(r["LyP"]  or 0),
-        "c":      int(r["C"]      or 0),
-        "ly_c":   int(r["LyC"]    or 0),
+        "c":      float(r["C"]    or 0),
+        "ly_c":   float(r["LyC"]  or 0),
         "i":      int(r["I"]      or 0),
         "ly_i":   int(r["LyI"]    or 0),
         "sup":    int(r["Sup"]    or 0),
@@ -261,8 +261,8 @@ def _load_purchase_by_principal(start: date, end: date,
             b.CompanyID,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS C,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS LyC,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS C,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyC,
             COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -299,9 +299,9 @@ def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
     sql = f"""
         SELECT
             b.CompanyID,
-            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN vi.CaseQty     ELSE 0 END) AS BCases,
+            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS BCases,
             SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN vi.TotalAmount ELSE 0 END) AS BVal,
-            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN vi.CaseQty     ELSE 0 END) AS SCases,
+            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS SCases,
             SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN vi.TotalAmount ELSE 0 END) AS SVal
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -323,7 +323,7 @@ def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
         for c in ("BVal", "SVal"):
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         for c in ("BCases", "SCases"):
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         df["Principal"] = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
     return df
 
@@ -342,7 +342,7 @@ def _load_purchase_monthly(months: int = 24,
         SELECT
             FORMAT(h.VoucherDate, 'yyyy-MM') AS Month,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase,
-            SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -362,7 +362,7 @@ def _load_purchase_monthly(months: int = 24,
     df = run_query(sql, company_params)
     if not df.empty:
         df["Purchase"] = pd.to_numeric(df["Purchase"], errors="coerce").fillna(0.0)
-        df["Cases"]    = pd.to_numeric(df["Cases"],    errors="coerce").fillna(0).astype(int)
+        df["Cases"]    = pd.to_numeric(df["Cases"],    errors="coerce").fillna(0.0)
     return df
 
 
@@ -379,7 +379,7 @@ def _load_top_brands_purchased(start: date, end: date,
     sql = f"""
         SELECT TOP 15
             b.BrandName, b.CompanyID,
-            SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases,
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -400,7 +400,7 @@ def _load_top_brands_purchased(start: date, end: date,
     df = run_query(sql, (str(start), str(end)) + company_params)
     if not df.empty:
         df["Purchase"]  = pd.to_numeric(df["Purchase"], errors="coerce").fillna(0.0)
-        df["Cases"]     = pd.to_numeric(df["Cases"],    errors="coerce").fillna(0).astype(int)
+        df["Cases"]     = pd.to_numeric(df["Cases"],    errors="coerce").fillna(0.0)
         df["Principal"] = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
     return df
 
@@ -413,7 +413,7 @@ def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
             h.VoucherDate,
             h.VoucherNo,
             h.TransTypeID,
-            SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases,
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Amount,
             -- Principal inferred from brand CompanyID majority on the voucher
             (
@@ -445,7 +445,7 @@ def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
     df = run_query(sql, (str(end),))
     if not df.empty:
         df["VoucherDate"] = pd.to_datetime(df["VoucherDate"])
-        df["Cases"]       = pd.to_numeric(df["Cases"],  errors="coerce").fillna(0).astype(int)
+        df["Cases"]       = pd.to_numeric(df["Cases"],  errors="coerce").fillna(0.0)
         df["Amount"]      = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
     return df
 
@@ -480,8 +480,8 @@ def _section_kpis(kpi: dict, gl: dict) -> None:
     with c3:
         st.markdown(_kpi_card(
             "Cases Purchased",
-            f"{kpi['c']:,}",
-            f"{c_delta} YoY (LY: {kpi['ly_c']:,})",
+            f"{kpi['c']:,.2f}",
+            f"{c_delta} YoY (LY: {kpi['ly_c']:,.2f})",
             c_color, _KPI_COLORS[2],
         ), unsafe_allow_html=True)
     with c4:
@@ -597,7 +597,7 @@ def _section_reconciliation(rec_df: pd.DataFrame) -> None:
     styled = (
         display.style
         .format({
-            "Cases Bought": "{:,}", "Cases Sold": "{:,}", "Cases Diff": "{:+,}",
+            "Cases Bought": "{:,.2f}", "Cases Sold": "{:,.2f}", "Cases Diff": "{:+,.2f}",
             "Purchase ₹": format_inr, "Sales ₹": format_inr, "Margin ₹": format_inr,
             "Margin %":   "{:.1f}%",
         })
@@ -625,7 +625,7 @@ def _section_principal_breakdown(p_df: pd.DataFrame) -> None:
                 return "color:#6b7280;"
             styled = (
                 display.style
-                .format({"Purchase": format_inr, "Cases": "{:,}", "Invoices": "{:,}"})
+                .format({"Purchase": format_inr, "Cases": "{:,.2f}", "Invoices": "{:,}"})
                 .map(_yoy_style, subset=["YoY Growth"])
             )
             st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -752,7 +752,7 @@ def _section_recent_vouchers(vouchers_df: pd.DataFrame) -> None:
         "VoucherNo": "Voucher No",
     })
     st.dataframe(
-        disp.style.format({"Cases": "{:,}", "Amount": format_inr}),
+        disp.style.format({"Cases": "{:,.2f}", "Amount": format_inr}),
         use_container_width=True, hide_index=True,
     )
 

@@ -91,7 +91,7 @@ def _load_principal_brands(company_id: str, start: date, end: date) -> pd.DataFr
     sql = f"""
         SELECT b.BrandName,
                SUM(CAST(vi.TotalAmount AS FLOAT))  AS Revenue,
-               SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases
+               SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -117,7 +117,7 @@ def _load_principal_brands(company_id: str, start: date, end: date) -> pd.DataFr
     df = run_query(sql, (company_id, str(start), str(end)))
     if not df.empty:
         df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
-        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0).astype(int)
+        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
     return df
 
 
@@ -186,7 +186,7 @@ def _render_kpis(principal_master: pd.DataFrame,
     period_df = principal_master[principal_master["BillMonth"].isin(months)]
 
     total_rev   = float(period_df["Revenue"].sum())
-    total_cases = int(period_df["Cases"].sum())
+    total_cases = float(period_df["Cases"].sum())
     uni_size    = len(principal_uni)
     cm_df       = principal_master[principal_master["BillMonth"] == current_month]
     cm_billed   = len(frozenset(cm_df["PartyID"]) & principal_uni)
@@ -209,7 +209,7 @@ def _render_kpis(principal_master: pd.DataFrame,
     with k1:
         st.metric("Total Revenue",     format_inr(total_rev))
     with k2:
-        st.metric("Total Cases",       f"{total_cases:,}")
+        st.metric("Total Cases",       f"{total_cases:,.2f}")
     with k3:
         st.metric("Active Universe",   f"{uni_size:,}")
     with k4:
@@ -330,7 +330,7 @@ def _render_salesman_table(master: pd.DataFrame,
             "WOD %":    "{:.1f}%",
             "Universe": "{:,}",
             "Billed":   "{:,}",
-            "Cases":    "{:,}",
+            "Cases":    "{:,.2f}",
         })
         .map(_style_wod, subset=["WOD %"])
         .apply(
@@ -388,7 +388,7 @@ def _render_top_brands(start: date, end: date, cfg: dict) -> pd.DataFrame:
         })
         styled = tbl.style.format({
             "Revenue":         format_inr,
-            "Cases":           "{:,}",
+            "Cases":           "{:,.2f}",
             "% of Principal":  "{:.1f}%",
         })
         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -483,7 +483,7 @@ def _render_outlet_intel(principal_master: pd.DataFrame,
             ].rename(columns={"PartyName": "Party", "Revenue": "Revenue (3mo)",
                               "Cases": "Cases (3mo)"})
             st.dataframe(
-                tbl.style.format({"Revenue (3mo)": format_inr, "Cases (3mo)": "{:,}"}),
+                tbl.style.format({"Revenue (3mo)": format_inr, "Cases (3mo)": "{:,.2f}"}),
                 use_container_width=True, hide_index=True,
             )
 

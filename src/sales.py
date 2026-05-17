@@ -94,8 +94,8 @@ def _load_period_kpis(start: date, end: date,
         SELECT
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS Cases,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS LyCases,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS Invoices,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS LyInvoices,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN d.PartyID END) AS Cust,
@@ -149,8 +149,8 @@ def _load_period_kpis(start: date, end: date,
     return {
         "rev":         float(r["Rev"]      or 0),
         "ly_rev":      float(r["LyRev"]    or 0),
-        "cases":       int(r["Cases"]      or 0),
-        "ly_cases":    int(r["LyCases"]    or 0),
+        "cases":       float(r["Cases"]    or 0),
+        "ly_cases":    float(r["LyCases"]  or 0),
         "invoices":    int(r["Invoices"]   or 0),
         "ly_invoices": int(r["LyInvoices"] or 0),
         "cust":        int(r["Cust"]       or 0),
@@ -173,7 +173,7 @@ def _load_monthly_revenue(months: int = 24,
         SELECT
             FORMAT(h.VoucherDate, 'yyyy-MM') AS Month,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Revenue,
-            SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4)) / NULLIF(im.BottlesPerCase,0)) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -199,7 +199,7 @@ def _load_monthly_revenue(months: int = 24,
     df = run_query(sql, company_params)
     if not df.empty:
         df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
-        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0).astype(int)
+        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
     return df
 
 
@@ -213,8 +213,8 @@ def _load_principal_growth(start: date, end: date,
             b.CompanyID,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS Cases,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS LyCases
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -242,8 +242,8 @@ def _load_principal_growth(start: date, end: date,
     if not df.empty:
         df["Rev"]     = pd.to_numeric(df["Rev"],     errors="coerce").fillna(0.0)
         df["LyRev"]   = pd.to_numeric(df["LyRev"],   errors="coerce").fillna(0.0)
-        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0).astype(int)
-        df["LyCases"] = pd.to_numeric(df["LyCases"], errors="coerce").fillna(0).astype(int)
+        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
+        df["LyCases"] = pd.to_numeric(df["LyCases"], errors="coerce").fillna(0.0)
         df["Principal"] = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
     return df
 
@@ -343,8 +343,8 @@ def _load_brand_growth(start: date, end: date,
             b.BrandName,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyRev,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS Cases,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.CaseQty     ELSE 0 END) AS LyCases
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS Cases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0) ELSE 0 END) AS LyCases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -454,8 +454,8 @@ def _section_kpis(kpi: dict) -> None:
     with c2:
         st.markdown(_kpi_card(
             "Cases Sold",
-            f"{kpi['cases']:,}",
-            f"{case_delta} YoY (LY: {kpi['ly_cases']:,})",
+            f"{kpi['cases']:,.2f}",
+            f"{case_delta} YoY (LY: {kpi['ly_cases']:,.2f})",
             case_color, _KPI_COLORS[1],
         ), unsafe_allow_html=True)
     with c3:
@@ -605,7 +605,7 @@ def _section_breakdown(principal_df: pd.DataFrame,
 
             styled = (
                 display.style
-                .format({"Revenue": format_inr, "Cases": "{:,}"})
+                .format({"Revenue": format_inr, "Cases": "{:,.2f}"})
                 .map(_yoy_style, subset=["YoY Growth"])
             )
             st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -651,7 +651,7 @@ def _section_brand_growth(brands_df: pd.DataFrame) -> None:
 
     styled = (
         display.style
-        .format({"Revenue": format_inr, "Cases": "{:,}"})
+        .format({"Revenue": format_inr, "Cases": "{:,.2f}"})
         .map(_yoy_style, subset=["YoY Cases %", "YoY Revenue %"])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)

@@ -69,7 +69,7 @@ def _load_brand_party_revenue(start: date, end: date,
             b.BrandName,
             b.CompanyID,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Revenue,
-            SUM(CAST(vi.CaseQty     AS BIGINT)) AS Cases
+            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))/NULLIF(im.BottlesPerCase,0)) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -107,7 +107,7 @@ def _load_brand_party_revenue(start: date, end: date,
     df = run_query(sql, (str(start), str(end)) + company_params)
     if not df.empty:
         df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
-        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0).astype(int)
+        df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
     return df
 
 
@@ -411,7 +411,7 @@ def _render_portfolio_and_customers(sm_master: pd.DataFrame,
                     .rename(columns={"BrandName": "Brand"})
                 )
                 st.dataframe(
-                    brand_tbl.style.format({"Revenue": format_inr, "Cases": "{:,}"}),
+                    brand_tbl.style.format({"Revenue": format_inr, "Cases": "{:,.2f}"}),
                     use_container_width=True, hide_index=True,
                 )
 
