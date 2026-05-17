@@ -54,6 +54,17 @@ _LT_LABEL: dict[str, str] = {
     "180007": "FL-IV One Day",
 }
 
+# ── Principal → MsPartyMaster SM field (team-based, matches ERP logic) ──────
+# Empirically, the SM field is team-determined, not principal-determined.
+# Each salesman's sm_field below is the column they appear in for ALL their
+# principals.  Wine-shop sellers (Ajay/DP) use SM2 for both Diageo and BF;
+# POP sellers (Atish/Tulsiram/etc.) use SM1 for both USL and Diageo; UBL
+# beer + Institution salesmen use SM3 for all their principals.
+#
+# SM1 = SalesManID (primary)
+# SM2 = SalesManID1 (secondary)
+# SM3 = SalesManID2 (tertiary)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SALESMAN MAP
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -63,89 +74,46 @@ SALESMAN_MAP: dict[str, dict] = {
     # Suresh Nair (000040) handles cross-supply UBL beer — he is in SM2 for
     # these same outlets.  Shashank/Sachin still service them for USL wine.
     "Shashank":       {"team": "USL Wine Shops",       "sm_id": "000014",
-                       "principals": ["C00025"],
-                       "license_types": ["180001"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM1", "principals": ["C00025"]},
     "Sachin":         {"team": "USL Wine Shops",       "sm_id": "000012",
-                       "principals": ["C00025"],
-                       "license_types": ["180001"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
-    # ── USL+Diageo Permit Rooms (SM0) ────────────────────────────────────
+                       "sm_field": "SM1", "principals": ["C00025"]},
+    # ── USL+Diageo Permit Rooms (SM1 for BOTH principals) ─────────────────
     "Tulsiram":       {"team": "USL+Diageo POP",       "sm_id": "000024",
-                       "principals": ["C00025","C00040"],
-                       "license_types": ["180002"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM1", "principals": ["C00025","C00040"]},
     "Saurabh":        {"team": "USL+Diageo POP",       "sm_id": "000018",
-                       "principals": ["C00025","C00040"],
-                       "license_types": ["180002"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM1", "principals": ["C00025","C00040"]},
     "Miran":          {"team": "USL+Diageo POP",       "sm_id": "000039",
-                       "principals": ["C00025","C00040"],
-                       "license_types": ["180002"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM1", "principals": ["C00025","C00040"]},
     "Prashant":       {"team": "USL+Diageo POP",       "sm_id": "000025",
-                       "principals": ["C00025","C00040"],
-                       "license_types": ["180002"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM1", "principals": ["C00025","C00040"]},
     "Atish":          {"team": "USL+Diageo POP",       "sm_id": "000033",
-                       "principals": ["C00025","C00040"],
-                       "license_types": ["180002"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
-    # ── Diageo+BF Wine Shops (SM1) ────────────────────────────────────────
+                       "sm_field": "SM1", "principals": ["C00025","C00040"]},
+    # ── Diageo+BF Wine Shops (SM2 for BOTH principals) ────────────────────
     "Ajay":           {"team": "Diageo+BF Wine Shops", "sm_id": "000030",
-                       "principals": ["C00040","C00056"],
-                       "license_types": ["180001"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
+                       "sm_field": "SM2", "principals": ["C00040","C00056"]},
     "Deepak Patil":   {"team": "Diageo+BF Wine Shops", "sm_id": "000004",
-                       "principals": ["C00040","C00056"],
-                       "license_types": ["180001"],
-                       "ac3_include": [], "ac3_exclude": ["130004","130002","130006"]},
-    # ── UBL KW Beer ──────────────────────────────────────────────────────
-    # Aabid: SM2 only, wine shops + permit rooms (cross-supply beer outlets).
-    #   SM2 LT=['180001','180002'] = 25+92 = 117 (matches ERP).
-    #   sm_fields=['SM2'] prevents SM0 (only 2 non-beer outlets) from inflating.
-    # Omkar: SM0 + SM2, beer shopee (180004) territory only.
-    #   SM0∪SM2 with LT=['180004'] union = 114 (matches ERP).
+                       "sm_field": "SM2", "principals": ["C00040","C00056"]},
+    # ── UBL KW Beer (SM3) ────────────────────────────────────────────────
     "Aabid":          {"team": "UBL KW Beer",          "sm_id": "000028",
-                       "principals": ["C00039"],
-                       "sm_fields": ["SM2"],
-                       "license_types": ["180001","180002"],
-                       "ac3_include": [], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039"]},
     "Omkar":          {"team": "UBL KW Beer",          "sm_id": "000032",
-                       "principals": ["C00039"],
-                       "sm_fields": ["SM0","SM2"],
-                       "license_types": ["180004"],
-                       "ac3_include": [], "ac3_exclude": []},
-    # ── KW Institution (SM2) ─────────────────────────────────────────────
+                       "sm_field": "SM3", "principals": ["C00039"]},
+    # ── KW Institution (SM3 for BOTH UBL + BF) ───────────────────────────
     "Anand Raj":      {"team": "KW Institution",       "sm_id": "000037",
-                       "principals": ["C00039","C00056"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039","C00056"]},
     "Deepak Pangare": {"team": "KW Institution",       "sm_id": "000038",
-                       "principals": ["C00039","C00056"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039","C00056"]},
     "Shashank Desai": {"team": "KW Institution",       "sm_id": "000036",
-                       "principals": ["C00039","C00056"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039","C00056"]},
     "Pranav":         {"team": "KW Institution",       "sm_id": "000026",
-                       "principals": ["C00039","C00056"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130004","130006"], "ac3_exclude": []},
-    # ── PCMC Institution (SM2) ────────────────────────────────────────────
+                       "sm_field": "SM3", "principals": ["C00039","C00056"]},
+    # ── PCMC Institution (SM3) ───────────────────────────────────────────
     "Gajendra Das":   {"team": "PCMC Institution",     "sm_id": "000042",
-                       "principals": ["C00039"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130002"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039"]},
     "Amol Sathe":     {"team": "PCMC Institution",     "sm_id": "000041",
-                       "principals": ["C00039"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130002"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039"]},
     "Rahul Ghone":    {"team": "PCMC Institution",     "sm_id": "000043",
-                       "principals": ["C00039"],
-                       "license_types": ["180002"],
-                       "ac3_include": ["130002"], "ac3_exclude": []},
+                       "sm_field": "SM3", "principals": ["C00039"]},
 }
 
 
@@ -187,22 +155,18 @@ def _last_complete_month() -> str:
     return f"{last_prev.year:04d}-{last_prev.month:02d}"
 
 
-def _filter_sm(df: pd.DataFrame, sm_key: str) -> pd.DataFrame:
-    """Filter master billing DataFrame to a salesman's territory."""
-    cfg  = SALESMAN_MAP[sm_key]
-    # Ensure NaN → '' so isin() comparisons work reliably
-    d = df.copy()
-    d["AcType3ID"]     = d["AcType3ID"].fillna("").astype(str)
-    d["LicenseTypeID"] = d["LicenseTypeID"].fillna("").astype(str)
-    mask = (
-        d["CompanyID"].isin(cfg["principals"])
-        & d["LicenseTypeID"].isin(cfg["license_types"])
-    )
-    if cfg["ac3_include"]:
-        mask &= d["AcType3ID"].isin(cfg["ac3_include"])
-    if cfg["ac3_exclude"]:
-        mask &= ~d["AcType3ID"].isin(cfg["ac3_exclude"])
-    return d[mask]
+def _filter_sm(df: pd.DataFrame, sm_key: str, uni_ids: frozenset) -> pd.DataFrame:
+    """Filter master billing DataFrame to a salesman's billing-active universe.
+
+    Rows are kept where the brand belongs to one of the salesman's principals
+    AND the party is in the salesman's active universe (12-month billing
+    intersection with the correct MsPartyMaster SM-field assignment).
+    """
+    cfg = SALESMAN_MAP[sm_key]
+    return df[
+        df["CompanyID"].isin(cfg["principals"])
+        & df["PartyID"].isin(uni_ids)
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -280,65 +244,103 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UNIVERSE LOADER  (MsPartyMaster-based, cached 1 hour)
+# UNIVERSE LOADER  (Billing-active, cached 1 hour)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_universe() -> pd.DataFrame:
+def _load_active_universe() -> pd.DataFrame:
     """
-    Load salesman-assigned parties from MsPartyMaster.
-    Returns one row per party with SM0/SM1/SM2 columns (stripped strings).
+    Active universe = parties that have billed any tracked principal in the
+    last 12 months, joined with their MsPartyMaster SM1/SM2/SM3 IDs.
 
-    Universe per salesman = parties where the salesman's ID appears in
-    ANY of SalesManID, SalesManID1, SalesManID2, filtered by the
-    salesman's license_types and ac3 rules.
+    The per-salesman universe is built in Python by intersecting:
+       (CompanyID == this salesman's principal)
+       ∩ (the SM field for that principal == this salesman's sm_id)
 
-    This is stable master data — it does not fluctuate with billing
-    activity, so the denominator is consistent month to month.
+    This matches the ERP report logic exactly (billing-based, not
+    pure master-based), giving the same denominator the principal
+    review decks use.
     """
     df = run_query("""
-        SELECT
-            p.PartyID,
+        SELECT DISTINCT
+            d.PartyID,
             p.PartyName,
-            ISNULL(p.LicenseTypeID, '')             AS LicenseTypeID,
-            ISNULL(p.AcType3ID,     '')             AS AcType3ID,
-            RTRIM(ISNULL(p.SalesManID,  ''))        AS SM0,
-            RTRIM(ISNULL(p.SalesManID1, ''))        AS SM1,
-            RTRIM(ISNULL(p.SalesManID2, ''))        AS SM2
-        FROM MsPartyMaster p
-        WHERE p.BannedPartyYN = 'N'
-          AND p.LicenseTypeID IN ('180001','180002','180004','180005','180007')
+            ISNULL(p.LicenseTypeID,'')          AS LicenseTypeID,
+            ISNULL(p.AcType3ID,    '')          AS AcType3ID,
+            b.CompanyID,
+            RTRIM(ISNULL(p.SalesManID,  ''))    AS SM1,
+            RTRIM(ISNULL(p.SalesManID1, ''))    AS SM2,
+            RTRIM(ISNULL(p.SalesManID2, ''))    AS SM3
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.FreeItemYN  = 'N'
+            AND vi.ItemID      LIKE 'I%'
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID
+            FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY TransTypeID, VoucherNo
+                           ORDER BY Amount DESC
+                       ) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL
+                  AND DrCrIndicator = 'D'
+                  AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN (18,19,23,35,37,38,39,40,41,44,47,49,51,53)
+          AND h.Cancelled   = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -12, GETDATE())
+          AND p.BannedPartyYN = 'N'
+          AND b.CompanyID IN ('C00025','C00040','C00056','C00039')
     """)
     if df.empty:
         return df
-    for col in ("LicenseTypeID", "AcType3ID", "SM0", "SM1", "SM2"):
-        df[col] = df[col].fillna("").str.strip().astype(str)
+    for col in ("LicenseTypeID", "AcType3ID", "SM1", "SM2", "SM3", "CompanyID"):
+        df[col] = df[col].fillna("").astype(str).str.strip()
     return df
 
 
-def _uni_ids_from_master(uni_df: pd.DataFrame, sm_key: str) -> frozenset:
+def _build_universes(uni_df: pd.DataFrame) -> tuple[dict, dict]:
+    """Build per-salesman active billing universes.
+
+    For each (salesman, principal) pair, take outlets where:
+       (CompanyID == principal) AND (the SM field for that principal == sm_id)
+    Then union across the salesman's principals to get the total universe.
+
+    Returns:
+       main_uni:        {sm_key: frozenset(party_ids)}  — union across principals
+       by_principal:    {sm_key: {principal_id: frozenset(party_ids)}}
     """
-    Return the set of PartyIDs for a salesman's universe by matching
-    their sm_id against SM0, SM1, or SM2 in the party master, then
-    applying the same license_type / ac3 filters as the billing query.
-    """
-    cfg       = SALESMAN_MAP[sm_key]
-    sm_id     = cfg["sm_id"]
-    sm_fields = cfg.get("sm_fields", ["SM0", "SM1", "SM2"])  # default: all three
+    main_uni: dict[str, frozenset] = {}
+    by_principal: dict[str, dict[str, frozenset]] = {}
 
-    # Outlet must have the salesman in at least one of the specified SM columns
-    in_any_sm = pd.Series(False, index=uni_df.index)
-    for field in sm_fields:
-        in_any_sm |= (uni_df[field] == sm_id)
+    for sm_key, cfg in SALESMAN_MAP.items():
+        sm_id        = cfg["sm_id"]
+        sm_field     = cfg["sm_field"]
+        principals   = cfg["principals"]
+        all_parties: set = set()
+        per_p: dict[str, frozenset] = {}
 
-    mask = in_any_sm & uni_df["LicenseTypeID"].isin(cfg["license_types"])
+        for principal in principals:
+            mask = (
+                (uni_df["CompanyID"] == principal) &
+                (uni_df[sm_field]    == sm_id)
+            )
+            parties = frozenset(uni_df.loc[mask, "PartyID"])
+            per_p[principal] = parties
+            all_parties |= parties
 
-    if cfg["ac3_include"]:
-        mask &= uni_df["AcType3ID"].isin(cfg["ac3_include"])
-    if cfg["ac3_exclude"]:
-        mask &= ~uni_df["AcType3ID"].isin(cfg["ac3_exclude"])
+        main_uni[sm_key]     = frozenset(all_parties)
+        by_principal[sm_key] = per_p
 
-    return frozenset(uni_df.loc[mask, "PartyID"])
+    return main_uni, by_principal
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -637,14 +639,17 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
     # ── Load data ─────────────────────────────────────────────────────────────
     with st.spinner("Loading distribution analytics…"):
         master = _load_master(13)
-        uni_df = _load_universe()
+        uni_df = _load_active_universe()
 
     if master.empty:
         st.error("No billing data returned. Check DB connection.")
         return
     if uni_df.empty:
-        st.error("No universe data returned from MsPartyMaster. Check DB connection.")
+        st.error("No universe data returned. Check DB connection.")
         return
+
+    # ── Build per-salesman active universes (billing × master-SM intersection) ──
+    universes, universes_by_p = _build_universes(uni_df)
 
     # ── Pre-compute per-salesman slices & metrics ────────────────────────────
     sm_data: dict[str, pd.DataFrame]         = {}
@@ -654,25 +659,27 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
     concentration: dict[str, dict]           = {}
 
     for sm in SALESMAN_MAP:           # compute for ALL salesmen (scorecard tab needs full set)
-        df_sm         = _filter_sm(master, sm)
-        sm_data[sm]   = df_sm
-        uni_ids[sm]   = _uni_ids_from_master(uni_df, sm)   # ← MsPartyMaster universe
+        uni_ids[sm]     = universes[sm]
+        df_sm           = _filter_sm(master, sm, uni_ids[sm])
+        sm_data[sm]     = df_sm
         all_metrics[sm] = _monthly_metrics(df_sm, months_12, uni_ids[sm])
         ids = _lapsed_new_ids(df_sm, sel_month_str, prev_month_str, uni_ids[sm])
         movement[sm] = {k: len(v) for k, v in ids.items()}
-        movement[sm]["lapsed_ids"] = ids["lapsed"]    # keep sets for detail tables
+        movement[sm]["lapsed_ids"] = ids["lapsed"]
         movement[sm]["new_ids"]    = ids["new"]
         concentration[sm] = _concentration(df_sm, sel_month_str)
 
-    # ── Print universe sizes for verification ─────────────────────────────────
-    # (visible in terminal; remove in production if needed)
-    print("\n=== UNIVERSE VERIFICATION ===")
+    # ── Print universe sizes for verification (terminal-only) ────────────────
+    print("\n=== ACTIVE UNIVERSE VERIFICATION (12-month billing) ===")
     for sm in sorted(SALESMAN_MAP.keys()):
         u = len(uni_ids[sm])
+        per_p = " ".join(
+            f"{p}={len(universes_by_p[sm][p])}" for p in universes_by_p[sm]
+        )
         sel_row = all_metrics[sm][all_metrics[sm]["BillMonth"] == sel_month_str]
         b  = int(sel_row["billed"].iloc[0])  if not sel_row.empty else 0
         wp = sel_row["wod_pct"].iloc[0]      if not sel_row.empty else 0.0
-        print(f"  {sm:<20} universe={u:>4}  billed={b:>4}  WOD={wp:.1f}%")
+        print(f"  {sm:<18} uni={u:>4}  billed={b:>4}  WOD={wp:5.1f}%   ({per_p})")
 
     # ── Aggregate KPI (unique parties across selected salesmen) ───────────────
     all_uni_union     = set()
