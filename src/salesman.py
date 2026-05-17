@@ -76,6 +76,13 @@ def _load_brand_party_revenue(start: date, end: date,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN (
             SELECT TransTypeID, VoucherNo, PartyID
             FROM (

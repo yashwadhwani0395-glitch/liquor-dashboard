@@ -79,6 +79,13 @@ def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.FreeItemYN  = 'N'
             AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN (
             SELECT TransTypeID, VoucherNo, PartyID
             FROM (

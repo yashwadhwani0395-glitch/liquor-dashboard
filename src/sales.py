@@ -106,6 +106,13 @@ def _load_period_kpis(start: date, end: date,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN (
             SELECT TransTypeID, VoucherNo, PartyID
             FROM (
@@ -173,6 +180,13 @@ def _load_monthly_revenue(months: int = 24,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         WHERE h.TransTypeID IN ({type_ph})
@@ -207,6 +221,13 @@ def _load_principal_growth(start: date, end: date,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         WHERE h.TransTypeID IN ({type_ph})
@@ -258,6 +279,13 @@ def _load_channel_revenue(start: date, end: date,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN (
             SELECT TransTypeID, VoucherNo, PartyID
             FROM (
@@ -323,6 +351,13 @@ def _load_brand_growth(start: date, end: date,
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         WHERE h.TransTypeID IN ({type_ph})
