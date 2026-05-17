@@ -132,23 +132,27 @@ with t2:
     render_purchase()
 
 with t3:
-    s1, s2, s3, s4, s5 = st.tabs([
+    s_plan, s_overview, s_team, s_dist, s_meeting, s_ops = st.tabs([
+        "Sales Plan",
         "Sales Overview", "Team Performance",
         "Distribution", "Meeting Pack", "Operations Rhythm",
     ])
-    with s1:
+    with s_plan:
+        from src.sales_plan import render as render_sales_plan
+        render_sales_plan()
+    with s_overview:
         from src.sales import render as render_sales
         render_sales()
-    with s2:
+    with s_team:
         from src.salesman import render as render_salesman
         render_salesman()
-    with s3:
+    with s_dist:
         from src.distribution import render as render_distribution
         render_distribution()
-    with s4:
+    with s_meeting:
         from src.principal import render as render_principal
         render_principal()
-    with s5:
+    with s_ops:
         from src.operations import render as render_operations
         render_operations()
 
