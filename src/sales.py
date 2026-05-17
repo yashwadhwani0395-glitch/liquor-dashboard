@@ -327,36 +327,36 @@ def render():
     brands_df   = _load_brands()
     salesmen_df = _load_salesmen()
 
-    # ── Sidebar filters ───────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("#### Filters")
+    # ── Inline filter row ─────────────────────────────────────────────────
+    today    = date.today()
+    fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-        today = date.today()
-        fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
-
-        c1, c2 = st.columns(2)
-        with c1:
+    with st.container():
+        fc1, fc2, fc3, fc4 = st.columns([1.1, 1.1, 2.4, 2.4])
+        with fc1:
             start = st.date_input("From", value=fy_start, key="s_from")
-        with c2:
+        with fc2:
             end = st.date_input("To", value=today, key="s_to")
-
-        if start > end:
-            st.warning("Start date must be before end date.")
-            return
 
         # Brand filter
         brand_map: dict[str, int] = {}
         if not brands_df.empty:
             brand_map = dict(zip(brands_df["BrandName"], brands_df["BrandID"].astype(int)))
-        sel_brands = st.multiselect("Brand", options=sorted(brand_map), key="s_brands")
-        brand_ids  = tuple(brand_map[b] for b in sel_brands)
+        with fc3:
+            sel_brands = st.multiselect("Brand", options=sorted(brand_map), key="s_brands")
+        brand_ids = tuple(brand_map[b] for b in sel_brands)
 
         # Salesman filter
         sm_map: dict[str, str] = {}
         if not salesmen_df.empty:
             sm_map = dict(zip(salesmen_df["FullName"], salesmen_df["SalesManID"]))
-        sel_sm    = st.multiselect("Salesman", options=sorted(sm_map), key="s_sm")
+        with fc4:
+            sel_sm = st.multiselect("Salesman", options=sorted(sm_map), key="s_sm")
         salesman_ids = tuple(sm_map[s] for s in sel_sm)
+
+    if start > end:
+        st.warning("Start date must be before end date.")
+        return
 
     # ── Fetch main period data ─────────────────────────────────────────────
     with st.spinner("Fetching sales data..."):
@@ -461,4 +461,3 @@ def render():
     )
 
 
-render()

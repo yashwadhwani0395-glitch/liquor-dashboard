@@ -580,36 +580,32 @@ def render():
     st.caption("Revenue attribution by salesman team and channel | Source: TEKNIK ERP")
     st.divider()
 
-    # ── Sidebar filters ───────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("#### Filters")
+    # ── Inline filter row ─────────────────────────────────────────────────
+    today    = date.today()
+    fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-        today    = date.today()
-        fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
-
-        c1, c2 = st.columns(2)
-        with c1:
+    with st.container():
+        fc1, fc2, fc3, fc4 = st.columns([1.1, 1.1, 2.4, 2.4])
+        with fc1:
             start = st.date_input("From", value=fy_start, key="sm_from")
-        with c2:
-            end = st.date_input("To",   value=today,    key="sm_to")
+        with fc2:
+            end = st.date_input("To", value=today, key="sm_to")
+        with fc3:
+            sel_principals = st.multiselect(
+                "Principal",
+                options=["United Spirits", "Diageo", "Brown-Forman", "United Breweries", "Others"],
+                key="sm_principals",
+            )
+        with fc4:
+            sel_channels = st.multiselect(
+                "Channel",
+                options=_CHANNEL_ORDER[:-1] + ["Others"],
+                key="sm_channels",
+            )
 
-        if start > end:
-            st.warning("Start date must be before end date.")
-            return
-
-        sel_principals = st.multiselect(
-            "Principal",
-            options=[
-                "United Spirits", "Diageo",
-                "Brown-Forman", "United Breweries", "Others",
-            ],
-            key="sm_principals",
-        )
-        sel_channels = st.multiselect(
-            "Channel",
-            options=_CHANNEL_ORDER[:-1] + ["Others"],   # exclude "Other", add "Others"
-            key="sm_channels",
-        )
+    if start > end:
+        st.warning("Start date must be before end date.")
+        return
 
     # ── Fetch data ─────────────────────────────────────────────────────────
     with st.spinner("Fetching salesman & channel data…"):
@@ -761,4 +757,3 @@ def render():
     )
 
 
-render()

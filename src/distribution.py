@@ -592,40 +592,41 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
     st.caption("Width & Depth of Distribution · Outlet Intelligence · Salesman Scorecard | Source: TEKNIK ERP")
     st.divider()
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
-    all_sm  = sorted(SALESMAN_MAP.keys())
-    months_12 = _last_n_month_strs(12)  # last 12 months, oldest → newest
-    months_13 = _last_n_month_strs(13)  # 13 for universe (extra month lapse detection)
+    # ── Inline filter row ────────────────────────────────────────────────────
+    all_sm    = sorted(SALESMAN_MAP.keys())
+    months_12 = _last_n_month_strs(12)
+    months_13 = _last_n_month_strs(13)
 
-    with st.sidebar:
-        st.markdown("#### Distribution Filters")
+    default_month = _last_complete_month()
+    avail_months  = list(reversed(months_12))          # newest first for picker
+    try:
+        default_idx = avail_months.index(default_month)
+    except ValueError:
+        default_idx = 0
 
-        sel_sm = st.multiselect(
-            "Salesman", options=all_sm, default=all_sm, key="dist_sm"
-        )
-        if not sel_sm:
-            sel_sm = all_sm
+    with st.container():
+        fc1, fc2, fc3 = st.columns([2.5, 2.5, 2.0])
+        with fc1:
+            sel_sm = st.multiselect(
+                "Salesman", options=all_sm, default=all_sm, key="dist_sm"
+            )
+            if not sel_sm:
+                sel_sm = all_sm
+        with fc2:
+            sel_month_str = st.selectbox(
+                "Reference Month",
+                options=avail_months,
+                index=default_idx,
+                format_func=_fmt_month,
+                key="dist_month",
+            )
+        with fc3:
+            target_wod = st.slider(
+                "WOD Target %", min_value=50, max_value=95, value=70, step=5,
+                key="dist_target",
+            )
 
-        default_month = _last_complete_month()
-        avail_months  = list(reversed(months_12))           # newest first for picker
-        try:
-            default_idx = avail_months.index(default_month)
-        except ValueError:
-            default_idx = 0
-
-        sel_month_str = st.selectbox(
-            "Reference Month",
-            options=avail_months,
-            index=default_idx,
-            format_func=_fmt_month,
-            key="dist_month",
-        )
-        prev_month_str = _prev_month_str(sel_month_str)
-
-        target_wod = st.slider(
-            "WOD Target %", min_value=50, max_value=95, value=70, step=5,
-            key="dist_target",
-        )
+    prev_month_str = _prev_month_str(sel_month_str)
 
     # ── Load data ─────────────────────────────────────────────────────────────
     with st.spinner("Loading distribution analytics…"):
