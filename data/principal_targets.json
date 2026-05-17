@@ -1,10 +1,9 @@
 {
   "United Breweries__2026-05": {
     "breakdown": {
-      "Cross Supply": 0,
-      "KW Beer": 50000,
-      "KW Institution": 32000,
-      "PCMC Institution": 8000
+      "KW Beer": 48000,
+      "Institution": 32000,
+      "Cross Supply": 10000
     },
     "total_cases": 90000,
     "updated_at": "2026-05-17"

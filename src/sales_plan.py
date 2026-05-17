@@ -58,10 +58,12 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
         "company_id": "C00039",
         "color":      "#1D9E75",
         "subteams": {
-            "KW Beer":          ["Aabid", "Omkar"],
-            "KW Institution":   ["Anand Raj", "Deepak Pangare", "Shashank Desai", "Pranav"],
-            "PCMC Institution": ["Gajendra Das", "Amol Sathe", "Rahul Ghone"],
-            "Cross Supply":     [],
+            "KW Beer":      ["Aabid", "Omkar"],
+            "Institution":  ["Anand Raj", "Deepak Pangare", "Shashank Desai",
+                             "Pranav", "Gajendra Das", "Amol Sathe", "Rahul Ghone"],
+            # Cross Supply: special — no assigned salesman; identified by
+            # AcType3ID = '130007' on the outlet. Handled in achievement calc.
+            "Cross Supply": [],
         },
     },
     "United Spirits": {
@@ -106,6 +108,7 @@ def _load_outlet_history(company_id: str,
             d.PartyID,
             ISNULL(p.PartyName, '(unknown)')          AS PartyName,
             ISNULL(p.LicenseTypeID, '')               AS LicenseTypeID,
+            ISNULL(p.AcType3ID,     '')               AS AcType3ID,
             FORMAT(h.VoucherDate, 'yyyy-MM')           AS BillMonth,
             SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
                 / NULLIF(im.BottlesPerCase, 0))        AS Cases,
@@ -135,7 +138,7 @@ def _load_outlet_history(company_id: str,
           AND b.CompanyID   = ?
           AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, ?)
           AND CAST(h.VoucherDate AS date) <= ?
-        GROUP BY d.PartyID, p.PartyName, p.LicenseTypeID,
+        GROUP BY d.PartyID, p.PartyName, p.LicenseTypeID, p.AcType3ID,
                  FORMAT(h.VoucherDate, 'yyyy-MM')
     """
     df = run_query(sql, (company_id, str(end_date), str(end_date)))
@@ -921,18 +924,26 @@ def render() -> None:
             hist[hist["BillMonth"] == op_month]["Cases"].sum()
         )
 
-        # Achieved per sub-team (sum cases across all outlets in that team's universes)
+        # Achieved per sub-team. Two modes:
+        #   - team has salesman list: filter by union of their principal universes
+        #   - team has empty list and is named "Cross Supply": filter by
+        #     AcType3ID = '130007' on the outlet (special UBL cross-supply rule)
+        # Outlets with AcType3='130007' that are ALSO in Aabid/Omkar's universe
+        # are counted in BOTH KW Beer and Cross Supply — these are two views
+        # of the same outlets (the sub-targets sum to the principal total but
+        # achievement may show small overlap).
         achieved_by_team: dict[str, float] = {}
+        cm_hist = hist[hist["BillMonth"] == op_month]
         for team_name, sms in cfg["subteams"].items():
-            team_uni = frozenset().union(*[
-                universes_by_p.get(sm, {}).get(cid, frozenset()) for sm in sms
-            ])
-            ach = float(
-                hist[
-                    (hist["BillMonth"] == op_month) &
-                    (hist["PartyID"].isin(team_uni))
-                ]["Cases"].sum()
-            )
+            if sms:
+                team_uni = frozenset().union(*[
+                    universes_by_p.get(sm, {}).get(cid, frozenset()) for sm in sms
+                ])
+                ach = float(cm_hist[cm_hist["PartyID"].isin(team_uni)]["Cases"].sum())
+            elif team_name == "Cross Supply":
+                ach = float(cm_hist[cm_hist["AcType3ID"] == "130007"]["Cases"].sum())
+            else:
+                ach = 0.0
             achieved_by_team[team_name] = ach
 
         pace = _pace_metrics(achieved_total, total_target, op_month_date)
