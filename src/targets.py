@@ -21,10 +21,12 @@ from typing import Any
 _DATA_DIR              = Path(__file__).resolve().parent.parent / "data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-TARGETS_FILE           = _DATA_DIR / "targets.json"            # salesman WOD targets
-PRINCIPAL_TARGETS_FILE = _DATA_DIR / "principal_targets.json"  # principal monthly case targets
-FOCUS_BRAND_FILE       = _DATA_DIR / "focus_brand.json"        # current focus brand
-PARTY_TARGETS_FILE     = _DATA_DIR / "party_targets.json"      # manual per-outlet overrides
+TARGETS_FILE             = _DATA_DIR / "targets.json"              # salesman WOD targets
+PRINCIPAL_TARGETS_FILE   = _DATA_DIR / "principal_targets.json"    # principal monthly case targets
+FOCUS_BRAND_FILE         = _DATA_DIR / "focus_brand.json"          # current focus brand
+PARTY_TARGETS_FILE       = _DATA_DIR / "party_targets.json"        # manual per-outlet overrides
+SALESMAN_OVERRIDES_FILE  = _DATA_DIR / "salesman_overrides.json"   # manual salesman case targets
+TARGET_CONFIG_FILE       = _DATA_DIR / "target_config.json"        # smart-target params
 
 
 def load_targets() -> dict[str, dict[str, Any]]:
@@ -138,18 +140,17 @@ def save_focus_brand(brand_id: int, brand_name: str,
 # PER-PARTY MANUAL TARGET OVERRIDES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_party_target_override(party_id: str, month_str: str) -> float | None:
-    data = _read_json(PARTY_TARGETS_FILE).get(f"{party_id}__{month_str}")
-    if data is None:
-        return None
-    return float(data.get("cases", 0))
+def load_party_target_override(party_id: str, month_str: str) -> dict | None:
+    """Return the full override dict {'cases', 'note', 'updated_at'} or None."""
+    return _read_json(PARTY_TARGETS_FILE).get(f"{party_id}__{month_str}")
 
 
 def save_party_target_override(party_id: str, month_str: str,
-                               cases: float) -> None:
+                               cases: float, note: str = "") -> None:
     data = _read_json(PARTY_TARGETS_FILE)
     data[f"{party_id}__{month_str}"] = {
         "cases":      float(cases),
+        "note":       note,
         "updated_at": date.today().isoformat(),
     }
     _write_json(PARTY_TARGETS_FILE, data)
@@ -159,3 +160,54 @@ def delete_party_target_override(party_id: str, month_str: str) -> None:
     data = _read_json(PARTY_TARGETS_FILE)
     data.pop(f"{party_id}__{month_str}", None)
     _write_json(PARTY_TARGETS_FILE, data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PER-SALESMAN MANUAL OVERRIDES (case target for the month)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_salesman_override(salesman: str, month_str: str) -> float | None:
+    data = _read_json(SALESMAN_OVERRIDES_FILE).get(f"{salesman}__{month_str}")
+    if data is None:
+        return None
+    return float(data.get("target_cases", 0))
+
+
+def save_salesman_override(salesman: str, month_str: str,
+                           target_cases: float) -> None:
+    data = _read_json(SALESMAN_OVERRIDES_FILE)
+    data[f"{salesman}__{month_str}"] = {
+        "target_cases": float(target_cases),
+        "updated_at":   date.today().isoformat(),
+    }
+    _write_json(SALESMAN_OVERRIDES_FILE, data)
+
+
+def delete_salesman_override(salesman: str, month_str: str) -> None:
+    data = _read_json(SALESMAN_OVERRIDES_FILE)
+    data.pop(f"{salesman}__{month_str}", None)
+    _write_json(SALESMAN_OVERRIDES_FILE, data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TARGET CONFIG (smart-target tuning knobs)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TARGET_CONFIG: dict[str, float] = {
+    "min_l3m_threshold":     5.0,   # skip outlets averaging below this
+    "standard_growth":       1.10,  # default push factor
+    "growth_bonus":          1.15,  # when L3M trending up vs L6M
+    "decline_factor":        1.00,  # when L3M trending down — recovery only
+    "ceiling_multiplier":    1.5,   # cap at this × best month L12M
+    "months_for_floor":      9,     # consistent-buyer floor threshold
+}
+
+
+def load_target_config() -> dict[str, float]:
+    cfg = DEFAULT_TARGET_CONFIG.copy()
+    cfg.update(_read_json(TARGET_CONFIG_FILE))
+    return cfg
+
+
+def save_target_config(config: dict[str, float]) -> None:
+    _write_json(TARGET_CONFIG_FILE, {k: float(v) for k, v in config.items()})
