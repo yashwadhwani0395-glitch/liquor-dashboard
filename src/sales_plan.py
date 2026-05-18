@@ -725,7 +725,7 @@ def _hero_card(principal: str, color: str, month_label: str,
         </div>
         <div style='text-align:right;min-width:280px'>
             <div style='font-size:0.72rem;opacity:0.78'>
-                Achieved <b>{achieved:,.0f}</b> cs ·
+                Achieved <b>{achieved:,.1f}</b> cs ·
                 <b>{pct:.1f}%</b>
             </div>
             <div style='background:rgba(255,255,255,0.15);height:10px;
@@ -734,7 +734,7 @@ def _hero_card(principal: str, color: str, month_label: str,
                             width:{pct}%'></div>
             </div>
             <div style='font-size:0.78rem;opacity:0.85;margin-top:6px'>
-                At current pace: <b>{pace['projected']:,.0f}</b> cs
+                At current pace: <b>{pace['projected']:,.1f}</b> cs
                 ({pace['projected_pct']:.0f}% of target)
             </div>
         </div>
@@ -782,7 +782,15 @@ def _no_target_form(principal: str, color: str, month_str: str,
                 st.rerun()
 
 
-def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float]) -> None:
+def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float],
+                     hero_total: float | None = None) -> None:
+    """Render one card per sub-team target.
+
+    If the sum of sub-team achievements is less than the hero total
+    (i.e. some BF / USL / Diageo sales went to outlets that aren't in
+    any handler-salesman's universe), surface that gap as a caption so
+    the owner can investigate or assign salesmen to those outlets.
+    """
     breakdown = target_entry.get("breakdown", {})
     cols = st.columns(len(breakdown) if breakdown else 1)
     for col, (team, tgt) in zip(cols, breakdown.items()):
@@ -797,7 +805,7 @@ def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float]) -> 
                             text-transform:uppercase;letter-spacing:0.04em'>{team}</div>
                 <div style='font-size:1.15rem;font-weight:700;color:#111827;
                             margin-top:2px'>
-                    {ach:,.0f} <span style='font-size:0.78rem;
+                    {ach:,.1f} <span style='font-size:0.78rem;
                                             font-weight:500;color:#6b7280'>/ {tgt:,}</span>
                 </div>
                 <div style='font-size:0.72rem;color:#374151;font-weight:600'>
@@ -805,6 +813,19 @@ def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float]) -> 
                 </div>
             </div>
             """, unsafe_allow_html=True)
+
+    # ── Unattributed surface (hero - sum of sub-team achievements) ──
+    if hero_total is not None:
+        sub_sum = sum(float(v) for v in achieved_by_team.values())
+        gap = hero_total - sub_sum
+        if gap > 0.5:
+            st.caption(
+                f"⚠️ **{gap:,.1f} cases unattributed** — sales to outlets "
+                f"not assigned to any handler-salesman for this principal. "
+                f"These count in the hero total but not in any sub-team card. "
+                f"Tip: open the Sales Plan **outlet plan** below to see the "
+                f"affected outlets (they'll appear without a target burden)."
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1557,7 +1578,8 @@ def render() -> None:
                        total_target, achieved_total, pace),
             unsafe_allow_html=True,
         )
-        _subtarget_cards(target_entry, achieved_by_team)
+        _subtarget_cards(target_entry, achieved_by_team,
+                         hero_total=achieved_total)
 
         if st.button("✏️ Edit target", key=f"edit_tgt_{op_month}"):
             # Clear by writing empty entry so the form reappears
