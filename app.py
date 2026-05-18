@@ -129,8 +129,11 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
 
 
 with t1:
-    coming_soon("Overview Dashboard",
-                "Consolidated KPIs from every module")
+    coming_soon(
+        "Overview Dashboard",
+        "Consolidated KPIs from every module — revenue, margin, debtors, stock value, P&L summary",
+        "📊",
+    )
 
 with t2:
     from src.purchase import render as render_purchase
@@ -166,10 +169,22 @@ with t4:
     render_inventory()
 
 with t5:
-    coming_soon("Expense Tracking", "Operating expenses by category")
+    coming_soon(
+        "Expense Tracking",
+        "Operating expenses by category, monthly trends, vs revenue ratios",
+        "💸",
+    )
 
 with t6:
-    coming_soon("Cash Flow & Outstanding", "Debtor and creditor ageing")
+    coming_soon(
+        "Cash Flow & Outstanding",
+        "Cash inflow/outflow, debtor ageing (0-30 / 30-60 / 60-90 / 90+), creditor outstanding",
+        "💰",
+    )
 
 with t7:
-    coming_soon("Balance Sheet", "Key ratios coming soon")
+    coming_soon(
+        "Balance Sheet",
+        "Use Tally or your accounting software for the full balance sheet. Key ratios will be added here later.",
+        "📋",
+    )

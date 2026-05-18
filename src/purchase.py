@@ -436,6 +436,7 @@ def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
             AND vi.ItemID      LIKE 'I%'
             AND vi.FreeItemYN  = 'N'
             {_FY_JOIN}
+        JOIN MsItemMaster im ON im.ItemID = vi.ItemID   -- required by _CASES
         WHERE h.TransTypeID IN ({type_ph})
           AND h.Cancelled   = 'N'
           AND h.VoucherDate <= ?
