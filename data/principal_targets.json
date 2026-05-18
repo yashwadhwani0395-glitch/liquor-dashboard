@@ -7,6 +7,14 @@
     "total_cases": 248,
     "updated_at": "2026-05-18"
   },
+  "Diageo__2026-05": {
+    "breakdown": {
+      "Wine Shops": 1300,
+      "Permit Rooms": 1500
+    },
+    "total_cases": 2800,
+    "updated_at": "2026-05-18"
+  },
   "United Breweries__2026-05": {
     "breakdown": {
       "KW Beer": 48000,
@@ -15,5 +23,13 @@
     },
     "total_cases": 90000,
     "updated_at": "2026-05-17"
+  },
+  "United Spirits__2026-05": {
+    "breakdown": {
+      "Wine Shops": 9500,
+      "Permit Rooms": 8800
+    },
+    "total_cases": 18300,
+    "updated_at": "2026-05-18"
   }
 }

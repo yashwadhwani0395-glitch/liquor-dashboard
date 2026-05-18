@@ -10,5 +10,35 @@
       "WOODFORD KENTUCKY STRAIGHT BOURB": 5
     },
     "updated_at": "2026-05-18"
+  },
+  "United Spirits__2026-05": {
+    "targets": {
+      "McDowells No.1 Original Blended NEW": 11000,
+      "McDowell's No.1 Original Blended Wh": 2700,
+      "McDowells No.1 Original Blended PET": 2400,
+      "MCDOWELLS SIGNATURE RARE WHY NEW": 750,
+      "McDowells No.1 Original B PET NEW": 700,
+      "McDowell's No.1 Luxury Blended Why": 400,
+      "ANTIQUITY BLUE WHISKY": 200,
+      "ANTIQUITY BLUE ULTRA PREM Hipster": 150
+    },
+    "updated_at": "2026-05-18"
+  },
+  "Diageo__2026-05": {
+    "targets": {
+      "JOHNNIE WALKER RED LABEL NEW": 440,
+      "SMIRNOFF  Minty Jamum TRIPLE VODKA": 400,
+      "JOHNNIE WALKER RED LABEL ": 380,
+      "JOHNNIE WALKER BLACK LABEL NEW": 370,
+      "SMIRNOFF TRIPLE  VODKA NEW": 290,
+      "SMIRNOFF TRIPLE  VODKA (Hipster )": 180,
+      "GREATER THAN LONDON DRY GIN": 160,
+      "JOHNNIE WALKER BLONDE NEW": 150,
+      "J & B RARE NEW": 110,
+      "SMIRNOFF TRIPLE DISTILLED VODKA": 85,
+      "SMIRNOFF ORANGE TRIPLE DISTILLED VO": 75,
+      "TANQUERAY LONDON GIN-NEW": 60
+    },
+    "updated_at": "2026-05-18"
   }
 }
