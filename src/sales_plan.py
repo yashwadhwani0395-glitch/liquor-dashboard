@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import calendar
 import io
+import sys
 from datetime import date, timedelta
 
 import pandas as pd
@@ -145,12 +146,17 @@ def _load_outlet_history(company_id: str,
     """
     df = run_query(sql, (company_id, str(end_date), str(end_date)))
     if df.empty:
-        # Return an empty DF with the same shape callers expect, so they
-        # can safely do hist["Cases"].sum() etc. without KeyError.
-        return pd.DataFrame(columns=[
-            "PartyID", "PartyName", "LicenseTypeID", "AcType3ID",
-            "BillMonth", "Cases", "Revenue", "LastBill", "Channel",
-        ])
+        # Defensive: zero rows over a 13-month look-back for any active
+        # principal (UBL/USL/Diageo/BF) is diagnostic of a transient DB
+        # error or a half-broken connection — NOT a genuine "no sales".
+        # Raising lets @st.cache_data skip caching so the next call retries,
+        # instead of poisoning the cache with an empty DF for the full TTL
+        # (which is the root cause of the silent "Achieved 0 cs" bug).
+        raise RuntimeError(
+            f"Empty outlet history for {company_id} over "
+            f"{months_back} months — likely transient DB error. "
+            f"Click ♻️ Recompute targets or \U0001f504 Refresh to retry."
+        )
     df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
     df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
     df["LastBill"] = pd.to_datetime(df["LastBill"], errors="coerce")
@@ -704,8 +710,62 @@ def _compute_outlet_plan(hist_df: pd.DataFrame,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _hero_card(principal: str, color: str, month_label: str,
-               target_total: int, achieved: float, pace: dict) -> str:
+               target_total: int, achieved: float, pace: dict,
+               n_bills: int = -1,
+               last_bill: str | None = None,
+               data_missing: bool = False) -> str:
+    """Render the principal target hero banner.
+
+    `data_missing=True` swaps the normal "Achieved X cs · X%" line for a
+    loud red warning. This is triggered from render() when the data
+    layer returns zero bills for the current month on an active
+    principal — distinguishing a real load failure from a genuine zero.
+
+    `n_bills` / `last_bill` show the freshness of the data behind the
+    number, so the user can tell at a glance whether 0 means "no data
+    loaded" vs. "data loaded, no sales yet".
+    """
     pct = max(0, min(100, pace["pct_achieved"]))
+
+    # Achievement line — red banner on data_missing, normal otherwise
+    if data_missing:
+        ach_block = (
+            "<div style='background:#7f1d1d;color:#fee2e2;padding:8px 12px;"
+            "border-radius:6px;font-size:0.82rem;font-weight:600;"
+            "border:1px solid #fca5a5'>"
+            "&#9888; No bills loaded for this principal &mdash; "
+            "likely a transient DB error.<br>"
+            "Click <b>&#9851;&#65039; Recompute targets</b> or the "
+            "<b>&#128260; Refresh</b> button to retry."
+            "</div>"
+        )
+    else:
+        ach_block = (
+            f"<div style='font-size:0.72rem;opacity:0.78'>"
+            f"Achieved <b>{achieved:,.1f}</b> cs &middot; "
+            f"<b>{pct:.1f}%</b>"
+            f"</div>"
+            f"<div style='background:rgba(255,255,255,0.15);height:10px;"
+            f"border-radius:5px;margin:8px 0;overflow:hidden'>"
+            f"<div style='background:#FAC775;height:100%;"
+            f"width:{pct}%'></div></div>"
+            f"<div style='font-size:0.78rem;opacity:0.85;margin-top:6px'>"
+            f"At current pace: <b>{pace['projected']:,.1f}</b> cs "
+            f"({pace['projected_pct']:.0f}% of target)"
+            f"</div>"
+        )
+
+    # Freshness footnote — only when we actually have bill counts
+    if n_bills >= 0:
+        last_str = f" &middot; last bill {last_bill}" if last_bill else ""
+        footnote = (
+            f"<div style='font-size:0.65rem;opacity:0.6;margin-top:8px'>"
+            f"loaded {n_bills:,} bills this month{last_str}"
+            f"</div>"
+        )
+    else:
+        footnote = ""
+
     return f"""
     <div style='background:{color};color:#fff;padding:24px;border-radius:12px;
                 display:flex;justify-content:space-between;align-items:center;
@@ -724,19 +784,8 @@ def _hero_card(principal: str, color: str, month_label: str,
             </div>
         </div>
         <div style='text-align:right;min-width:280px'>
-            <div style='font-size:0.72rem;opacity:0.78'>
-                Achieved <b>{achieved:,.1f}</b> cs ·
-                <b>{pct:.1f}%</b>
-            </div>
-            <div style='background:rgba(255,255,255,0.15);height:10px;
-                        border-radius:5px;margin:8px 0;overflow:hidden'>
-                <div style='background:#FAC775;height:100%;
-                            width:{pct}%'></div>
-            </div>
-            <div style='font-size:0.78rem;opacity:0.85;margin-top:6px'>
-                At current pace: <b>{pace['projected']:,.1f}</b> cs
-                ({pace['projected_pct']:.0f}% of target)
-            </div>
+            {ach_block}
+            {footnote}
         </div>
     </div>
     """
@@ -1584,9 +1633,40 @@ def render() -> None:
             achieved_by_team[team_name] = ach
 
         pace = _pace_metrics(achieved_total, total_target, op_month_date)
+
+        # Freshness metadata for the hero footnote + data-missing detection
+        n_bills = len(cm_hist)
+        last_bill_dt = (
+            pd.to_datetime(cm_hist["LastBill"], errors="coerce").max()
+            if n_bills > 0 else None
+        )
+        last_bill = (
+            last_bill_dt.strftime("%d %b") if last_bill_dt is not pd.NaT
+            and last_bill_dt is not None else None
+        )
+        # data_missing = active principal in the current month with literally
+        # zero bills loaded after the 1st of the month. That's diagnostic of
+        # a load failure, not genuine zero sales.
+        data_missing = (
+            n_bills == 0
+            and op_month == _month_str(date.today())
+            and date.today().day >= 2
+        )
+
+        # One-line stderr trace so Streamlit Cloud logs answer
+        # "is the query returning 0 rows or is the filter wrong"
+        print(
+            f"[sales_plan] {principal} {op_month}: "
+            f"hist_rows={len(hist)} this_mo_rows={n_bills} "
+            f"achieved={achieved_total:.2f} data_missing={data_missing}",
+            file=sys.stderr,
+        )
+
         st.markdown(
             _hero_card(principal, color, _fmt_month(op_month),
-                       total_target, achieved_total, pace),
+                       total_target, achieved_total, pace,
+                       n_bills=n_bills, last_bill=last_bill,
+                       data_missing=data_missing),
             unsafe_allow_html=True,
         )
         _subtarget_cards(target_entry, achieved_by_team,
@@ -1627,8 +1707,14 @@ def render() -> None:
     with col_rc:
         if st.button("♻️ Recompute targets", key=f"recompute_{op_month}",
                      help="Refresh data and recompute formulas. Manual overrides preserved."):
-            _load_outlet_history.clear()
-            _load_master.clear()
+            # Nuclear clear — clear ALL @st.cache_data entries (history,
+            # master, universe, brand buyers, anything else) AND drop the
+            # cached DB connection so a half-broken (deadlock-rolled-back)
+            # pymssql session is replaced on the next call. Mirrors the
+            # in-header 🔄 Refresh button behavior.
+            st.cache_data.clear()
+            from db import get_connection
+            get_connection.clear()
             st.rerun()
 
     safe_section("Outlet plan",
