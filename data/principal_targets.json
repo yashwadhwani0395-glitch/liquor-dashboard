@@ -1,4 +1,12 @@
 {
+  "Brown-Forman__2026-05": {
+    "breakdown": {
+      "Wine Shops": 200,
+      "Institution": 48
+    },
+    "total_cases": 248,
+    "updated_at": "2026-05-18"
+  },
   "United Breweries__2026-05": {
     "breakdown": {
       "KW Beer": 48000,
