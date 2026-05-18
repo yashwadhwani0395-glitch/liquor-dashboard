@@ -87,17 +87,24 @@ except Exception:
 CD_SERVICE_ITEMID = "S00026"
 
 SALES_TT: tuple[int, ...] = (
+    # The principal MS (Manual Sales) channels:
     18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53,
+    # Plus small/legacy MS channels surfaced by `_discover_recon4.out` —
+    # together they add ~Rs0.4 Cr to the brand-metadata-enriched pool.
+    13, 34,
 )
 
 # Set membership for fast Python-side lookups
 SALES_TT_SET: frozenset[int] = frozenset(SALES_TT)
 
-# TT=2 Bank Reciept is post-dated-cheque-heavy; we exclude rows whose
-# VoucherDate is in the future (still uncleared). Confirmed via
-# _discover_opening_pdc.py — a TT=2 receipt found with VoucherDate
-# 2026-08-26 entered on 2026-04-28 = a 4-month PDC.
-PDC_TT: int = 2
+# PDC (post-dated cheque) exclusion: any CR-side row whose VoucherDate
+# is in the future is a cheque entered but not yet cleared. We exclude
+# them from the FIFO Cr pool until they actually clear (= today catches
+# up to their VoucherDate). _discover_recon4.out Step Q3b confirms that
+# only TT=2 Bank Reciept currently carries PDCs in this DB (Rs5.5 Cr
+# across 534 vouchers), but we apply the filter to ALL CR-side rows on
+# principle so the rule stays correct if KWPL starts using PDCs on TT=29
+# (cash receipt) or any other CR TT in future.
 
 # BS reconciliation target — Sundry Debtors line from owner's BS.
 # Tunable here in case the comparison number changes month-on-month.
@@ -230,7 +237,14 @@ def _load_ledger() -> pd.DataFrame:
                                     AND bpr.VoucherNo   = d.VoucherNo
         WHERE d.PartyID LIKE 'D%'
           AND h.Cancelled = 'N'
-          AND NOT (h.TransTypeID = {PDC_TT}
+          -- Exclude PDC entries: any CR row whose VoucherDate is in
+          -- the future (cheque entered but not yet cleared). Mirrors
+          -- the manual matching report's "Uncleared Cheques" carve-out.
+          AND NOT (d.DrCrIndicator = 'C'
+                   AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date))
+          -- Also drop any forward-dated DR rows (shouldn't exist but
+          -- protects against data-entry slip-ups).
+          AND NOT (d.DrCrIndicator = 'D'
                    AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date))
     """
     df = run_query(sql)
@@ -244,6 +258,50 @@ def _load_ledger() -> pd.DataFrame:
     df["Amount"]      = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
     # Ageing date — TPDate if present, else VoucherDate
     df["AgeingDate"]  = df["TPDate"].fillna(df["VoucherDate"])
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_pdc_pipeline() -> pd.DataFrame:
+    """All Cr-side debtor rows whose VoucherDate is in the FUTURE.
+
+    These are the post-dated cheques sitting in clearing limbo — the
+    "Uncleared/Unmatched Cheques" column in the manual matching report.
+    They are deliberately excluded from the ageing FIFO (the dashboard
+    treats them as not-yet-paid) and surfaced separately in their own
+    panel so the user can see when the cash is expected to land.
+
+    Returns one row per PDC voucher with party, cheque date and amount.
+    """
+    sql = """
+        SELECT
+            d.PartyID,
+            ISNULL(p.PartyName, '(unknown)')           AS PartyName,
+            t.TransTypeName,
+            h.TransTypeID,
+            h.VoucherNo,
+            CAST(h.VoucherDate AS date)                AS ChequeDate,
+            CAST(d.Amount AS float)                    AS Amount
+        FROM TrVocHead   h
+        JOIN TrVocDetail d
+            ON d.TransTypeID = h.TransTypeID
+           AND d.VoucherNo   = h.VoucherNo
+           AND d.DrCrIndicator = 'C'
+           AND d.PartyID LIKE 'D%'
+        JOIN MsTransType t  ON t.TransTypeID = h.TransTypeID
+        LEFT JOIN MsPartyMaster p ON p.PartyID = d.PartyID
+        WHERE h.Cancelled  = 'N'
+          AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date)
+        ORDER BY h.VoucherDate
+    """
+    df = run_query(sql)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "PartyID", "PartyName", "TransTypeName", "TransTypeID",
+            "VoucherNo", "ChequeDate", "Amount",
+        ])
+    df["ChequeDate"] = pd.to_datetime(df["ChequeDate"])
+    df["Amount"]     = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
     return df
 
 
@@ -720,6 +778,104 @@ def _section_sanity(df: pd.DataFrame) -> None:
         )
 
 
+def _section_pdc_pipeline(today: pd.Timestamp) -> None:
+    """Surface every post-dated cheque entered in the ERP, grouped by
+    realization date. Mirrors the 'Uncleared/Unmatched Cheques' column
+    in the manual matching report.
+    """
+    pdc = _load_pdc_pipeline()
+    if pdc.empty:
+        return
+
+    st.subheader("📅 PDC pipeline (post-dated cheques)")
+    st.caption(
+        "Cheques entered in the ERP but dated in the future — they "
+        "haven't reduced outstanding yet. Listed by the date the cheque "
+        "is meant to be presented to the bank."
+    )
+
+    total_cr      = float(pdc["Amount"].sum()) / 1e7
+    party_count   = int(pdc["PartyID"].nunique())
+    next_30_cut   = today + pd.Timedelta(days=30)
+    next_30_amt   = float(pdc.loc[pdc["ChequeDate"] <= next_30_cut, "Amount"].sum()) / 1e7
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total PDC pipeline", f"₹{total_cr:.2f} Cr",
+              f"{len(pdc):,} cheques")
+    c2.metric("Realizing in next 30 days", f"₹{next_30_amt:.2f} Cr")
+    c3.metric("Parties with PDCs", f"{party_count:,}")
+
+    disp = pdc.sort_values("ChequeDate").copy()
+    disp["CqDate"]   = disp["ChequeDate"].dt.strftime("%d-%b-%Y")
+    disp["Amount_L"] = disp["Amount"] / 1e5
+    disp_view = disp[["CqDate", "PartyID", "PartyName",
+                      "TransTypeName", "VoucherNo", "Amount_L"]] \
+        .rename(columns={"CqDate":"Cheque Date", "Amount_L":"Amount (Rs L)"})
+
+    styled = (
+        disp_view.style.format({
+            "Amount (Rs L)": "₹{:.2f} L",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=320)
+
+
+# ── 5-party spot check (used by sanity section) ───────────────────────────
+SPOT_CHECK_PARTIES: tuple[str, ...] = (
+    "D06428",  # Y R WINES (VIRANSH MUNDHAWA)
+    "D00067",  # EAGLE WINES PAUD ROAD
+    "D06047",  # 2 BHK DINNER & KEY CLUB (MYRAH HOSPITALITY LLP)
+    "D02247",  # WINE KING (KHARADI)
+    "D00030",  # ATUL WINES (TILAK RD)
+)
+
+
+def _section_spot_check(df: pd.DataFrame) -> None:
+    """Five known high-balance parties side-by-side with their dashboard
+    outstanding. Owner cross-references these against the ERP manual
+    matching report to confirm no party is missing or mis-aged."""
+    rows = []
+    for pid in SPOT_CHECK_PARTIES:
+        sub = df[df["PartyID"] == pid]
+        if sub.empty:
+            rows.append({
+                "PartyID":          pid,
+                "PartyName":        "(not in dashboard)",
+                "Out_L":            0.0,
+                "Lines":            0,
+                "OldestAge":        0,
+                "OverduePct":       0.0,
+            })
+            continue
+        out_amt = float(sub["Remaining"].sum())
+        od_amt  = float(sub.loc[sub["IsOverdue"], "Remaining"].sum())
+        rows.append({
+            "PartyID":     pid,
+            "PartyName":   str(sub["PartyName"].iloc[0]),
+            "Out_L":       out_amt / 1e5,
+            "Lines":       int(len(sub)),
+            "OldestAge":   int(sub["AgeDays"].max()),
+            "OverduePct":  (od_amt / out_amt * 100) if out_amt else 0.0,
+        })
+
+    spot = pd.DataFrame(rows)
+    styled = (
+        spot.style.format({
+            "Out_L":      "₹{:.1f} L",
+            "Lines":      "{:,}",
+            "OldestAge":  "{:.0f} d",
+            "OverduePct": "{:.1f}%",
+        })
+    )
+    st.markdown("**Cross-check against manual matching report:**")
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption(
+        "Each number above is the dashboard's reading. Compare with the "
+        "manual matching report — gaps > ₹100 indicate a data-flow issue "
+        "(missing TransType, mis-attributed receipt, or PDC mis-handling)."
+    )
+
+
 def _section_reconciliation(df: pd.DataFrame) -> None:
     """At the very top: how the dashboard total compares to the BS."""
     total_cr = float(df["Remaining"].sum()) / 1e7
@@ -792,6 +948,7 @@ def render() -> None:
         return
 
     safe_section("Reconciliation",    _section_reconciliation, unpaid)
+    safe_section("Spot check",        _section_spot_check,     unpaid)
     st.divider()
     safe_section("Hero KPIs",         _section_hero,           unpaid)
     st.divider()
@@ -805,4 +962,6 @@ def render() -> None:
     safe_section("Party risk",        _section_party_risk,     unpaid)
     st.divider()
     safe_section("Renegotiation",     _section_renegotiate,    unpaid)
+    st.divider()
+    safe_section("PDC pipeline",      _section_pdc_pipeline,   today)
     safe_section("Sanity check",      _section_sanity,         unpaid)
