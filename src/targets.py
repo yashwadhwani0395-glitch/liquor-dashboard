@@ -27,6 +27,7 @@ FOCUS_BRAND_FILE         = _DATA_DIR / "focus_brand.json"          # current foc
 PARTY_TARGETS_FILE       = _DATA_DIR / "party_targets.json"        # manual per-outlet overrides
 SALESMAN_OVERRIDES_FILE  = _DATA_DIR / "salesman_overrides.json"   # manual salesman case targets
 TARGET_CONFIG_FILE       = _DATA_DIR / "target_config.json"        # smart-target params
+BRAND_TARGETS_FILE       = _DATA_DIR / "brand_targets.json"        # principal × month × {brand: cases}
 
 
 def load_targets() -> dict[str, dict[str, Any]]:
@@ -211,3 +212,31 @@ def load_target_config() -> dict[str, float]:
 
 def save_target_config(config: dict[str, float]) -> None:
     _write_json(TARGET_CONFIG_FILE, {k: float(v) for k, v in config.items()})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BRAND-LEVEL MONTHLY TARGETS (per principal, per month)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_brand_targets(principal: str, month_str: str) -> dict | None:
+    """Return {'targets': {brand_name: cases, ...}, 'updated_at': ...} or None."""
+    return _read_json(BRAND_TARGETS_FILE).get(f"{principal}__{month_str}")
+
+
+def save_brand_targets(principal: str, month_str: str,
+                       brand_targets: dict[str, float]) -> None:
+    """brand_targets keyed by exact MsBrandMaster.BrandName."""
+    data = _read_json(BRAND_TARGETS_FILE)
+    # Drop zero/blank entries so the file stays tidy
+    clean = {k: float(v) for k, v in brand_targets.items() if float(v) > 0}
+    data[f"{principal}__{month_str}"] = {
+        "targets":    clean,
+        "updated_at": date.today().isoformat(),
+    }
+    _write_json(BRAND_TARGETS_FILE, data)
+
+
+def delete_brand_targets(principal: str, month_str: str) -> None:
+    data = _read_json(BRAND_TARGETS_FILE)
+    data.pop(f"{principal}__{month_str}", None)
+    _write_json(BRAND_TARGETS_FILE, data)

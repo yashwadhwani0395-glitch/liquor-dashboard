@@ -30,6 +30,7 @@ from src.targets import (
     delete_party_target_override,
     load_salesman_override, save_salesman_override, delete_salesman_override,
     load_target_config, save_target_config, DEFAULT_TARGET_CONFIG,
+    load_brand_targets, save_brand_targets, delete_brand_targets,
 )
 
 SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
@@ -230,6 +231,167 @@ def _load_brands_for_principal(company_id: str) -> pd.DataFrame:
         (company_id,),
     )
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_brand_outlet_sales(company_id: str,
+                             months_back: int,
+                             end_date: date) -> pd.DataFrame:
+    """Raw (BrandName, PartyID, SM1, SM2, SM3, Cases) for a principal.
+
+    Caller attributes each row to a salesman via SALESMAN_MAP's per-principal
+    sm_field rule, then aggregates by (BrandName, Salesman). Returns an
+    EMPTY DataFrame with the expected columns when SQL yields nothing.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            b.BrandName,
+            d.PartyID,
+            RTRIM(ISNULL(p.SalesManID,  '')) AS SM1,
+            RTRIM(ISNULL(p.SalesManID1, '')) AS SM2,
+            RTRIM(ISNULL(p.SalesManID2, '')) AS SM3,
+            SUM({_CASES}) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.FreeItemYN  = 'N'
+            AND vi.ItemID      LIKE 'I%'
+            {_FY_JOIN}
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY Amount DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
+        JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled    = 'N'
+          AND b.CompanyID    = ?
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, ?)
+          AND CAST(h.VoucherDate AS date) <= ?
+        GROUP BY b.BrandName, d.PartyID, p.SalesManID, p.SalesManID1, p.SalesManID2
+    """
+    df = run_query(sql, (company_id, str(end_date), str(end_date)))
+    if df.empty:
+        return pd.DataFrame(columns=["BrandName","PartyID","SM1","SM2","SM3","Cases"])
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    for c in ("SM1","SM2","SM3"):
+        df[c] = df[c].fillna("").astype(str)
+    return df
+
+
+def _attribute_to_salesman(row: pd.Series,
+                           handlers: dict[str, dict]) -> str:
+    """For each outlet row, return the salesman whose configured sm_field
+    holds them on this outlet. Falls back to 'Unmapped' if no handler claims it.
+    `handlers` maps sm_id → {'name': ..., 'field': 'SM1'|'SM2'|'SM3'}."""
+    for col in ("SM1", "SM2", "SM3"):
+        sid = row.get(col, "")
+        h = handlers.get(sid)
+        if h is not None and h["field"] == col:
+            return h["name"]
+    return "Unmapped"
+
+
+def _compute_brand_contribution(company_id: str,
+                                months_back: int,
+                                end_date: date) -> pd.DataFrame:
+    """Per (Brand, Salesman) historical cases over `months_back` ending at
+    `end_date`. Attribution uses SALESMAN_MAP's per-principal sm_field rule.
+
+    Returns columns: Brand · Salesman · Cases · BrandTotal · Contribution
+    """
+    raw = _load_brand_outlet_sales(company_id, months_back, end_date)
+    if raw.empty:
+        return pd.DataFrame(columns=["Brand","Salesman","Cases","BrandTotal","Contribution"])
+
+    # Build the principal's handler map: sm_id → {name, field}
+    handlers: dict[str, dict] = {
+        cfg["sm_id"]: {"name": sm_key, "field": cfg["sm_field"]}
+        for sm_key, cfg in SALESMAN_MAP.items()
+        if company_id in cfg["principals"]
+    }
+    raw["Salesman"] = raw.apply(_attribute_to_salesman, axis=1, handlers=handlers)
+
+    grouped = (
+        raw.groupby(["BrandName", "Salesman"], as_index=False)["Cases"].sum()
+        .rename(columns={"BrandName": "Brand"})
+    )
+    grouped["BrandTotal"] = grouped.groupby("Brand")["Cases"].transform("sum")
+    grouped["Contribution"] = grouped.apply(
+        lambda r: (r["Cases"] / r["BrandTotal"] * 100) if r["BrandTotal"] > 0 else 0.0,
+        axis=1,
+    ).round(2)
+    return grouped
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_brand_achievement(company_id: str, month_str: str) -> pd.DataFrame:
+    """Per (Brand, Salesman) cases for the current operating month.
+    Same attribution rule as _compute_brand_contribution.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    yr, mo = int(month_str[:4]), int(month_str[5:])
+    first = date(yr, mo, 1)
+    last  = _month_bounds(first)[1]
+
+    sql = f"""
+        SELECT
+            b.BrandName,
+            d.PartyID,
+            RTRIM(ISNULL(p.SalesManID,  '')) AS SM1,
+            RTRIM(ISNULL(p.SalesManID1, '')) AS SM2,
+            RTRIM(ISNULL(p.SalesManID2, '')) AS SM3,
+            SUM({_CASES}) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.FreeItemYN  = 'N'
+            AND vi.ItemID      LIKE 'I%'
+            {_FY_JOIN}
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY Amount DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
+        JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled    = 'N'
+          AND b.CompanyID    = ?
+          AND CAST(h.VoucherDate AS date) BETWEEN ? AND ?
+        GROUP BY b.BrandName, d.PartyID, p.SalesManID, p.SalesManID1, p.SalesManID2
+    """
+    df = run_query(sql, (company_id, str(first), str(last)))
+    if df.empty:
+        return pd.DataFrame(columns=["Brand","Salesman","Cases"])
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    for c in ("SM1","SM2","SM3"):
+        df[c] = df[c].fillna("").astype(str)
+
+    handlers = {
+        cfg["sm_id"]: {"name": sm_key, "field": cfg["sm_field"]}
+        for sm_key, cfg in SALESMAN_MAP.items()
+        if company_id in cfg["principals"]
+    }
+    df["Salesman"] = df.apply(_attribute_to_salesman, axis=1, handlers=handlers)
+    return (
+        df.groupby(["BrandName", "Salesman"], as_index=False)["Cases"].sum()
+        .rename(columns={"BrandName": "Brand"})
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -964,6 +1126,213 @@ def _compute_salesman_share(team_salesmen: list[str], hist: pd.DataFrame,
     return per_sm, total
 
 
+def _section_brand_targets(principal: str, cid: str,
+                            op_month: str, end_date: date,
+                            brands_df: pd.DataFrame) -> None:
+    """Brand-level target entry + brand × salesman allocation matrix."""
+    st.caption(
+        "Enter target cases **per brand** for this principal. "
+        "Allocation to salesmen uses each salesman's historical % share "
+        "of that brand over the last 11 months."
+    )
+    if brands_df.empty:
+        st.info(f"No brands found for {principal}."); return
+
+    existing = load_brand_targets(principal, op_month) or {}
+    saved = existing.get("targets", {}) if existing else {}
+
+    # ── Target entry form ──
+    with st.form(f"brand_tgt_form_{principal}_{op_month}"):
+        st.markdown("**Set brand targets for this month**")
+        brand_inputs: dict[str, float] = {}
+        # 3 columns of inputs for compact layout
+        cols = st.columns(3)
+        for i, row in enumerate(brands_df.iterrows()):
+            _, br = row
+            name = br["BrandName"]
+            with cols[i % 3]:
+                v = st.number_input(
+                    name[:40],
+                    min_value=0.0, step=1.0,
+                    value=float(saved.get(name, 0)),
+                    key=f"bt_{principal}_{name}_{op_month}",
+                )
+                brand_inputs[name] = v
+
+        total = sum(brand_inputs.values())
+        st.markdown(
+            f"**Sum of brand targets: {total:,.0f} cases**  "
+            f"<span style='color:#6b7280;font-size:0.85rem'>"
+            f"(auto-summed across {len(brand_inputs)} brands)</span>",
+            unsafe_allow_html=True,
+        )
+        c_save, c_clear, _ = st.columns([1, 1, 4])
+        with c_save:
+            submitted = st.form_submit_button("💾 Save brand targets", type="primary")
+        with c_clear:
+            clear = st.form_submit_button("🗑️ Clear all")
+
+    if submitted:
+        save_brand_targets(principal, op_month, brand_inputs)
+        st.success(f"Saved {sum(1 for v in brand_inputs.values() if v > 0)} brand targets.")
+        st.rerun()
+    if clear:
+        delete_brand_targets(principal, op_month)
+        st.success("Brand targets cleared.")
+        st.rerun()
+
+    # ── Matrix + summary (only if any targets exist) ──
+    if not saved:
+        st.info("No brand targets set yet. Enter values above and save to see "
+                "the brand × salesman allocation matrix.")
+        return
+
+    st.divider()
+    st.markdown("##### 📊 Brand × Salesman target matrix")
+    st.caption(
+        "Each salesman's target = (their historical % share of brand) × "
+        "(total brand target). Achievement = current-month cases for that "
+        "(brand, salesman) attributed via the principal's sm_field rule."
+    )
+
+    contrib = _compute_brand_contribution(cid, months_back=11, end_date=end_date)
+    ach     = _load_brand_achievement(cid, op_month)
+    if contrib.empty:
+        st.warning("No historical data to compute contributions."); return
+
+    # Drop "Unmapped" lines from the contribution view — they're cases on
+    # outlets that have no principal salesman assigned, so they cannot
+    # be allocated. Reported as a footnote.
+    unmapped_cases = float(contrib[contrib["Salesman"] == "Unmapped"]["Cases"].sum())
+    contrib = contrib[contrib["Salesman"] != "Unmapped"].copy()
+
+    # Recompute Contribution% after dropping Unmapped so allocations sum
+    # exactly to each brand target.
+    contrib["BrandTotal"] = contrib.groupby("Brand")["Cases"].transform("sum")
+    contrib["Contribution"] = contrib.apply(
+        lambda r: (r["Cases"] / r["BrandTotal"] * 100) if r["BrandTotal"] > 0 else 0.0,
+        axis=1,
+    )
+
+    # Build matrix rows
+    rows = []
+    for brand_name, tgt_cases in saved.items():
+        if float(tgt_cases) <= 0:
+            continue
+        b_contrib = contrib[contrib["Brand"] == brand_name]
+        if b_contrib.empty:
+            rows.append({
+                "Brand":         brand_name,
+                "Salesman":      "(no history)",
+                "Hist Share %":  0.0,
+                "Target":        float(tgt_cases),
+                "Achieved":      0.0,
+                "Balance":       float(tgt_cases),
+                "% Done":        0.0,
+            })
+            continue
+        for _, c in b_contrib.iterrows():
+            sm = c["Salesman"]
+            allocated = float(tgt_cases) * (c["Contribution"] / 100)
+            achieved = float(
+                ach[(ach["Brand"] == brand_name) & (ach["Salesman"] == sm)]["Cases"].sum()
+            )
+            rows.append({
+                "Brand":         brand_name,
+                "Salesman":      sm,
+                "Hist Share %":  round(c["Contribution"], 1),
+                "Target":        round(allocated, 2),
+                "Achieved":      round(achieved, 2),
+                "Balance":       round(allocated - achieved, 2),
+                "% Done":        round(achieved / allocated * 100, 1) if allocated > 0 else 0.0,
+            })
+
+    matrix = pd.DataFrame(rows)
+    if matrix.empty:
+        st.info("No allocations to display."); return
+
+    # ── Detailed brand × salesman table ──
+    st.markdown("**Detail rows (Brand × Salesman)**")
+    def _done_style(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if n >= 80:  return "color:#16a34a; font-weight:600"
+        if n >= 50:  return "color:#854d0e; font-weight:600"
+        return "color:#dc2626; font-weight:600"
+
+    styled_detail = (
+        matrix.sort_values(["Brand", "Target"], ascending=[True, False])
+        .style
+        .format({
+            "Hist Share %": "{:.1f}",
+            "Target":       "{:,.2f}",
+            "Achieved":     "{:,.2f}",
+            "Balance":      "{:+,.2f}",
+            "% Done":       "{:.1f}",
+        })
+        .map(_done_style, subset=["% Done"])
+    )
+    st.dataframe(styled_detail, use_container_width=True, hide_index=True)
+
+    # ── Per-salesman roll-up ──
+    st.markdown("**Per-salesman summary (Target vs Achieved)**")
+    summary = (
+        matrix.groupby("Salesman", as_index=False)
+        .agg(Target=("Target", "sum"),
+             Achieved=("Achieved", "sum"))
+    )
+    summary["Balance"]  = summary["Target"] - summary["Achieved"]
+    summary["% Done"]   = summary.apply(
+        lambda r: round(r["Achieved"] / r["Target"] * 100, 1) if r["Target"] > 0 else 0.0,
+        axis=1,
+    )
+    summary = summary.sort_values("Target", ascending=False)
+    styled_summary = (
+        summary.style
+        .format({
+            "Target":   "{:,.2f}",
+            "Achieved": "{:,.2f}",
+            "Balance":  "{:+,.2f}",
+            "% Done":   "{:.1f}",
+        })
+        .map(_done_style, subset=["% Done"])
+    )
+    st.dataframe(styled_summary, use_container_width=True, hide_index=True)
+
+    # ── Brand roll-up ──
+    st.markdown("**Per-brand summary**")
+    by_brand = (
+        matrix.groupby("Brand", as_index=False)
+        .agg(Target=("Target", "sum"),
+             Achieved=("Achieved", "sum"))
+    )
+    by_brand["Balance"] = by_brand["Target"] - by_brand["Achieved"]
+    by_brand["% Done"]  = by_brand.apply(
+        lambda r: round(r["Achieved"] / r["Target"] * 100, 1) if r["Target"] > 0 else 0.0,
+        axis=1,
+    )
+    styled_brand = (
+        by_brand.style
+        .format({
+            "Target":   "{:,.0f}",
+            "Achieved": "{:,.2f}",
+            "Balance":  "{:+,.2f}",
+            "% Done":   "{:.1f}",
+        })
+        .map(_done_style, subset=["% Done"])
+    )
+    st.dataframe(styled_brand, use_container_width=True, hide_index=True)
+
+    if unmapped_cases > 0:
+        st.caption(
+            f"Note: {unmapped_cases:,.1f} historical cases came from outlets "
+            f"with no matched salesman for this principal. Those cases are "
+            f"excluded from contribution % so allocations sum to the target."
+        )
+
+
 def _section_salesman_scoreboard(principal: str,
                                  universes: dict[str, frozenset],
                                  universes_by_p: dict[str, dict[str, frozenset]],
@@ -1244,6 +1613,17 @@ def render() -> None:
                  _section_salesman_scoreboard,
                  principal, universes, universes_by_p, master, hist,
                  op_month, target_entry, allocation_method)
+    st.divider()
+
+    # ── Section 5b: Brand-level targets (lazy expander, MIS-style) ──
+    with st.expander("🏷️ Brand-level targets & matrix (optional, more granular)",
+                     expanded=False):
+        brands_for_principal = _load_brands_for_principal(cid)
+        safe_section("Brand targets & matrix",
+                     _section_brand_targets,
+                     principal, cid, op_month,
+                     _month_bounds(op_month_date)[1],
+                     brands_for_principal)
     st.divider()
 
     # ── Section 6: Target config (advanced) ──
