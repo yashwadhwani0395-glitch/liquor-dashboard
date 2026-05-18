@@ -9,10 +9,10 @@
   },
   "Diageo__2026-05": {
     "breakdown": {
-      "Wine Shops": 1300,
-      "Permit Rooms": 1500
+      "Wine Shops": 4028,
+      "Permit Rooms": 612
     },
-    "total_cases": 2800,
+    "total_cases": 4640,
     "updated_at": "2026-05-18"
   },
   "United Breweries__2026-05": {
@@ -26,10 +26,10 @@
   },
   "United Spirits__2026-05": {
     "breakdown": {
-      "Wine Shops": 9500,
-      "Permit Rooms": 8800
+      "Wine Shops": 16187,
+      "Permit Rooms": 555
     },
-    "total_cases": 18300,
+    "total_cases": 16742,
     "updated_at": "2026-05-18"
   }
 }
