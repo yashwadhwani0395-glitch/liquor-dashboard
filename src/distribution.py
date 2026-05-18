@@ -247,7 +247,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
 # UNIVERSE LOADER  (Billing-active, cached 1 hour)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)   # billing-active universe — 24h
 def _load_active_universe() -> pd.DataFrame:
     """
     Active universe = parties that have billed any tracked principal in the

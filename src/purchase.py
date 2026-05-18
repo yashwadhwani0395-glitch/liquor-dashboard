@@ -126,7 +126,7 @@ def _kpi_card(label: str, value: str, delta_text: str,
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_kpis(start: date, end: date,
                         ly_start: date, ly_end: date,
                         principal_ids: tuple[str, ...]) -> dict:
@@ -184,7 +184,7 @@ def _load_purchase_kpis(start: date, end: date,
     }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_gl(start: date, end: date,
                       ly_start: date, ly_end: date) -> dict:
     """GL-based purchase totals (canonical — matches Balance Sheet).
@@ -252,7 +252,7 @@ def _load_purchase_gl(start: date, end: date,
     return out
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_by_principal(start: date, end: date,
                                 ly_start: date, ly_end: date) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
@@ -291,7 +291,7 @@ def _load_purchase_by_principal(start: date, end: date,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
     """Per principal: (cases bought + value) vs (cases sold + value)."""
     pu_ph = ",".join(str(t) for t in PURCHASE_TYPES)
@@ -328,7 +328,7 @@ def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_monthly(months: int = 24,
                            principal_ids: tuple[str, ...] = ()) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
@@ -366,7 +366,7 @@ def _load_purchase_monthly(months: int = 24,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_top_brands_purchased(start: date, end: date,
                                principal_ids: tuple[str, ...]) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
@@ -405,7 +405,7 @@ def _load_top_brands_purchased(start: date, end: date,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     sql = f"""

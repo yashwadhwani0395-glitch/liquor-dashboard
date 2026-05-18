@@ -78,7 +78,7 @@ def _last_n_month_strs(n: int, ref: date | None = None) -> list[str]:
 # DATA LOADERS  (one query covers current + LY periods via conditional sums)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_period_kpis(start: date, end: date,
                       ly_start: date, ly_end: date,
                       principal_ids: tuple[str, ...]) -> dict:
@@ -158,7 +158,7 @@ def _load_period_kpis(start: date, end: date,
     }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_monthly_revenue(months: int = 24,
                           principal_ids: tuple[str, ...] = ()) -> pd.DataFrame:
     """Per-month revenue for last `months` months (used by trend chart + benchmarks)."""
@@ -203,7 +203,7 @@ def _load_monthly_revenue(months: int = 24,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_principal_growth(start: date, end: date,
                            ly_start: date, ly_end: date) -> pd.DataFrame:
     """Per-principal revenue + cases for current period and LY."""
@@ -248,7 +248,7 @@ def _load_principal_growth(start: date, end: date,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_channel_revenue(start: date, end: date,
                           principal_ids: tuple[str, ...]) -> pd.DataFrame:
     """Per-channel revenue using LicenseType+AcType3 logic (mirrors salesman.py)."""
@@ -326,7 +326,7 @@ def _load_channel_revenue(start: date, end: date,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_brand_growth(start: date, end: date,
                        ly_start: date, ly_end: date,
                        principal_ids: tuple[str, ...]) -> pd.DataFrame:

@@ -84,7 +84,7 @@ _LT_LABEL: dict[str, str] = {
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_principal_brands(company_id: str, start: date, end: date) -> pd.DataFrame:
     """Brand-level revenue + cases for a principal across a date range."""
     type_ph = ",".join(str(t) for t in SALES_TYPES)

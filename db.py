@@ -66,8 +66,10 @@ def get_connection() -> pymssql.Connection | None:
 
 # ── Connection status helper ───────────────────────────────────────────────
 
+@st.cache_data(ttl=60, show_spinner=False)   # avoid re-probing on every rerun
 def get_connection_status() -> bool:
-    """Return True if the DB is reachable, False otherwise."""
+    """Return True if the DB is reachable, False otherwise.
+    Cached for 60s — call get_connection.clear() to force a fresh probe."""
     try:
         conn = get_connection()
         return conn is not None

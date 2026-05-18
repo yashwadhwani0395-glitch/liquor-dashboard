@@ -96,15 +96,26 @@ status_html = (
     if status else
     '<span class="kwpl-status-off">● DB Offline</span>'
 )
-st.markdown(f"""
-<div class="kwpl-header">
-    <div>
-        <div class="kwpl-logo">KWPL</div>
-        <div class="kwpl-sub">Kranti Wines Pvt. Ltd.</div>
+_hdr, _btn = st.columns([12, 1])
+with _hdr:
+    st.markdown(f"""
+    <div class="kwpl-header">
+        <div>
+            <div class="kwpl-logo">KWPL</div>
+            <div class="kwpl-sub">Kranti Wines Pvt. Ltd.</div>
+        </div>
+        {status_html}
     </div>
-    {status_html}
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+with _btn:
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh", help="Clear cache & re-query DB",
+                 key="hdr_refresh", use_container_width=True):
+        st.cache_data.clear()
+        # Also re-probe the connection in case it was stale
+        from db import get_connection
+        get_connection.clear()
+        st.rerun()
 
 # ── Top-level tabs ───────────────────────────────────────────────────────────
 t1, t2, t3, t4, t5, t6, t7 = st.tabs([

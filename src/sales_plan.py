@@ -99,7 +99,7 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_outlet_history(company_id: str,
                          end_date: date,
                          months_back: int = 7) -> pd.DataFrame:
@@ -151,7 +151,7 @@ def _load_outlet_history(company_id: str,
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_brand_buyers(company_id: str,
                        brand_id: int,
                        end_date: date) -> pd.DataFrame:
@@ -207,7 +207,7 @@ def _load_brand_buyers(company_id: str,
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)   # master brand list — 24h
 def _load_brands_for_principal(company_id: str) -> pd.DataFrame:
     """All brands belonging to a principal — used for focus-brand dropdown."""
     df = run_query(
@@ -804,7 +804,6 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
 def _section_focus_brand(company_id: str,
                          op_month: str, prev_month: str,
                          brands_df: pd.DataFrame) -> None:
-    st.subheader("Focus brand of the fortnight")
     st.caption("Pick a brand to push across all outlets — see recover / convert / grow lists")
 
     if brands_df.empty:
@@ -1218,9 +1217,10 @@ def render() -> None:
     _section_outlet_plan(plan_df, cfg["subteams"], op_month)
     st.divider()
 
-    # ── Section 4: Focus brand ──
-    brands_df = _load_brands_for_principal(cid)
-    _section_focus_brand(cid, op_month, prev_month, brands_df)
+    # ── Section 4: Focus brand (lazy — only loads when opened) ──
+    with st.expander("🎯 Focus Brand of the Fortnight", expanded=False):
+        brands_df = _load_brands_for_principal(cid)
+        _section_focus_brand(cid, op_month, prev_month, brands_df)
     st.divider()
 
     # ── Section 5: Salesman scoreboard (uses hist for L3M share) ──

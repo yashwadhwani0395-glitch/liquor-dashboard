@@ -52,7 +52,7 @@ _LT_LABEL: dict[str, str] = {
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_brand_party_revenue(start: date, end: date,
                               principal_ids: tuple[str, ...]) -> pd.DataFrame:
     """Brand × Party revenue for date range; filter Python-side by universe."""

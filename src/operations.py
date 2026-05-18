@@ -61,7 +61,7 @@ _GRID = dict(gridcolor="#E8E8E8")
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
     """Distinct (BillDate, PartyID, CompanyID) rows for the operating month.
 

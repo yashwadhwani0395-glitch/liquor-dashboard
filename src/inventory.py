@@ -64,7 +64,7 @@ _FY_JOIN = """
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_current_stock() -> pd.DataFrame:
     """Live closing stock per item (today). Source: MsItemBatchOpening."""
     sql = """
@@ -105,7 +105,7 @@ def _load_current_stock() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_movements(start: date, end: date) -> pd.DataFrame:
     """Per-item In/Out bottle + case movements between start and end.
 
@@ -141,7 +141,7 @@ def _load_movements(start: date, end: date) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)   # FY-fixed — 24h
 def _load_opening_stock() -> pd.DataFrame:
     """Per-item opening bottles from MsItemBatchOpening (FY-opening basis)."""
     sql = """
@@ -157,7 +157,7 @@ def _load_opening_stock() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)   # item classification — 24h
 def _load_item_origin() -> pd.DataFrame:
     """Classify each item as Import / Daman / Domestic based on dominant
     purchase TransType in the last 12 months."""
@@ -192,7 +192,7 @@ def _load_item_origin() -> pd.DataFrame:
     return run_query(sql)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def _load_sales_velocity(as_of_date: date, days_back: int = 30) -> pd.DataFrame:
     """Per-item sales cases in last N days + last sale date (FY-CASE filtered)."""
     sql = f"""
