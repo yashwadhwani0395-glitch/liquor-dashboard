@@ -41,5 +41,22 @@ db_structure.txt
 streamlit_*.txt
 streamlit_*.log
 
+# Local diagnostic / verification / discovery scripts and their captured output.
+# These are throwaway scripts authored during investigation. Findings are
+# documented in commit messages and module docstrings; the scripts themselves
+# stay local for re-running but never enter git.
+_diag*.py
+_diag*.out
+_discover*.py
+_discover*.out
+_verify*.py
+_verify*.out
+_smoke_*.py
+_full_render_trace.py
+_revenue_check.py
+_check_brand_names.py
+_commit_msg.txt
+run_query.py
+
 # Jupyter
 .ipynb_checkpoints/
