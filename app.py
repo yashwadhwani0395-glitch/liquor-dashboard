@@ -118,9 +118,13 @@ with _btn:
         st.rerun()
 
 # ── Top-level tabs ───────────────────────────────────────────────────────────
+# Inventory is no longer a top-level tab — it lives under Purchase as a sub-tab,
+# since stock is the direct consequence of purchase activity. The new
+# Debtors Ageing tab sits between Expenses and Cash Flow as a first-class
+# receivables view.
 t1, t2, t3, t4, t5, t6, t7 = st.tabs([
-    "Overview", "Purchase", "Sales", "Inventory",
-    "Expenses", "Cash Flow", "Balance Sheet",
+    "Overview", "Purchase", "Sales",
+    "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet",
 ])
 
 
@@ -147,8 +151,15 @@ with t1:
     )
 
 with t2:
-    from src.purchase import render as render_purchase
-    render_purchase()
+    p_overview, p_inventory = st.tabs([
+        "📦 Purchase Overview", "🏭 Inventory",
+    ])
+    with p_overview:
+        from src.purchase import render as render_purchase
+        render_purchase()
+    with p_inventory:
+        from src.inventory import render as render_inventory
+        render_inventory()
 
 with t3:
     s_plan, s_overview, s_team, s_dist, s_meeting, s_ops = st.tabs([
@@ -175,21 +186,21 @@ with t3:
         from src.operations import render as render_operations
         render_operations()
 
-with t4:
-    from src.inventory import render as render_inventory
-    render_inventory()
-
-with t5:
+with t4:  # Expenses (slot 4 since Inventory is no longer top-level)
     coming_soon(
         "Expense Tracking",
         "Operating expenses by category, monthly trends, vs revenue ratios",
         "💸",
     )
 
+with t5:  # Debtors Ageing — new first-class tab
+    from src.debtors import render as render_debtors
+    render_debtors()
+
 with t6:
     coming_soon(
-        "Cash Flow & Outstanding",
-        "Cash inflow/outflow, debtor ageing (0-30 / 30-60 / 60-90 / 90+), creditor outstanding",
+        "Cash Flow",
+        "Cash inflow/outflow, creditor outstanding, working-capital trends",
         "💰",
     )
 
