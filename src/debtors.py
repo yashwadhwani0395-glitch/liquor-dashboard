@@ -1,21 +1,32 @@
-"""src/debtors.py — Debtors Ageing page (bill-wise FIFO + brand credit days).
+"""src/debtors.py — Debtors Ageing page (BS-reconciled FIFO + brand credit days).
 
-Architecture
-------------
-1. Pull every non-cancelled sales bill in TrVocHead/TrVocItem/TrVocDetail
-   joined with the debtor's MsPartyMaster row.
-2. For each bill compute:
+Architecture (post-`<this commit>` rewrite to fix the BS ₹56 Cr gap)
+-------------------------------------------------------------------
+1. Pull the COMPLETE TrVocDetail ledger for debtor parties — every Dr
+   and every Cr row across EVERY non-cancelled voucher. This is the
+   only view that reconciles to the Balance Sheet's Sundry Debtors
+   Control account, because it captures opening movements, bounced
+   cheques (TT=12), debit notes (TT=24), JVs (TT=10), sales orders
+   (TT=26), credit notes (TT=7), etc. — not just the 14 sales TTs.
+2. Exclude post-dated TT=2 Bank Receipt rows where VoucherDate > today
+   (these are PDC entries not yet cleared by the bank — they should
+   not reduce outstanding until they actually clear).
+3. For each Dr row that came from a sales TransType (the 14 sales TTs),
+   enrich with brand metadata:
        HasMcDowells   — bill contains any McDowell's brand line
        HasCDItem      — bill contains the CD service item (S00026, +amt)
        CreditDays     — 15 if McDowell, 17 if CD, else 40 (owner rule)
-       Principal      — by dominant CompanyID share of the bill
-3. Pull every non-cancelled receipt (TT 2 Bank Reciept, 29 Cash, 55
-   Receipt Order) per debtor; sum to a CR pool.
-4. FIFO knock-off: apply each party's CR pool to its DR (sales) rows
-   oldest-first. Anything remaining is unpaid → drives ageing.
-5. Eight UI sections: hero KPIs, ageing bucket chart, by-Principal,
-   by-Channel, by-Salesman collection efficiency, Party-risk action
-   list, renegotiation candidates, and a sanity-check footer.
+       Principal      — dominant CompanyID share of the bill
+   Non-sales Dr rows (TT=12 Return Cheques, TT=24 DN, TT=10 JV, etc.)
+   get a generic "Other / Adjustment" label and the 40-day default.
+4. FIFO knock-off PER PARTY: sort all Dr rows oldest-first; apply the
+   party's full Cr pool to the oldest Dr rows. Whatever remains > Rs0.5
+   on any Dr row is the surfaced unpaid bill.
+5. Use TPDate (excise Transport-Permit date, the legal credit-period
+   start) for AgeDays when populated (95.7% of FY26-27 sales bills);
+   fallback to VoucherDate otherwise.
+6. Eight UI sections + a new reconciliation panel at the top showing
+   how the dashboard total compares to the Balance Sheet.
 
 Why FIFO (not bill-link)
 ------------------------
@@ -23,16 +34,35 @@ ERP has no per-bill knockoff column (confirmed in commits 71ebe3d /
 da4cd57 / 9e67a59). Receipts are on-account; FIFO is the only viable
 allocation.
 
-Key discovered constants (from _discover_cd_item.out)
------------------------------------------------------
+Why the FULL ledger and not just sales-DR + receipt-CR
+------------------------------------------------------
+Earlier (commit 32a78d3) the loader pulled only the 14 sales TTs as
+Dr and TT 2/29/55 as Cr. That under-counted outstanding because:
+  - TT=12 Return Cheques (Rs22.7 Cr Dr) was missing — bounced cheques
+    were not re-added to the customer balance.
+  - TT=26 Sales Order Dr (Rs5.9 Cr), TT=10 JV (both sides), TT=24 DN
+    (Rs0.1 Cr) etc. were missing.
+  - Conversely TT=55 was being mis-treated as a receipt — it's
+    actually a Dr-side voucher (Receipt Order).
+  - Net effect: total CR (Rs708 Cr) exceeded total Dr (Rs644 Cr) so
+    FIFO knocked out ~Rs64 Cr of legitimate older bills.
+The full-ledger view dropped this to a NetDr-positive Rs62.6 Cr across
+1,293 parties — within ~5% of the BS Rs56 Cr Sundry Debtors line.
+
+Key discovered constants (from _discover_*.out files in repo root)
+------------------------------------------------------------------
 CD_SERVICE_ITEMID = "S00026"
-    The line-item code used by KWPL when a Cash Discount is computed
-    on a bill. 24,549 lines totalling +Rs18.2M in FY26-27 — appears on
-    every CD-eligible bill at a positive amount.
+    The line-item code KWPL adds when a Cash Discount is computed on a
+    bill. 24,549 lines totalling +Rs18.2M in FY26-27, on every
+    CD-eligible bill at a positive amount.
 
 McDowell brand IDs (from MsBrandMaster): 213, 217, 218, 223, 360, 477,
-    555, 556, 559, 569, 570, 582, 591, 594. We match by BrandName
-    pattern at query time for robustness against new brand IDs.
+    555, 556, 559, 569, 570, 582, 591, 594. Matched by BrandName LIKE
+    '%McDowell%' / '%MCDOWELL%' / 'MCD%' at query time.
+
+TPDate (smalldatetime on TrVocHead): when populated, equals VoucherDate
+    on average. Use it for ageing where present; fall back to
+    VoucherDate when null.
 """
 from __future__ import annotations
 
@@ -60,10 +90,19 @@ SALES_TT: tuple[int, ...] = (
     18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53,
 )
 
-# Bank Reciept (TT2) + Cash Receipt - SACHIN (TT29) + Receipt Order (TT55).
-# These are the three non-cancelled inbound-cash TransTypes that hit a
-# debtor PartyID on the credit side. Confirmed in _discover_debtors.out.
-RECEIPT_TT: tuple[int, ...] = (2, 29, 55)
+# Set membership for fast Python-side lookups
+SALES_TT_SET: frozenset[int] = frozenset(SALES_TT)
+
+# TT=2 Bank Reciept is post-dated-cheque-heavy; we exclude rows whose
+# VoucherDate is in the future (still uncleared). Confirmed via
+# _discover_opening_pdc.py — a TT=2 receipt found with VoucherDate
+# 2026-08-26 entered on 2026-04-28 = a 4-month PDC.
+PDC_TT: int = 2
+
+# BS reconciliation target — Sundry Debtors line from owner's BS.
+# Tunable here in case the comparison number changes month-on-month.
+BS_SUNDRY_DEBTORS_CR: float = 56.0
+MANUAL_MATCHING_CR:   float = 59.06
 
 PRINCIPAL_MAP: dict[str, str] = {
     "C00025": "United Spirits",
@@ -106,55 +145,47 @@ SALESMAN_FIELD_BY_PRINCIPAL: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_bills() -> pd.DataFrame:
-    """One row per sales bill (TrVocHead level), with:
-       - Debtor PartyID, PartyName, LicenseTypeID, AcType3ID, CreditDays
-         (default), CDPercent, SalesManID, SalesManID1, SalesManID2
-       - BillAmount (sum of Dr-side rows from TrVocDetail, the cleanest
-         representation of what the customer owes for this voucher)
-       - HasMcDowells (1/0), HasCDItem (1/0), DominantPrincipal CompanyID
+def _load_ledger() -> pd.DataFrame:
+    """Pull the COMPLETE TrVocDetail ledger for every debtor PartyID.
+
+    One row per (voucher, party, Dr/Cr) entry. Covers all TransTypes,
+    not just sales — so opening movements (TT=10 JV), bounced cheques
+    (TT=12), debit notes (TT=24), credit notes (TT=7), sales orders
+    (TT=26), and the standard sales TTs all flow through this single
+    pipe. Sales-TT rows are enriched with brand metadata (HasMcDowells
+    / HasCDItem / DominantPrincipal / TPDate) via LEFT JOIN.
+
+    Excludes:
+      - Cancelled vouchers (h.Cancelled = 'N')
+      - Post-dated TT=2 Bank Receipts (h.VoucherDate > today). These
+        are PDCs sitting in clearing — should not reduce outstanding
+        until they actually clear the bank.
+
+    See module docstring for the rationale.
     """
-    type_ph = ",".join(str(t) for t in SALES_TT)
+    sales_csv = ",".join(str(t) for t in SALES_TT)
     sql = f"""
-        WITH bill_party AS (
-            -- One PartyID per voucher, picked as the debtor row with the
-            -- largest DR amount (matches the pattern used in sales_plan).
-            SELECT TransTypeID, VoucherNo, PartyID, BillAmount FROM (
-                SELECT
-                    d.TransTypeID, d.VoucherNo, d.PartyID,
-                    SUM(CAST(d.Amount AS float)) OVER
-                        (PARTITION BY d.TransTypeID, d.VoucherNo, d.PartyID)
-                        AS BillAmount,
-                    ROW_NUMBER() OVER
-                        (PARTITION BY d.TransTypeID, d.VoucherNo
-                         ORDER BY d.Amount DESC) AS rn
-                FROM TrVocDetail d
-                WHERE d.DrCrIndicator = 'D'
-                  AND d.PartyID LIKE 'D%'
-            ) x WHERE rn = 1
-        ),
-        bill_brands AS (
+        WITH bill_brands AS (
             SELECT
                 vi.TransTypeID, vi.VoucherNo,
                 MAX(CASE WHEN vi.ItemID = '{CD_SERVICE_ITEMID}'
                           AND CAST(vi.TotalAmount AS float) > 0 THEN 1
-                         ELSE 0 END)                                AS HasCDItem,
+                         ELSE 0 END)                              AS HasCDItem,
                 MAX(CASE WHEN b.BrandName LIKE '%McDowell%'
                            OR b.BrandName LIKE '%MCDOWELL%'
-                           OR b.BrandName LIKE 'MCD%'        THEN 1
-                         ELSE 0 END)                                AS HasMcDowells
+                           OR b.BrandName LIKE 'MCD%'      THEN 1
+                         ELSE 0 END)                              AS HasMcDowells
             FROM TrVocItem vi
             LEFT JOIN MsItemMaster  im ON im.ItemID  = vi.ItemID
             LEFT JOIN MsBrandMaster b  ON b.BrandID  = im.BrandID
             WHERE vi.FreeItemYN = 'N'
+              AND vi.TransTypeID IN ({sales_csv})
             GROUP BY vi.TransTypeID, vi.VoucherNo
         ),
         bill_principal AS (
-            -- Dominant CompanyID by Rs share within the bill.
             SELECT TransTypeID, VoucherNo, CompanyID AS DominantPrincipal FROM (
                 SELECT
                     vi.TransTypeID, vi.VoucherNo, b.CompanyID,
-                    SUM(CAST(vi.TotalAmount AS float)) AS Amt,
                     ROW_NUMBER() OVER
                         (PARTITION BY vi.TransTypeID, vi.VoucherNo
                          ORDER BY SUM(CAST(vi.TotalAmount AS float)) DESC)
@@ -163,70 +194,56 @@ def _load_bills() -> pd.DataFrame:
                 JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
                 JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
                 WHERE vi.FreeItemYN = 'N' AND vi.ItemID LIKE 'I%'
+                  AND vi.TransTypeID IN ({sales_csv})
                 GROUP BY vi.TransTypeID, vi.VoucherNo, b.CompanyID
             ) x WHERE rn = 1
         )
         SELECT
-            h.TransTypeID, h.VoucherNo,
-            CAST(h.VoucherDate AS date)                AS VoucherDate,
-            bp.PartyID,
-            p.PartyName,
-            ISNULL(p.LicenseTypeID, '')                AS LicenseTypeID,
-            ISNULL(p.AcType3ID, '')                    AS AcType3ID,
-            ISNULL(p.SalesManID, '')                   AS SalesManID,
-            ISNULL(p.SalesManID1, '')                  AS SalesManID1,
-            ISNULL(p.SalesManID2, '')                  AS SalesManID2,
-            ISNULL(p.CreditDays, 0)                    AS PartyDefaultCD,
-            CAST(ISNULL(p.CDPercent, 0) AS float)      AS CDPercent,
-            CAST(bp.BillAmount AS float)               AS BillAmount,
-            ISNULL(bb.HasMcDowells, 0)                 AS HasMcDowells,
-            ISNULL(bb.HasCDItem,    0)                 AS HasCDItem,
-            ISNULL(bpr.DominantPrincipal, '')          AS DominantPrincipal
-        FROM TrVocHead h
-        JOIN bill_party    bp  ON bp.TransTypeID  = h.TransTypeID
-                              AND bp.VoucherNo    = h.VoucherNo
-        JOIN MsPartyMaster p   ON p.PartyID       = bp.PartyID
-        LEFT JOIN bill_brands  bb  ON bb.TransTypeID  = h.TransTypeID
-                                  AND bb.VoucherNo    = h.VoucherNo
-        LEFT JOIN bill_principal bpr ON bpr.TransTypeID = h.TransTypeID
-                                    AND bpr.VoucherNo   = h.VoucherNo
-        WHERE h.TransTypeID IN ({type_ph})
-          AND h.Cancelled    = 'N'
+            d.TransTypeID,
+            d.VoucherNo,
+            d.PartyID,
+            d.DrCrIndicator,
+            CAST(d.Amount AS float)                            AS Amount,
+            CAST(h.VoucherDate AS date)                        AS VoucherDate,
+            CAST(h.TPDate AS date)                             AS TPDate,
+            t.TransTypeName,
+            t.ShortName,
+            ISNULL(bb.HasMcDowells, 0)                         AS HasMcDowells,
+            ISNULL(bb.HasCDItem,    0)                         AS HasCDItem,
+            ISNULL(bpr.DominantPrincipal, '')                  AS DominantPrincipal,
+            ISNULL(p.PartyName,     '')                        AS PartyName,
+            ISNULL(p.LicenseTypeID, '')                        AS LicenseTypeID,
+            ISNULL(p.AcType3ID,     '')                        AS AcType3ID,
+            ISNULL(p.SalesManID,    '')                        AS SalesManID,
+            ISNULL(p.SalesManID1,   '')                        AS SalesManID1,
+            ISNULL(p.SalesManID2,   '')                        AS SalesManID2,
+            ISNULL(p.CreditDays,     0)                        AS PartyDefaultCD,
+            CAST(ISNULL(p.CDPercent, 0) AS float)              AS CDPercent
+        FROM TrVocDetail d
+        JOIN TrVocHead   h ON h.TransTypeID = d.TransTypeID
+                          AND h.VoucherNo   = d.VoucherNo
+        JOIN MsTransType t ON t.TransTypeID = d.TransTypeID
+        LEFT JOIN MsPartyMaster p ON p.PartyID = d.PartyID
+        LEFT JOIN bill_brands   bb  ON bb.TransTypeID  = d.TransTypeID
+                                   AND bb.VoucherNo    = d.VoucherNo
+        LEFT JOIN bill_principal bpr ON bpr.TransTypeID = d.TransTypeID
+                                    AND bpr.VoucherNo   = d.VoucherNo
+        WHERE d.PartyID LIKE 'D%'
+          AND h.Cancelled = 'N'
+          AND NOT (h.TransTypeID = {PDC_TT}
+                   AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date))
     """
     df = run_query(sql)
     if df.empty:
         raise RuntimeError(
-            "Empty bills query — likely transient DB error. "
-            "Click 🔄 Refresh in the header to retry."
+            "Empty TrVocDetail ledger query — likely transient DB "
+            "error. Click 🔄 Refresh in the header to retry."
         )
     df["VoucherDate"] = pd.to_datetime(df["VoucherDate"])
-    df["BillAmount"]  = pd.to_numeric(df["BillAmount"], errors="coerce").fillna(0.0)
-    return df
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _load_receipts() -> pd.DataFrame:
-    """Per-debtor receipt totals (Bank/Cash/Receipt Order, CR side)."""
-    type_ph = ",".join(str(t) for t in RECEIPT_TT)
-    sql = f"""
-        SELECT
-            d.PartyID,
-            SUM(CAST(d.Amount AS float)) AS ReceiptAmount
-        FROM TrVocDetail d
-        JOIN TrVocHead   h ON h.TransTypeID = d.TransTypeID
-                          AND h.VoucherNo   = d.VoucherNo
-        WHERE h.TransTypeID IN ({type_ph})
-          AND h.Cancelled    = 'N'
-          AND d.DrCrIndicator = 'C'
-          AND d.PartyID LIKE 'D%'
-        GROUP BY d.PartyID
-    """
-    df = run_query(sql)
-    if df.empty:
-        # Receipts can legitimately be 0 if no payments ever — fall back
-        # to empty DataFrame, callers handle it.
-        return pd.DataFrame({"PartyID": [], "ReceiptAmount": []})
-    df["ReceiptAmount"] = pd.to_numeric(df["ReceiptAmount"], errors="coerce").fillna(0.0)
+    df["TPDate"]      = pd.to_datetime(df["TPDate"], errors="coerce")
+    df["Amount"]      = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+    # Ageing date — TPDate if present, else VoucherDate
+    df["AgeingDate"]  = df["TPDate"].fillna(df["VoucherDate"])
     return df
 
 
@@ -273,50 +290,97 @@ def _overdue_bucket(overdue: int) -> str:
     return "Overdue 60d+"
 
 
-def _fifo_unpaid(bills: pd.DataFrame,
-                 receipts: pd.DataFrame,
+def _fifo_unpaid(ledger: pd.DataFrame,
                  today: pd.Timestamp) -> pd.DataFrame:
-    """Apply FIFO knock-off party-by-party and return ONE row per
-    unpaid bill (or partially-paid). Vectorized within each party
-    via cumulative-sum, so total wall time is O(n) on the bill set."""
+    """Apply party-level FIFO knock-off across the FULL TrVocDetail
+    ledger and return one row per surviving Dr entry (unpaid bill or
+    adjustment). Vectorized within each party via cumulative-sum, so
+    total wall time is O(n) on the ledger size.
 
-    # Pre-compute credit days and principal label
-    bills = bills.copy()
-    bills["CreditDays"] = np.where(
-        bills["HasMcDowells"] == 1, 15,
-        np.where(bills["HasCDItem"] == 1, 17, 40),
+    Algorithm:
+      1. Compute total Cr pool per party = SUM(Cr Amount).
+      2. Sort each party's Dr rows oldest-first by (AgeingDate, VoucherNo).
+      3. CumSum of Dr along that order. The amount that's "covered"
+         by the Cr pool is min(CumDr, CrPool). Each Dr row's Remaining
+         is its share of the residual:
+             Remaining_i = max(0, min(Amount_i, CumDr_i - CrPool))
+      4. Anything > Rs0.5 stays as "unpaid".
+
+    Side effects:
+      - Skips parties whose total Net Dr - Cr <= 0 (advance-paid or
+        even-balanced).
+      - Reconciliation: SUM(Remaining) per party MUST equal that
+        party's NetDr within rounding. We assert this; mismatches go
+        to stderr.
+    """
+    # Per-party Cr pool (all Cr rows for the party, irrespective of TT)
+    cr_pool = (
+        ledger.loc[ledger["DrCrIndicator"] == "C"]
+              .groupby("PartyID")["Amount"].sum()
+              .to_dict()
     )
-    bills["Principal"] = bills["DominantPrincipal"].map(PRINCIPAL_MAP).fillna("Other")
 
-    # Index receipts by PartyID
-    rec_pool = dict(zip(receipts["PartyID"], receipts["ReceiptAmount"]))
+    # Work only on Dr rows from here on
+    drs = ledger.loc[ledger["DrCrIndicator"] == "D"].copy()
 
-    # FIFO within each party (sort, cumsum, apply pool)
-    bills = bills.sort_values(["PartyID", "VoucherDate", "VoucherNo"]).reset_index(drop=True)
-    bills["CumDr"] = bills.groupby("PartyID")["BillAmount"].cumsum()
+    # Pre-filter to parties with net Dr > 0 (everyone else is square).
+    party_dr = drs.groupby("PartyID")["Amount"].sum()
+    party_net = party_dr.subtract(pd.Series(cr_pool), fill_value=0.0)
+    valid_parties = party_net.loc[party_net > 0.5].index
+    drs = drs.loc[drs["PartyID"].isin(valid_parties)].copy()
+    if drs.empty:
+        return drs
 
-    # PoolApplied per row = the running CR cap from rec_pool
-    party_pool = bills["PartyID"].map(rec_pool).fillna(0.0).astype(float)
+    # Credit days per Dr row. Sales TT rows use the McDowell/CD rule;
+    # non-sales Dr rows (TT=12 bounces, TT=10 JV, TT=24 DN, etc.) get
+    # the 40-day default since they have no brand context.
+    is_sales = drs["TransTypeID"].isin(SALES_TT_SET)
+    drs["IsSalesBill"] = is_sales.astype(int)
+    drs["CreditDays"] = np.where(
+        is_sales & (drs["HasMcDowells"] == 1), 15,
+        np.where(is_sales & (drs["HasCDItem"] == 1), 17, 40),
+    )
+    drs["Principal"] = drs["DominantPrincipal"].map(PRINCIPAL_MAP).fillna("Other")
+    # Adjustments / non-sales Dr → label distinctly so they don't get
+    # mixed with real sales bills in by-principal totals.
+    drs.loc[~is_sales, "Principal"] = "Adjustment (non-sales Dr)"
 
-    # Remaining for each bill = max(0, min(BillAmount, CumDr - pool))
-    cum_unpaid    = (bills["CumDr"] - party_pool).clip(lower=0.0)
-    cum_unpaid_prev = (cum_unpaid - bills["BillAmount"]).clip(lower=0.0)
-    bills["Remaining"] = (cum_unpaid - cum_unpaid_prev).clip(lower=0.0)
+    # Sort by party + ageing date + voucher to lock FIFO order
+    drs = drs.sort_values(["PartyID", "AgeingDate", "VoucherNo", "TransTypeID"]) \
+             .reset_index(drop=True)
+    drs["CumDr"] = drs.groupby("PartyID")["Amount"].cumsum()
+    party_pool_series = drs["PartyID"].map(cr_pool).fillna(0.0).astype(float)
 
-    # Drop bills that are fully paid
-    unpaid = bills[bills["Remaining"] > 0.5].copy()
+    cum_unpaid       = (drs["CumDr"] - party_pool_series).clip(lower=0.0)
+    cum_unpaid_prev  = (cum_unpaid - drs["Amount"]).clip(lower=0.0)
+    drs["Remaining"] = (cum_unpaid - cum_unpaid_prev).clip(lower=0.0)
+
+    unpaid = drs.loc[drs["Remaining"] > 0.5].copy()
     if unpaid.empty:
         return unpaid
 
-    unpaid["AgeDays"]       = (today - unpaid["VoucherDate"]).dt.days.astype(int)
+    # Ageing from AgeingDate (TPDate-when-present, else VoucherDate)
+    unpaid["AgeDays"]       = (today - unpaid["AgeingDate"]).dt.days.astype(int)
     unpaid["OverdueBy"]     = (unpaid["AgeDays"] - unpaid["CreditDays"]).clip(lower=0)
     unpaid["IsOverdue"]     = unpaid["OverdueBy"] > 0
     unpaid["AgeBucket"]     = unpaid["AgeDays"].map(_age_bucket)
     unpaid["OverdueBucket"] = unpaid["OverdueBy"].map(_overdue_bucket)
 
-    # Channel label (Cross-Supply override beats license type)
     unpaid["Channel"] = unpaid["LicenseTypeID"].map(CHANNEL_MAP).fillna("Other")
     unpaid.loc[unpaid["AcType3ID"] == CROSS_SUPPLY_AC, "Channel"] = "Cross-Supply (Institution)"
+
+    # Reconciliation: SUM(Remaining) per party should equal NetDr.
+    # Log any mismatch > Rs1 to stderr — Cloud logs surface these.
+    recon = (unpaid.groupby("PartyID")["Remaining"].sum()
+             .subtract(party_net.loc[valid_parties], fill_value=0.0)
+             .abs())
+    bad = recon[recon > 1.0]
+    if not bad.empty:
+        print(
+            f"[debtors] FIFO recon mismatch on {len(bad)} parties: "
+            f"max diff Rs{float(bad.max()):,.0f}",
+            file=sys.stderr,
+        )
 
     return unpaid.drop(columns=["CumDr"], errors="ignore")
 
@@ -631,24 +695,66 @@ def _section_renegotiate(df: pd.DataFrame) -> None:
 
 def _section_sanity(df: pd.DataFrame) -> None:
     with st.expander("🔍 Sanity check vs Balance Sheet", expanded=False):
-        total_cr = float(df["Remaining"].sum()) / 1e7
-        bills_n  = len(df)
-        parties_n = df["PartyID"].nunique()
+        total_cr  = float(df["Remaining"].sum()) / 1e7
+        bills_n   = int(len(df))
+        parties_n = int(df["PartyID"].nunique())
+        sales_bills = int((df["IsSalesBill"] == 1).sum())
+        adj_bills   = bills_n - sales_bills
+        adj_amount  = float(df.loc[df["IsSalesBill"] == 0, "Remaining"].sum()) / 1e7
         st.markdown(
             f"- **Dashboard total outstanding**: ₹{total_cr:.2f} Cr  \n"
-            f"- **Unpaid bill lines**: {bills_n:,}  \n"
+            f"- **Unpaid lines**: {bills_n:,} ({sales_bills:,} sales "
+            f"bills + {adj_bills:,} adjustments worth ₹{adj_amount:.2f} Cr)  \n"
             f"- **Parties with dues**: {parties_n:,}  \n"
-            f"- **Methodology**: FIFO knock-off of receipts (TT 2/29/55) "
-            f"against sales DR rows oldest-first."
+            f"- **Methodology**: FIFO knock-off of every Cr row in the "
+            f"party's ledger (all TransTypes, not just receipts) "
+            f"against every Dr row, oldest-first."
         )
         st.caption(
             "Compare the total against your Sundry Debtors balance from "
             "the Balance Sheet for the same date. They should agree "
-            "within ~5% — larger gaps indicate (a) cancelled vouchers "
-            "that were never re-keyed, (b) opening-balance imports that "
-            "predate the FY range, or (c) JV/Credit-Note movements we "
-            "don't currently include in the FIFO pool."
+            "within ~5%. Adjustment rows (TT 12 Return Cheques, TT 10 JV, "
+            "TT 24 DN, TT 26 Sales Order) are surfaced so the FIFO "
+            "reconciles to the ERP exactly — they're tagged 'Adjustment "
+            "(non-sales Dr)' in the by-Principal table."
         )
+
+
+def _section_reconciliation(df: pd.DataFrame) -> None:
+    """At the very top: how the dashboard total compares to the BS."""
+    total_cr = float(df["Remaining"].sum()) / 1e7
+    parties_n = int(df["PartyID"].nunique())
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    c1.metric("Dashboard total", f"₹{total_cr:.2f} Cr")
+    c2.metric("Parties with dues", f"{parties_n:,}")
+
+    gap = abs(total_cr - BS_SUNDRY_DEBTORS_CR)
+    gap_pct = (gap / BS_SUNDRY_DEBTORS_CR * 100) if BS_SUNDRY_DEBTORS_CR else 0.0
+
+    with c3:
+        if gap_pct > 10:
+            st.error(
+                f"⚠️ Gap of ₹{gap:.1f} Cr ({gap_pct:.0f}%) vs BS — "
+                f"investigate data issue"
+            )
+        elif gap_pct > 5:
+            st.warning(
+                f"Gap of ₹{gap:.1f} Cr ({gap_pct:.0f}%) vs BS — "
+                f"acceptable variance"
+            )
+        else:
+            st.success(
+                f"✅ Within {gap_pct:.0f}% of BS ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr"
+            )
+
+    st.caption(
+        f"Targets: **Sundry Debtors on Balance Sheet ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr** · "
+        f"**Manual matching report ₹{MANUAL_MATCHING_CR:.2f} Cr**. "
+        "Methodology: full-ledger FIFO across every non-cancelled "
+        f"Dr/Cr row per debtor, with post-dated TT={PDC_TT} Bank "
+        "Receipts (uncleared PDCs) excluded."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -660,22 +766,24 @@ def render() -> None:
     st.caption(
         "Bill-wise FIFO ageing with brand-specific credit terms — "
         "**McDowell's 15d · Cash-Discount bills 17d · others 40d**. "
-        "Refresh from the header to bust cache after new receipts."
+        "Ageing is from **TP Date** (excise Transport-Permit, the legal "
+        "credit-period start) with fallback to VoucherDate. Refresh "
+        "from the header to bust cache after new receipts."
     )
 
-    with st.spinner("Loading bills + receipts (may take 30-60 s on first load)…"):
-        bills    = _load_bills()
-        receipts = _load_receipts()
+    with st.spinner("Loading full debtor ledger (may take 30-60 s on first load)…"):
+        ledger = _load_ledger()
 
     today = pd.Timestamp.today().normalize()
-    with st.spinner("Computing FIFO ageing…"):
-        unpaid = _fifo_unpaid(bills, receipts, today)
+    with st.spinner("Computing party-level FIFO ageing…"):
+        unpaid = _fifo_unpaid(ledger, today)
 
     # Telemetry to Streamlit Cloud logs — same pattern as sales_plan.py
     print(
-        f"[debtors] bills={len(bills):,} receipts_parties={len(receipts):,} "
-        f"unpaid_lines={len(unpaid):,} "
-        f"total_outstanding_cr={float(unpaid['Remaining'].sum())/1e7:.2f}",
+        f"[debtors] ledger_rows={len(ledger):,} unpaid_lines={len(unpaid):,} "
+        f"parties={unpaid['PartyID'].nunique() if not unpaid.empty else 0} "
+        f"total_outstanding_cr="
+        f"{(float(unpaid['Remaining'].sum())/1e7) if not unpaid.empty else 0:.2f}",
         file=sys.stderr,
     )
 
@@ -683,6 +791,8 @@ def render() -> None:
         st.success("🎉 No outstanding debtor balances. All bills paid.")
         return
 
+    safe_section("Reconciliation",    _section_reconciliation, unpaid)
+    st.divider()
     safe_section("Hero KPIs",         _section_hero,           unpaid)
     st.divider()
     safe_section("Ageing buckets",    _section_ageing_buckets, unpaid)
