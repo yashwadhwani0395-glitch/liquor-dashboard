@@ -704,6 +704,144 @@ def _section_party_risk(df: pd.DataFrame) -> None:
     )
 
 
+def _section_unmatched_followup() -> None:
+    """Daily worklist: parties whose receipts > bills in the last
+    `window_days`, with a ratio + absolute-Rs floor to filter out
+    normal AR pay-downs. Mirrors the manual matching report's
+    "Uncleared / Unmatched Cheques" column (Rs6.84 Cr target).
+
+    Tunable knobs are exposed in the UI so the operator can dial
+    looser/tighter without a code change.
+    """
+    st.subheader("💰 Unmatched Receipts — Sales-Team Follow-up")
+    st.caption(
+        "Parties who have paid in the last 6 months but the receipts "
+        "couldn't be cleanly matched to specific bills (lump sums, "
+        "over-payments, mis-allocated cheques). **Sales team calls "
+        "these parties** to confirm which bill the payment is meant "
+        "for. Different from the PDC Pipeline section above, which "
+        "is purely the post-dated-cheque schedule."
+    )
+
+    # ── Filter knobs ────────────────────────────────────────────────
+    f1, f2, f3 = st.columns([1, 1, 1])
+    with f1:
+        window_days = st.selectbox(
+            "Window (days)", [90, 180, 270, 365],
+            index=1, key="dbt_unm_window",
+        )
+    with f2:
+        ratio_floor = st.slider(
+            "Min ratio (Receipts ÷ Bills)",
+            min_value=1.00, max_value=2.00, value=1.20, step=0.05,
+            key="dbt_unm_ratio",
+            help="Tighten to drop parties whose receipts only "
+                 "slightly exceed their bills (normal AR pay-down).",
+        )
+    with f3:
+        min_excess_l = st.number_input(
+            "Min excess (₹ Lakhs)", min_value=0.0, value=1.0, step=0.5,
+            key="dbt_unm_min",
+        )
+
+    df = _load_unmatched_receipts(window_days=int(window_days))
+    if df.empty:
+        st.success(f"🎉 No unmatched receipts in last {window_days} days.")
+        return
+
+    # Apply tuning floors
+    work = df[
+        (df["Bills"] > 0)
+        & (df["Receipts"] >= df["Bills"] * float(ratio_floor))
+        & (df["Excess"] >= float(min_excess_l) * 1e5)
+    ].copy()
+
+    if work.empty:
+        st.info("Filters too tight — relax ratio or min-excess to surface candidates.")
+        return
+
+    total_cr   = float(work["Excess"].sum()) / 1e7
+    parties_n  = int(len(work))
+    avg_l      = float(work["Excess"].mean()) / 1e5
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Unmatched", f"₹{total_cr:.2f} Cr",
+              "Target ₹6.84 Cr (manual matching)")
+    c2.metric("Parties to call", f"{parties_n:,}")
+    c3.metric("Avg per party", f"₹{avg_l:.1f} L")
+    c4.metric("Window", f"{window_days} d")
+
+    # ── Salesman attribution (primary SM only) ──────────────────────
+    sm_master = _load_salesman_master()
+    sm_dict   = dict(zip(sm_master["SalesManID"], sm_master["FullName"]))
+
+    def _primary_sm(row):
+        for col in ("SalesManID", "SalesManID1", "SalesManID2"):
+            sid = (row.get(col) or "").strip()
+            if sid:
+                return sid
+        return ""
+
+    work["SalesmanID"] = work.apply(_primary_sm, axis=1)
+    work["Salesman"]   = work["SalesmanID"].map(sm_dict).fillna("(unmapped)")
+    work.loc[work["Salesman"].str.strip() == "", "Salesman"] = "(unmapped)"
+
+    work["Bills_L"]    = work["Bills"]    / 1e5
+    work["Receipts_L"] = work["Receipts"] / 1e5
+    work["Excess_L"]   = work["Excess"]   / 1e5
+    work["Ratio"]      = (work["Receipts"] / work["Bills"]).round(2)
+
+    # ── Follow-up worklist table ───────────────────────────────────
+    st.markdown("**Follow-up worklist** (sorted by excess desc)")
+    disp = work[[
+        "PartyID", "PartyName", "Salesman",
+        "Bills_L", "Receipts_L", "Excess_L", "Ratio",
+    ]].rename(columns={
+        "Bills_L":    f"Bills L{window_days}d (Rs L)",
+        "Receipts_L": f"Receipts L{window_days}d (Rs L)",
+        "Excess_L":   "Excess Receipt (Rs L)",
+    })
+    styled = (
+        disp.style.format({
+            f"Bills L{window_days}d (Rs L)":     "₹{:,.1f} L",
+            f"Receipts L{window_days}d (Rs L)":  "₹{:,.1f} L",
+            "Excess Receipt (Rs L)":             "₹{:,.2f} L",
+            "Ratio":                             "{:.2f}x",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=460)
+
+    # ── Salesman workload table ─────────────────────────────────────
+    st.markdown("**Workload by salesman** — who has how many parties to call")
+    by_sm = (
+        work.groupby("Salesman", observed=True)
+            .agg(PartiesToCall=("PartyID", "nunique"),
+                 TotalExcess=("Excess", "sum"))
+            .reset_index()
+            .sort_values("TotalExcess", ascending=False)
+    )
+    by_sm["Total_L"] = by_sm["TotalExcess"] / 1e5
+    styled_sm = (
+        by_sm[["Salesman", "PartiesToCall", "Total_L"]].style.format({
+            "PartiesToCall": "{:,}",
+            "Total_L":       "₹{:,.1f} L",
+        })
+    )
+    st.dataframe(styled_sm, use_container_width=True, hide_index=True)
+
+    # ── CSV export of the worklist ──────────────────────────────────
+    export = work[[
+        "PartyID", "PartyName", "SalesmanID", "Salesman",
+        "Bills", "Receipts", "Excess", "Ratio",
+    ]]
+    csv = export.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download follow-up list (CSV)", csv,
+        f"unmatched_followup_{date.today()}.csv", "text/csv",
+        key="dbt_unmatched_dl",
+    )
+
+
 def _section_renegotiate(df: pd.DataFrame) -> None:
     st.subheader("🔄 Renegotiation candidates")
     st.caption(
@@ -874,6 +1012,77 @@ def _section_spot_check(df: pd.DataFrame) -> None:
         "manual matching report — gaps > ₹100 indicate a data-flow issue "
         "(missing TransType, mis-attributed receipt, or PDC mis-handling)."
     )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_unmatched_receipts(window_days: int = 180) -> pd.DataFrame:
+    """Parties whose receipts in the last `window_days` exceed their
+    bills in the same window — the operational follow-up worklist
+    that mirrors the manual matching report's "Uncleared/Unmatched
+    Cheques" column.
+
+    Returns raw per-party Bills/Receipts/Excess + party metadata
+    needed for salesman attribution. The UI then applies a ratio
+    floor (default 1.20) + min-excess floor (default Rs1L) to land
+    near the Rs6.84 Cr target.
+
+    The proxy used here is broader than "cheque didn't clear"
+    (which is the PDC pipeline section). It catches:
+      - Cheques entered but not allocated to bills yet
+      - Lump-sum payments covering multiple bills (where the
+        accountant hasn't broken them down)
+      - Over-payments / round-offs
+
+    All cases the sales team needs to phone the outlet about.
+    """
+    sql = f"""
+        WITH window_activity AS (
+            SELECT
+                d.PartyID,
+                SUM(CASE WHEN d.DrCrIndicator='D'
+                         THEN CAST(d.Amount AS float) ELSE 0 END) AS Bills,
+                SUM(CASE WHEN d.DrCrIndicator='C'
+                          AND CAST(h.VoucherDate AS date)
+                              <= CAST(GETDATE() AS date)
+                         THEN CAST(d.Amount AS float) ELSE 0 END) AS Receipts
+            FROM TrVocDetail d
+            JOIN TrVocHead   h
+                ON h.TransTypeID = d.TransTypeID
+               AND h.VoucherNo   = d.VoucherNo
+            WHERE d.PartyID LIKE 'D%'
+              AND h.Cancelled = 'N'
+              AND h.VoucherDate >= DATEADD(DAY, -{int(window_days)},
+                                           CAST(GETDATE() AS date))
+              AND h.VoucherDate <= CAST(GETDATE() AS date)
+            GROUP BY d.PartyID
+        )
+        SELECT
+            wa.PartyID,
+            ISNULL(p.PartyName, '(unknown)')               AS PartyName,
+            ISNULL(p.LicenseTypeID, '')                    AS LicenseTypeID,
+            ISNULL(p.AcType3ID, '')                        AS AcType3ID,
+            ISNULL(p.SalesManID,  '')                      AS SalesManID,
+            ISNULL(p.SalesManID1, '')                      AS SalesManID1,
+            ISNULL(p.SalesManID2, '')                      AS SalesManID2,
+            wa.Bills,
+            wa.Receipts,
+            (wa.Receipts - wa.Bills)                       AS Excess
+        FROM window_activity wa
+        JOIN MsPartyMaster p ON p.PartyID = wa.PartyID
+        WHERE wa.Bills > 0
+          AND wa.Receipts > wa.Bills
+        ORDER BY (wa.Receipts - wa.Bills) DESC
+    """
+    df = run_query(sql)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "PartyID","PartyName","LicenseTypeID","AcType3ID",
+            "SalesManID","SalesManID1","SalesManID2",
+            "Bills","Receipts","Excess",
+        ])
+    for c in ("Bills", "Receipts", "Excess"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    return df
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1212,6 +1421,8 @@ def render() -> None:
     safe_section("By salesman",       _section_by_salesman,    unpaid)
     st.divider()
     safe_section("Party risk",        _section_party_risk,     unpaid)
+    st.divider()
+    safe_section("Unmatched follow-up", _section_unmatched_followup)
     st.divider()
     safe_section("Renegotiation",     _section_renegotiate,    unpaid)
     st.divider()
