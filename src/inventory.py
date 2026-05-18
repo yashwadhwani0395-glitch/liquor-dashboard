@@ -502,36 +502,42 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
     )
     slow = slow.sort_values("DaysCover", ascending=False).head(30)
 
+    # Keep original column names so styler + format always agree.
+    # Display labels are handled via Streamlit column_config below.
     disp = slow[["BrandName", "ItemDescription", "ClosingCases",
-                 "Sales30", "DaysCover", "Value"]].rename(columns={
-        "BrandName":       "Brand",
-        "ItemDescription": "Item",
-        "ClosingCases":    "Closing Cases",
-        "Sales30":         "Last 30d Cases",
-        "DaysCover":       "Days of Cover",
-        "Value":           "Stock Value",
-    })
+                 "Sales30", "DaysCover", "Value"]].copy()
 
-    # Row style uses the RENAMED column ("Days of Cover"), not the original.
     def _row_style(row):
-        v = row["Days of Cover"]
+        v = row["DaysCover"]
         if v > 90:    bg = "background-color:#fee2e2"
         elif v > 30:  bg = "background-color:#fef3c7"
         else:         bg = ""
         return [bg] * len(row)
 
     fmt = {
-        "Closing Cases":   "{:,.0f}",
-        "Last 30d Cases":  "{:,.2f}",
-        "Days of Cover":   lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
-        "Stock Value":     format_inr,
+        "ClosingCases": "{:,.0f}",
+        "Sales30":      "{:,.2f}",
+        "DaysCover":    lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
+        "Value":        format_inr,
     }
     styled = (
         disp.style
         .apply(_row_style, axis=1)
         .format(_safe_format(disp, fmt))
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "BrandName":       st.column_config.Column("Brand"),
+            "ItemDescription": st.column_config.Column("Item"),
+            "ClosingCases":    st.column_config.Column("Closing Cases"),
+            "Sales30":         st.column_config.Column("Last 30d Cases"),
+            "DaysCover":       st.column_config.Column("Days of Cover"),
+            "Value":           st.column_config.Column("Stock Value"),
+        },
+    )
 
 
 def _section_out_of_stock(stock_df: pd.DataFrame, vel_30: pd.DataFrame,
@@ -587,35 +593,40 @@ def _section_days_of_cover(stock_df: pd.DataFrame, vel_df: pd.DataFrame) -> None
     )
     top_sellers = sellers.sort_values("Sales30", ascending=False).head(30)
 
-    def _doc_style(row):
-        try:
-            v = float(str(row["Days of Cover"]).replace("+", "").replace(",", ""))
-        except ValueError:
-            return [""] * len(row)
-        if v >= 30:  bg = "background-color:#dcfce7"
-        elif v >= 15: bg = "background-color:#fef3c7"
-        else:         bg = "background-color:#fee2e2"
-        return [bg if c == "Days of Cover" else "" for c in row.index]
-
+    # Style on original column names; show display labels via column_config.
     disp = top_sellers[["BrandName", "ItemDescription", "ClosingCases",
-                        "DailyAvg", "DaysCover"]].rename(columns={
-        "BrandName":       "Brand",
-        "ItemDescription": "Item",
-        "ClosingCases":    "Stock (Cases)",
-        "DailyAvg":        "Daily Avg Sales",
-        "DaysCover":       "Days of Cover",
-    })
+                        "DailyAvg", "DaysCover"]].copy()
+
+    def _doc_style(row):
+        v = row["DaysCover"]
+        if v >= 9999:        bg = ""
+        elif v >= 30:        bg = "background-color:#dcfce7"
+        elif v >= 15:        bg = "background-color:#fef3c7"
+        else:                bg = "background-color:#fee2e2"
+        return [bg if c == "DaysCover" else "" for c in row.index]
+
     fmt = {
-        "Stock (Cases)":    "{:,.0f}",
-        "Daily Avg Sales":  "{:.2f}",
-        "Days of Cover":    lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
+        "ClosingCases": "{:,.0f}",
+        "DailyAvg":     "{:.2f}",
+        "DaysCover":    lambda x: "9999+" if x >= 9999 else f"{x:,.0f}",
     }
     styled = (
         disp.style
         .apply(_doc_style, axis=1)
         .format(_safe_format(disp, fmt))
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "BrandName":       st.column_config.Column("Brand"),
+            "ItemDescription": st.column_config.Column("Item"),
+            "ClosingCases":    st.column_config.Column("Stock (Cases)"),
+            "DailyAvg":        st.column_config.Column("Daily Avg Sales"),
+            "DaysCover":       st.column_config.Column("Days of Cover"),
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
