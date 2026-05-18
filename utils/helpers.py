@@ -60,6 +60,24 @@ CASES_SQL_EXPR: str = """(CASE
 END)"""
 
 
+def safe_section(title: str, render_func, *args, **kwargs):
+    """Run a render function inside an error boundary.
+
+    If the section crashes, surface a friendly error and a collapsible
+    traceback so the rest of the page still renders.
+    """
+    try:
+        render_func(*args, **kwargs)
+    except Exception as exc:
+        st.error(
+            f"⚠️ Section **{title}** failed to load: "
+            f"`{type(exc).__name__}`: {str(exc)[:200]}"
+        )
+        with st.expander("Technical details", expanded=False):
+            import traceback
+            st.code(traceback.format_exc())
+
+
 def cases_sql_expr() -> str:
     """Return the KEG-aware case-equivalent SQL fragment (constant string).
 

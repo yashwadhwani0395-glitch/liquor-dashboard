@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES, safe_section
 from src.distribution import (
     SALESMAN_MAP,
     _load_master,
@@ -143,11 +143,17 @@ def _load_outlet_history(company_id: str,
                  FORMAT(h.VoucherDate, 'yyyy-MM')
     """
     df = run_query(sql, (company_id, str(end_date), str(end_date)))
-    if not df.empty:
-        df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
-        df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
-        df["LastBill"] = pd.to_datetime(df["LastBill"], errors="coerce")
-        df["Channel"]  = df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+    if df.empty:
+        # Return an empty DF with the same shape callers expect, so they
+        # can safely do hist["Cases"].sum() etc. without KeyError.
+        return pd.DataFrame(columns=[
+            "PartyID", "PartyName", "LicenseTypeID", "AcType3ID",
+            "BillMonth", "Cases", "Revenue", "LastBill", "Channel",
+        ])
+    df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
+    df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
+    df["LastBill"] = pd.to_datetime(df["LastBill"], errors="coerce")
+    df["Channel"]  = df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
     return df
 
 
@@ -199,11 +205,15 @@ def _load_brand_buyers(company_id: str,
     """
     params = (brand_id, brand_id, company_id, str(end_date), str(end_date))
     df = run_query(sql, params)
-    if not df.empty:
-        for c in ("BrandCases", "PrincipalCases"):
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-        df["BrandLastBill"] = pd.to_datetime(df["BrandLastBill"], errors="coerce")
-        df["Channel"]       = df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "PartyID", "PartyName", "LicenseTypeID", "BillMonth",
+            "BrandCases", "PrincipalCases", "BrandLastBill", "Channel",
+        ])
+    for c in ("BrandCases", "PrincipalCases"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["BrandLastBill"] = pd.to_datetime(df["BrandLastBill"], errors="coerce")
+    df["Channel"]       = df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
     return df
 
 
@@ -1192,7 +1202,7 @@ def render() -> None:
     st.divider()
 
     # ── Section 2: KPI row ──
-    _section_kpis(principal_uni, hist, op_month, prev_month)
+    safe_section("KPIs", _section_kpis, principal_uni, hist, op_month, prev_month)
     st.divider()
 
     # ── Allocation method (for salesman scoreboard) ──
@@ -1204,7 +1214,11 @@ def render() -> None:
         )
 
     # ── Section 3: Outlet plan ──
-    plan_df = _compute_outlet_plan(hist, op_month, principal_uni, tgt_cfg)
+    try:
+        plan_df = _compute_outlet_plan(hist, op_month, principal_uni, tgt_cfg)
+    except Exception as e:
+        st.error(f"⚠️ Outlet plan failed to compute: {type(e).__name__}: {e}")
+        plan_df = pd.DataFrame()
 
     col_rc, _ = st.columns([1, 4])
     with col_rc:
@@ -1214,20 +1228,22 @@ def render() -> None:
             _load_master.clear()
             st.rerun()
 
-    _section_outlet_plan(plan_df, cfg["subteams"], op_month)
+    safe_section("Outlet plan",
+                 _section_outlet_plan, plan_df, cfg["subteams"], op_month)
     st.divider()
 
     # ── Section 4: Focus brand (lazy — only loads when opened) ──
     with st.expander("🎯 Focus Brand of the Fortnight", expanded=False):
         brands_df = _load_brands_for_principal(cid)
-        _section_focus_brand(cid, op_month, prev_month, brands_df)
+        safe_section("Focus brand",
+                     _section_focus_brand, cid, op_month, prev_month, brands_df)
     st.divider()
 
     # ── Section 5: Salesman scoreboard (uses hist for L3M share) ──
-    _section_salesman_scoreboard(
-        principal, universes, universes_by_p, master, hist,
-        op_month, target_entry, allocation_method,
-    )
+    safe_section("Salesman scoreboard",
+                 _section_salesman_scoreboard,
+                 principal, universes, universes_by_p, master, hist,
+                 op_month, target_entry, allocation_method)
     st.divider()
 
     # ── Section 6: Target config (advanced) ──

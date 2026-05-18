@@ -960,9 +960,10 @@ def render():  # noqa: C901 (complexity — intentional for a single-page analyt
                     .sort_values("Days Since", ascending=False)  # sort by int first
                     .reset_index(drop=True)
                 )
-                # Format "Never" after sort to avoid mixed-type sort crash
+                # Format ALL values as strings (consistent type) so Arrow can
+                # serialise the column; "Never" replaces 9999.
                 cold_df["Days Since"] = cold_df["Days Since"].apply(
-                    lambda x: "Never" if x >= 9999 else x
+                    lambda x: "Never" if x >= 9999 else f"{int(x)}"
                 )
                 st.dataframe(cold_df, use_container_width=True, hide_index=True)
 

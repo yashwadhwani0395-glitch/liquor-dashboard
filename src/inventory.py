@@ -19,7 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
+from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES, safe_section
 
 
 def _safe_format(df: "pd.DataFrame", fmt: dict) -> dict:
@@ -688,16 +688,17 @@ def render() -> None:
         st.info(f"Showing historical stock as of {as_of_date.strftime('%d %b %Y')} "
                 f"(rolled back from live).")
 
-    _section_kpis(stock_df)
+    safe_section("KPIs",            _section_kpis,            stock_df)
     st.divider()
-    _section_reconciliation(opening_df, move_df, stock_df, fy_start, as_of_date)
+    safe_section("Stock reconciliation", _section_reconciliation,
+                 opening_df, move_df, stock_df, fy_start, as_of_date)
     st.divider()
-    _section_by_principal(stock_df)
+    safe_section("By principal",    _section_by_principal,    stock_df)
     st.divider()
-    _section_top_items(view_df, origin_df)
+    safe_section("Top items",       _section_top_items,       view_df, origin_df)
     st.divider()
-    _section_slow_movers(stock_df, vel_30)
+    safe_section("Slow movers",     _section_slow_movers,     stock_df, vel_30)
     st.divider()
-    _section_out_of_stock(stock_df, vel_30, vel_90)
+    safe_section("Out of stock",    _section_out_of_stock,    stock_df, vel_30, vel_90)
     st.divider()
-    _section_days_of_cover(stock_df, vel_30)
+    safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
