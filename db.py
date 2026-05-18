@@ -11,6 +11,7 @@ so callers never need to know which driver is active.
 
 import os
 import sys
+import time
 import pymssql
 import pandas as pd
 
@@ -79,30 +80,88 @@ def get_connection_status() -> bool:
 
 # ── Query runner ───────────────────────────────────────────────────────────
 
+# Transient SQL Server errors that are safe (and expected) to retry.
+# 1205 = deadlock victim. The server has already rolled the txn back; the
+#        canonical fix is to rerun. Retrying is the documented Microsoft
+#        guidance — see "Handling Deadlocks" in SQL Server docs.
+# 1222 = lock request timeout.
+_RETRYABLE_SQL_ERRORS = (1205, 1222)
+_MAX_RETRIES   = 3
+_RETRY_BACKOFF = 0.5  # seconds; doubles each retry
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True if exc is a transient SQL Server error we should retry."""
+    # pymssql wraps the SQL Server error number in args[0]
+    try:
+        code = exc.args[0] if exc.args else None
+    except Exception:
+        return False
+    if code in _RETRYABLE_SQL_ERRORS:
+        return True
+    # pymssql's OperationalError on deadlock surfaces the code inside the
+    # message bytes; check there too as a safety net.
+    msg = str(exc).lower()
+    return "deadlocked" in msg or "deadlock victim" in msg
+
+
 def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
     """Execute a parameterised SQL query and return a DataFrame.
 
     Converts pyodbc-style ? placeholders to pymssql-style %s automatically,
     so page code written for pyodbc works without changes.
-    Returns an empty DataFrame on any error (logged to stderr).
-    On connection errors the cached connection is cleared so the next
-    call will attempt to reconnect.
+
+    On transient SQL Server errors (deadlock victim 1205, lock timeout 1222)
+    the query is retried up to _MAX_RETRIES times with exponential backoff.
+
+    On persistent failure RAISES — never returns an empty DataFrame as
+    a silent stand-in for an error. This is critical because callers wrap
+    us in @st.cache_data; returning empty would poison the cache for the
+    full TTL (up to an hour) and the dashboard would silently show "0".
+    Streamlit does not cache results when the function raises, so re-raising
+    forces the next call to try the DB again.
     """
     conn = get_connection()
     if conn is None:
-        return pd.DataFrame()
+        raise RuntimeError(
+            "Database connection unavailable. Check DB credentials / network."
+        )
 
     # pymssql uses %s; callers use ? (pyodbc convention)
     if params:
         sql = sql.replace("?", "%s")
 
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, params or ())
-            cols = [col[0] for col in cursor.description]
-            rows = cursor.fetchall()
-        return pd.DataFrame.from_records(rows, columns=cols)
-    except Exception as exc:
-        print(f"[db.run_query] {exc}", file=sys.stderr)
-        get_connection.clear()   # force reconnect on next call
-        return pd.DataFrame()
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params or ())
+                cols = [col[0] for col in cursor.description]
+                rows = cursor.fetchall()
+            return pd.DataFrame.from_records(rows, columns=cols)
+        except Exception as exc:
+            last_exc = exc
+            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF * (2 ** attempt)
+                print(
+                    f"[db.run_query] transient error (attempt "
+                    f"{attempt+1}/{_MAX_RETRIES}), retrying in {wait}s: {exc}",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                # Reconnect on retry — the prior connection may be in a
+                # rolled-back state after a deadlock.
+                get_connection.clear()
+                conn = get_connection()
+                if conn is None:
+                    raise RuntimeError(
+                        "Reconnect failed after transient DB error."
+                    ) from exc
+                continue
+            # Non-retryable, or out of retries — clear connection and raise
+            # so @st.cache_data does NOT cache an empty result.
+            print(f"[db.run_query] {exc}", file=sys.stderr)
+            get_connection.clear()
+            raise
+    # Unreachable, but keep mypy happy
+    raise RuntimeError("run_query exhausted retries") from last_exc

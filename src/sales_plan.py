@@ -783,15 +783,26 @@ def _no_target_form(principal: str, color: str, month_str: str,
 
 
 def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float],
-                     hero_total: float | None = None) -> None:
+                     hero_total: float | None = None,
+                     allowed_teams: list[str] | None = None) -> None:
     """Render one card per sub-team target.
+
+    If `allowed_teams` is given, ONLY render cards for teams in that list
+    (intersected with what's in target_entry["breakdown"]). This is a
+    safety filter so config drift in principal_targets.json can't cause
+    a leak — e.g. an erroneous "Cross Supply" key under USL/Diageo/BF
+    will be silently dropped rather than rendered as a phantom card.
 
     If the sum of sub-team achievements is less than the hero total
     (i.e. some BF / USL / Diageo sales went to outlets that aren't in
     any handler-salesman's universe), surface that gap as a caption so
     the owner can investigate or assign salesmen to those outlets.
     """
-    breakdown = target_entry.get("breakdown", {})
+    raw_breakdown = target_entry.get("breakdown", {})
+    if allowed_teams is not None:
+        breakdown = {k: v for k, v in raw_breakdown.items() if k in allowed_teams}
+    else:
+        breakdown = dict(raw_breakdown)
     cols = st.columns(len(breakdown) if breakdown else 1)
     for col, (team, tgt) in zip(cols, breakdown.items()):
         ach = float(achieved_by_team.get(team, 0))
@@ -1579,7 +1590,8 @@ def render() -> None:
             unsafe_allow_html=True,
         )
         _subtarget_cards(target_entry, achieved_by_team,
-                         hero_total=achieved_total)
+                         hero_total=achieved_total,
+                         allowed_teams=list(cfg["subteams"].keys()))
 
         if st.button("✏️ Edit target", key=f"edit_tgt_{op_month}"):
             # Clear by writing empty entry so the form reappears
