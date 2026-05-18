@@ -1190,20 +1190,82 @@ def _section_focus_brand(company_id: str,
 def _compute_salesman_share(team_salesmen: list[str], hist: pd.DataFrame,
                             l3_months: list[str],
                             universes_by_p: dict[str, dict[str, frozenset]],
-                            cid: str) -> tuple[dict[str, dict], float]:
-    """Return ({sm: {l3m_cases, share_pct}}, team_total_l3m)."""
+                            cid: str,
+                            smly_month: str | None = None,
+                            l3m_weight: float = 0.6,
+                            smly_weight: float = 0.4,
+                            ) -> tuple[dict[str, dict], float]:
+    """Return ({sm: {l3m_cases, smly_cases, share_l3m, share_smly, share_pct,
+                     universe_size}}, team_total).
+
+    `share_pct` blends L3M (`l3m_weight`, default 60%) with the same month
+    of the previous year (`smly_weight`, default 40%) — capturing recent
+    trend AND seasonality. The blend gracefully degrades:
+      - Both L3M and SMLY have data → blended weighting
+      - Only L3M has data           → pure L3M (current behavior)
+      - Only SMLY has data          → pure SMLY
+      - Neither has data            → 0 share for all (caller falls back
+                                       to equal split)
+
+    Applies uniformly to UBL / USL / Diageo / Brown-Forman.
+    """
     l3 = hist[hist["BillMonth"].isin(l3_months)]
+    smly = (hist[hist["BillMonth"] == smly_month]
+            if smly_month is not None else hist.iloc[0:0])
+
     per_sm: dict[str, dict] = {}
-    total = 0.0
+    l3_total = 0.0
+    smly_total = 0.0
     for sm in team_salesmen:
         uni = universes_by_p.get(sm, {}).get(cid, frozenset())
-        cases = float(l3[l3["PartyID"].isin(uni)]["Cases"].sum())
-        per_sm[sm] = {"l3m_cases": cases, "share_pct": 0.0,
-                      "universe_size": len(uni)}
-        total += cases
-    if total > 0:
+        l3_cases = float(l3[l3["PartyID"].isin(uni)]["Cases"].sum())
+        smly_cases = float(smly[smly["PartyID"].isin(uni)]["Cases"].sum())
+        per_sm[sm] = {
+            "l3m_cases":     l3_cases,
+            "smly_cases":    smly_cases,
+            "share_l3m":     0.0,
+            "share_smly":    0.0,
+            "share_pct":     0.0,
+            "universe_size": len(uni),
+        }
+        l3_total   += l3_cases
+        smly_total += smly_cases
+
+    # Per-source shares
+    if l3_total > 0:
         for sm in per_sm:
-            per_sm[sm]["share_pct"] = per_sm[sm]["l3m_cases"] / total * 100
+            per_sm[sm]["share_l3m"] = per_sm[sm]["l3m_cases"] / l3_total * 100
+    if smly_total > 0:
+        for sm in per_sm:
+            per_sm[sm]["share_smly"] = per_sm[sm]["smly_cases"] / smly_total * 100
+
+    # Blend — graceful fallback when one source is empty
+    if l3_total > 0 and smly_total > 0:
+        for sm in per_sm:
+            per_sm[sm]["share_pct"] = (
+                per_sm[sm]["share_l3m"]  * l3m_weight
+                + per_sm[sm]["share_smly"] * smly_weight
+            )
+        # Renormalize so blended shares sum to exactly 100 (weights are
+        # both applied to already-normalized shares, so the sum equals
+        # l3m_weight + smly_weight; rescale to 100 if weights don't sum
+        # to 1).
+        weight_sum = l3m_weight + smly_weight
+        if weight_sum > 0 and abs(weight_sum - 1.0) > 1e-9:
+            for sm in per_sm:
+                per_sm[sm]["share_pct"] /= weight_sum
+        total = l3_total + smly_total
+    elif l3_total > 0:
+        for sm in per_sm:
+            per_sm[sm]["share_pct"] = per_sm[sm]["share_l3m"]
+        total = l3_total
+    elif smly_total > 0:
+        for sm in per_sm:
+            per_sm[sm]["share_pct"] = per_sm[sm]["share_smly"]
+        total = smly_total
+    else:
+        total = 0.0
+
     return per_sm, total
 
 
@@ -1429,8 +1491,17 @@ def _section_salesman_scoreboard(principal: str,
     subteams = cfg_p["subteams"]
     breakdown = (target_entry or {}).get("breakdown", {})
 
-    # Compute L3M share per team
-    l3_months = _last_n_months(4, op_month)[:-1]  # 3 prior months
+    # Compute share per team using L3M + same-month-last-year (SMLY).
+    # L3M = recent trend (3 prior months); SMLY = seasonality (e.g. for
+    # May 2026 → May 2025). Blended 60/40 by default (tunable via
+    # data/target_config.json: l3m_weight, smly_weight).
+    l3_months  = _last_n_months(4, op_month)[:-1]   # 3 prior months
+    yr, mo     = int(op_month[:4]), int(op_month[5:7])
+    smly_month = f"{yr-1:04d}-{mo:02d}"             # same month, prev year
+
+    tgt_cfg = load_target_config()
+    l3m_w   = float(tgt_cfg.get("l3m_weight",  0.6))
+    smly_w  = float(tgt_cfg.get("smly_weight", 0.4))
 
     rows = []
     for team_name, sms in subteams.items():
@@ -1439,6 +1510,8 @@ def _section_salesman_scoreboard(principal: str,
         team_target = breakdown.get(team_name, 0)
         per_sm, team_total = _compute_salesman_share(
             sms, hist, l3_months, universes_by_p, cid,
+            smly_month=smly_month,
+            l3m_weight=l3m_w, smly_weight=smly_w,
         )
 
         for sm in sms:
@@ -1448,7 +1521,7 @@ def _section_salesman_scoreboard(principal: str,
                 auto_target = team_target / len(sms) if sms else 0
             elif allocation_method == "Manual" and team_total == 0:
                 auto_target = team_target / len(sms) if sms else 0
-            else:  # Auto by L3M share (default)
+            else:  # Auto by L3M + SMLY share (default)
                 auto_target = team_target * d["share_pct"] / 100 if team_total else (
                     team_target / len(sms) if sms else 0
                 )
@@ -1477,7 +1550,10 @@ def _section_salesman_scoreboard(principal: str,
                 "Team":         team_name,
                 "Universe":     len(pu),
                 "L3M Avg/mo":   round(d["l3m_cases"] / 3, 1),
-                "Share %":      round(d["share_pct"], 1),
+                "SMLY":         round(d["smly_cases"], 1),
+                "L3M %":        round(d["share_l3m"],  1),
+                "SMLY %":       round(d["share_smly"], 1),
+                "Share %":      round(d["share_pct"],  1),
                 "Auto Target":  int(round(auto_target)),
                 "Override":     int(round(ov)) if ov is not None else 0,
                 "Effective":    int(round(effective)),
@@ -1503,17 +1579,25 @@ def _section_salesman_scoreboard(principal: str,
     styled = (
         df.style
         .format({
-            "Universe": "{:,}",
-            "L3M Avg/mo": "{:.1f}",
-            "Share %": "{:.1f}",
-            "Auto Target": "{:,}",
-            "Override": lambda v: "—" if v == 0 else f"{v:,}",
-            "Effective": "{:,}",
-            "This Mo": "{:,.1f}",
-            "WOD %": "{:.1f}",
-            "% Done": "{:.1f}",
+            "Universe":     "{:,}",
+            "L3M Avg/mo":   "{:.1f}",
+            "SMLY":         "{:.1f}",
+            "L3M %":        "{:.1f}",
+            "SMLY %":       "{:.1f}",
+            "Share %":      "{:.1f}",
+            "Auto Target":  "{:,}",
+            "Override":     lambda v: "—" if v == 0 else f"{v:,}",
+            "Effective":    "{:,}",
+            "This Mo":      "{:,.1f}",
+            "WOD %":        "{:.1f}",
+            "% Done":       "{:.1f}",
         })
         .map(_wod_style, subset=["WOD %"])
+    )
+    st.caption(
+        f"**Share %** = L3M × {l3m_w:.0%} + same-month-last-year × {smly_w:.0%}. "
+        "When SMLY data is missing (e.g. principal added this year), falls "
+        "back to L3M only. Weights tunable in `data/target_config.json`."
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -1692,8 +1776,14 @@ def render() -> None:
     with st.expander("⚙️ Target allocation method"):
         allocation_method = st.radio(
             "How to split sub-targets across salesmen",
-            ["Auto by L3M share (recommended)", "Equal split", "Manual"],
+            ["Auto by L3M + same-month-last-year (recommended)",
+             "Equal split", "Manual"],
             index=0, key="allocation_method",
+            help=("Auto blends L3M (recent trend, 60%) with the same month "
+                  "of the previous year (seasonality, 40%). Equal split "
+                  "divides the team target evenly. Manual uses your "
+                  "per-salesman overrides — set them via 'Set manual "
+                  "salesman override' below."),
         )
 
     # ── Section 3: Outlet plan ──

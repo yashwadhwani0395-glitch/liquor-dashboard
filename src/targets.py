@@ -201,6 +201,11 @@ DEFAULT_TARGET_CONFIG: dict[str, float] = {
     "decline_factor":        1.00,  # when L3M trending down — recovery only
     "ceiling_multiplier":    1.5,   # cap at this × best month L12M
     "months_for_floor":      9,     # consistent-buyer floor threshold
+    # Salesman target allocation: blended weights for L3M (recent trend)
+    # vs SMLY = same-month-last-year (seasonality). Sum need not be 1.0;
+    # the computation renormalizes. Used by _compute_salesman_share.
+    "l3m_weight":            0.6,
+    "smly_weight":           0.4,
 }
 
 
