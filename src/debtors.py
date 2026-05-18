@@ -876,6 +876,256 @@ def _section_spot_check(df: pd.DataFrame) -> None:
     )
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_advances() -> pd.DataFrame:
+    """Parties with net Cr balance (advances received that aren't being
+    netted against outstanding). Same query as Tab C in the gap section,
+    cached because it's also useful as a sanity number.
+    """
+    sql = """
+        SELECT d.PartyID,
+               ISNULL(p.PartyName,'(unknown)')              AS PartyName,
+               SUM(CASE WHEN d.DrCrIndicator='D'
+                        THEN CAST(d.Amount AS float)
+                        ELSE -CAST(d.Amount AS float) END)  AS Balance
+        FROM TrVocDetail d
+        JOIN MsPartyMaster p ON p.PartyID = d.PartyID
+        JOIN TrVocHead   h ON h.TransTypeID = d.TransTypeID
+                          AND h.VoucherNo   = d.VoucherNo
+        WHERE d.PartyID LIKE 'D%' AND h.Cancelled = 'N'
+          AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
+        GROUP BY d.PartyID, p.PartyName
+        HAVING SUM(CASE WHEN d.DrCrIndicator='D'
+                        THEN CAST(d.Amount AS float)
+                        ELSE -CAST(d.Amount AS float) END) < -1000
+        ORDER BY Balance ASC
+    """
+    df = run_query(sql)
+    if df.empty:
+        return pd.DataFrame(columns=["PartyID","PartyName","Balance"])
+    df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce").fillna(0.0)
+    return df
+
+
+def _year_bucket(days: int) -> str:
+    if days <= 365:   return "0-1 yr"
+    if days <= 730:   return "1-2 yrs"
+    if days <= 1825:  return "2-5 yrs"
+    return "5+ yrs"
+
+
+def _section_gap_inspection(df: pd.DataFrame) -> None:
+    """Drill-down into where the Rs9 Cr gap vs BS Rs56 Cr is coming from.
+    Four tabs:
+      A) Non-sales TransType breakdown (TT=12 Return Cheques etc.)
+      B) Ancient bills by year-bucket (writeoff candidates)
+      C) Credit balances (advances that aren't netted)
+      D) Top driver parties (oldest * value)
+    Surfaces, doesn't hide.
+    """
+    st.subheader("🔍 What's in the gap?")
+    st.caption(
+        "Drill-down into the dashboard's excess vs BS Sundry Debtors. "
+        "Owner can decide whether to write off, net, or scope each "
+        "bucket individually. **Nothing here is silently dropped** — "
+        "all four buckets contribute to the headline outstanding."
+    )
+
+    total_cr = float(df["Remaining"].sum()) / 1e7
+    non_sales = df[~df["TransTypeID"].isin(SALES_TT)].copy()
+    old_bills = df[df["AgeDays"] > 365].copy()
+    advances  = _load_advances()
+    advances_total_cr = float(abs(advances["Balance"].sum())) / 1e7 if not advances.empty else 0.0
+
+    # Top-line summary bar — keeps the 4 numbers visible regardless of tab
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Non-sales DR", f"₹{non_sales['Remaining'].sum()/1e7:.2f} Cr",
+              f"{len(non_sales):,} lines · {non_sales['PartyID'].nunique():,} parties")
+    s2.metric("Old debt (>1 yr)",
+              f"₹{old_bills['Remaining'].sum()/1e7:.2f} Cr",
+              f"{len(old_bills):,} lines")
+    s3.metric("Credit balances (advances)",
+              f"₹{advances_total_cr:.2f} Cr",
+              f"{len(advances):,} parties",
+              delta_color="inverse")
+    s4.metric("Net if advances applied",
+              f"₹{total_cr - advances_total_cr:.2f} Cr",
+              f"Today's gross: ₹{total_cr:.2f} Cr")
+
+    tabA, tabB, tabC, tabD = st.tabs([
+        "A) Non-sales TransType",
+        "B) Ancient bills (>1 yr)",
+        "C) Credit balances (advances)",
+        "D) Top drivers",
+    ])
+
+    # ───── Tab A — by TransType (non-sales only) ─────────────────────
+    with tabA:
+        st.caption(
+            "Outstanding originating from non-sales Dr entries — "
+            "return cheques, JVs, debit notes, sales orders, etc. "
+            "These are real ledger movements that count toward "
+            "Sundry Debtors but don't have brand metadata."
+        )
+        if non_sales.empty:
+            st.info("No non-sales DR outstanding. Clean.")
+        else:
+            by_tt = (
+                non_sales.groupby(
+                    ["TransTypeID", "TransTypeName"], observed=True,
+                ).agg(
+                    Lines=("VoucherNo", "count"),
+                    Parties=("PartyID", "nunique"),
+                    Outstanding=("Remaining", "sum"),
+                )
+                .reset_index()
+                .sort_values("Outstanding", ascending=False)
+            )
+            by_tt["Out_Cr"] = by_tt["Outstanding"] / 1e7
+            disp = by_tt[["TransTypeID", "TransTypeName", "Lines",
+                          "Parties", "Out_Cr"]]
+            styled = (
+                disp.style.format({
+                    "TransTypeID": "{:.0f}",
+                    "Lines":       "{:,.0f}",
+                    "Parties":     "{:,.0f}",
+                    "Out_Cr":      "₹{:.2f} Cr",
+                })
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # ───── Tab B — ancient bills by year-bucket + by-party drilldown ──
+    with tabB:
+        st.caption(
+            "Bills older than 1 year — likely write-off candidates. "
+            "5+ year bills are pre-FY20 vintage and almost certainly "
+            "should be in 'Bad Debts Written Off' on the P&L rather "
+            "than Sundry Debtors on the BS."
+        )
+        if old_bills.empty:
+            st.info("No bills older than 1 year. Books are clean on this dimension.")
+        else:
+            old_bills["YearBucket"] = old_bills["AgeDays"].map(_year_bucket)
+            yb = (
+                old_bills.groupby("YearBucket", observed=True)
+                         .agg(Lines=("VoucherNo", "count"),
+                              Parties=("PartyID", "nunique"),
+                              Outstanding=("Remaining", "sum"))
+                         .reindex(["1-2 yrs", "2-5 yrs", "5+ yrs"]).fillna(0)
+                         .reset_index()
+            )
+            yb["Out_Cr"] = yb["Outstanding"] / 1e7
+            styled = (
+                yb.style.format({
+                    "Lines":      "{:,.0f}",
+                    "Parties":    "{:,.0f}",
+                    "Out_Cr":     "₹{:.2f} Cr",
+                })
+            )
+            st.markdown("**By age bucket:**")
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            st.markdown("**By party (top 50 by outstanding):**")
+            by_party = (
+                old_bills.groupby(["PartyID", "PartyName"], observed=True)
+                         .agg(Outstanding=("Remaining", "sum"),
+                              OldestDays=("AgeDays", "max"),
+                              Lines=("VoucherNo", "count"))
+                         .reset_index()
+                         .sort_values("Outstanding", ascending=False)
+                         .head(50)
+            )
+            by_party["Outstanding_L"] = by_party["Outstanding"] / 1e5
+            by_party["OldestYears"]   = (by_party["OldestDays"] / 365).round(1)
+            disp = by_party[["PartyID", "PartyName", "Outstanding_L",
+                             "OldestYears", "Lines"]]
+            styled = (
+                disp.style.format({
+                    "Outstanding_L": "₹{:.1f} L",
+                    "OldestYears":   "{:.1f} yrs",
+                    "Lines":         "{:.0f}",
+                })
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=380)
+
+            csv = by_party.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download write-off review list (CSV)", csv,
+                "writeoff_candidates.csv", "text/csv",
+                key="dbt_writeoff_dl",
+            )
+
+    # ───── Tab C — credit balances (advances) ────────────────────────
+    with tabC:
+        st.caption(
+            "Parties whose ledger shows a NET CREDIT balance — they've "
+            "paid more than was billed. These are advance receipts / "
+            "round-off credits sitting in the customer ledger. The "
+            "manual matching report would typically net these against "
+            "their own outstanding; the BS likely nets some but not "
+            "all of them."
+        )
+        if advances.empty:
+            st.info("No parties with net credit balance.")
+        else:
+            adv = advances.copy()
+            adv["Balance_L"] = adv["Balance"] / 1e5
+            disp = adv[["PartyID", "PartyName", "Balance_L"]].head(50)
+            styled = (
+                disp.style.format({
+                    "Balance_L": "₹{:.1f} L",
+                })
+            )
+            st.markdown(
+                f"**{len(advances):,} parties** carry a combined "
+                f"**₹{advances_total_cr:.2f} Cr** in credit balances. "
+                f"If fully netted, dashboard outstanding would drop "
+                f"from ₹{total_cr:.2f} Cr to "
+                f"**₹{total_cr - advances_total_cr:.2f} Cr** — *below* "
+                f"the BS target, so BS itself isn't fully netting these. "
+                f"Use this list to decide which advances are legitimate "
+                f"(apply to next bill) vs which are data-entry errors."
+            )
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=380)
+            st.caption(
+                "⚠️ A credit balance of ₹50L+ on an active outlet usually "
+                "means cheques have been applied to the wrong party in "
+                "the ERP — worth a 5-minute accountant check."
+            )
+
+    # ───── Tab D — top driver parties ─────────────────────────────────
+    with tabD:
+        st.caption(
+            "Top 20 parties driving the gap, ranked by `OldestBill × "
+            "Outstanding` so very-old high-value lines float to the top."
+        )
+        work = df.copy()
+        work["DriverScore"] = work["AgeDays"] * work["Remaining"] / 1e6
+        big = (
+            work.groupby(["PartyID", "PartyName"], observed=True)
+                .agg(Outstanding=("Remaining", "sum"),
+                     OldestBill=("AgeDays", "max"),
+                     AvgAge=("AgeDays", "mean"),
+                     Lines=("VoucherNo", "count"),
+                     DriverScore=("DriverScore", "sum"))
+                .reset_index()
+                .sort_values("DriverScore", ascending=False)
+                .head(20)
+        )
+        big["Outstanding_L"] = big["Outstanding"] / 1e5
+        disp = big[["PartyID", "PartyName", "Outstanding_L",
+                    "OldestBill", "AvgAge", "Lines"]]
+        styled = (
+            disp.style.format({
+                "Outstanding_L": "₹{:.1f} L",
+                "OldestBill":    "{:.0f} d",
+                "AvgAge":        "{:.0f} d",
+                "Lines":         "{:.0f}",
+            })
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=480)
+
+
 def _section_reconciliation(df: pd.DataFrame) -> None:
     """At the very top: how the dashboard total compares to the BS."""
     total_cr = float(df["Remaining"].sum()) / 1e7
@@ -949,6 +1199,8 @@ def render() -> None:
 
     safe_section("Reconciliation",    _section_reconciliation, unpaid)
     safe_section("Spot check",        _section_spot_check,     unpaid)
+    st.divider()
+    safe_section("Gap inspection",    _section_gap_inspection, unpaid)
     st.divider()
     safe_section("Hero KPIs",         _section_hero,           unpaid)
     st.divider()
