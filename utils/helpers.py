@@ -1,3 +1,4 @@
+import calendar
 import pandas as pd
 import streamlit as st
 from datetime import date, timedelta
@@ -7,6 +8,61 @@ def current_month_range() -> tuple[date, date]:
     today = date.today()
     start = today.replace(day=1)
     return start, today
+
+
+# ─── MTD helpers (single source of truth for "1st-to-today" windows) ────────
+# Used by every benchmark card across sales.py / salesman.py / future pages.
+# Key invariant: the day cutoff is ALWAYS derived from today.day, never
+# hard-coded — so "vs Same Month LY" on May-19 compares May 1-19 each year,
+# on May-20 it auto-updates to May 1-20, on May-31 it's full month.
+
+def same_mtd_window(
+    reference_date: date | pd.Timestamp,
+    months_back: int,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return (start, end) Timestamps for the SAME month-to-date window
+    `months_back` calendar months before `reference_date`.
+
+    Example: reference May-19-2026, months_back=1 →
+             (Apr-1-2026, Apr-19-2026)
+             reference May-19-2026, months_back=12 →
+             (May-1-2025, May-19-2025)
+
+    If the target month is shorter than reference_date.day (e.g. trying to
+    map May-31 back to Feb-31), the end date is capped at month-end.
+    """
+    ref = pd.Timestamp(reference_date).normalize()
+    target_start = (ref.replace(day=1) - pd.DateOffset(months=months_back)) \
+        .normalize()
+    # Last day of target month
+    _, last_dom = calendar.monthrange(target_start.year, target_start.month)
+    target_end_day = min(ref.day, last_dom)
+    target_end = target_start.replace(day=target_end_day)
+    return target_start, target_end
+
+
+def mtd_sum_in_window(
+    df: pd.DataFrame,
+    date_col: str,
+    value_col: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> float:
+    """Sum `value_col` from rows where `date_col` ∈ [start, end] inclusive.
+    Returns 0.0 on empty / missing column."""
+    if df.empty or date_col not in df.columns or value_col not in df.columns:
+        return 0.0
+    mask = (df[date_col] >= start) & (df[date_col] <= end)
+    if not mask.any():
+        return 0.0
+    return float(df.loc[mask, value_col].sum())
+
+
+def mtd_label(reference_date: date | pd.Timestamp) -> str:
+    """Returns '1-N <Mon>' label for use in card subtitles.
+    Example: 1-19 May  ·  1-31 Mar (when run on last day of March)."""
+    ref = pd.Timestamp(reference_date).normalize()
+    return f"1-{ref.day} {ref.strftime('%b')}"
 
 
 def format_inr(value: float) -> str:

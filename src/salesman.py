@@ -18,7 +18,13 @@ except ImportError:
     relativedelta = None
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
+from utils.helpers import (
+    format_inr,
+    CASES_SQL_EXPR as _CASES,
+    same_mtd_window,
+    mtd_sum_in_window,
+    mtd_label,
+)
 from src.distribution import (
     SALESMAN_MAP,
     _load_master,
@@ -172,6 +178,69 @@ def _status_card(label: str, value: str, sub: str, accent: str) -> str:
 # SECTION RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_salesman_daily_revenue(
+    universe_ids: tuple[str, ...],
+    company_ids: tuple[str, ...],
+    months_back: int = 24,
+) -> pd.DataFrame:
+    """Per-DAY revenue for a salesman: rows are days, scoped to outlets
+    in `universe_ids` × principals in `company_ids`. Feeds the MTD-to-
+    MTD benchmark cards so the day cutoff stays dynamic with today.
+
+    Empty universe → empty DataFrame (caller handles).
+    """
+    if not universe_ids or not company_ids:
+        return pd.DataFrame(columns=["BillDate", "Revenue"])
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    uni_ph  = ",".join(["?"] * len(universe_ids))
+    co_ph   = ",".join(["?"] * len(company_ids))
+
+    sql = f"""
+        SELECT
+            CAST(h.VoucherDate AS date)        AS BillDate,
+            SUM(CAST(vi.TotalAmount AS FLOAT)) AS Revenue
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY Amount DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsItemMaster   im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster  b  ON b.BrandID  = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+          AND d.PartyID  IN ({uni_ph})
+          AND b.CompanyID IN ({co_ph})
+        GROUP BY CAST(h.VoucherDate AS date)
+        ORDER BY BillDate
+    """
+    params = tuple(universe_ids) + tuple(company_ids)
+    df = run_query(sql, params)
+    if df.empty:
+        return pd.DataFrame(columns=["BillDate", "Revenue"])
+    df["BillDate"] = pd.to_datetime(df["BillDate"])
+    df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
+    return df
+
+
 def _render_profile_header(salesman: str, cfg: dict,
                            universe_size: int, wod_pct: float,
                            revenue_period: float) -> None:
@@ -219,29 +288,57 @@ def _render_benchmarks(sm_master: pd.DataFrame, universe: frozenset,
                        universe_size: int,
                        all_sm_metrics: dict[str, dict],
                        salesman: str, cfg: dict) -> None:
-    st.markdown("##### Performance vs benchmarks")
+    """MTD-to-MTD comparison cards for this salesman.
 
-    current_month = _last_complete_month()
-    monthly_rev = (
-        sm_master.groupby("BillMonth")["Revenue"].sum().to_dict()
+    Replaces the previous last-COMPLETE-month view (which became stale
+    by up to 30 days after month-end). The day cutoff is today.day —
+    every render compares "1 to today.day" of the current month against
+    the same 1-to-N window in (a) Same Month LY, (b) trailing 3-mo avg,
+    (c) trailing 6-mo avg.
+
+    The 4th card (Team Rank) stays as-is — it's a ranking, not a
+    period comparison.
+    """
+    label = mtd_label(pd.Timestamp.today().normalize())
+    st.markdown(f"##### Performance vs benchmarks  ·  *MTD-to-MTD ({label})*")
+
+    # Pull day-level revenue for this salesman's universe + principals
+    daily = _load_salesman_daily_revenue(
+        universe_ids=tuple(sorted(universe)),
+        company_ids=tuple(cfg.get("principals", [])),
+        months_back=24,
     )
-    curr_rev = float(monthly_rev.get(current_month, 0.0))
 
-    # vs same month LY
-    yr, mo = int(current_month[:4]), int(current_month[5:])
-    ly_key = f"{yr-1:04d}-{mo:02d}"
-    ly_rev = float(monthly_rev.get(ly_key, 0.0))
+    today = pd.Timestamp.today().normalize()
+    cur_start, cur_end = today.replace(day=1), today
+
+    curr_rev = mtd_sum_in_window(daily, "BillDate", "Revenue",
+                                 cur_start, cur_end)
+
+    # vs Same Month LY — same 1-to-today.day window 12 months back
+    ly_start, ly_end = same_mtd_window(today, months_back=12)
+    ly_rev = mtd_sum_in_window(daily, "BillDate", "Revenue",
+                               ly_start, ly_end)
     rev_delta, rev_color = _yoy_delta(curr_rev, ly_rev)
 
-    # vs 3 / 6 month averages
-    prev_3 = _last_n_month_strs(4)[:-1]
-    prev_6 = _last_n_month_strs(7)[:-1]
-    avg_3  = sum(monthly_rev.get(m, 0) for m in prev_3) / max(len(prev_3), 1)
-    avg_6  = sum(monthly_rev.get(m, 0) for m in prev_6) / max(len(prev_6), 1)
+    # Trailing 3 / 6 months — average of each same-MTD window
+    prev_3_mtds = [
+        mtd_sum_in_window(daily, "BillDate", "Revenue",
+                          *same_mtd_window(today, months_back=i))
+        for i in range(1, 4)
+    ]
+    prev_6_mtds = [
+        mtd_sum_in_window(daily, "BillDate", "Revenue",
+                          *same_mtd_window(today, months_back=i))
+        for i in range(1, 7)
+    ]
+    avg_3 = sum(prev_3_mtds) / max(len(prev_3_mtds), 1)
+    avg_6 = sum(prev_6_mtds) / max(len(prev_6_mtds), 1)
     d3_text, d3_color = _yoy_delta(curr_rev, avg_3)
     d6_text, d6_color = _yoy_delta(curr_rev, avg_6)
 
-    # Team rank
+    # Team rank — ranking on current-month revenue from sm_master
+    # (whole-month total, fine for ranking purposes since it's relative)
     team_name = cfg.get("team", "")
     team_members = [k for k, v in SALESMAN_MAP.items() if v.get("team") == team_name]
     team_revenues = [
@@ -255,23 +352,23 @@ def _render_benchmarks(sm_master: pd.DataFrame, universe: frozenset,
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(_kpi_card(
-            "vs Same Month LY",
+            f"{label} vs Same Month LY",
             f"₹{curr_rev/1e7:.2f} Cr",
-            f"{rev_delta} (LY: ₹{ly_rev/1e7:.2f} Cr)",
+            f"{rev_delta} (LY {label}: ₹{ly_rev/1e7:.2f} Cr)",
             rev_color, "#1B4F72",
         ), unsafe_allow_html=True)
     with c2:
         st.markdown(_kpi_card(
-            "vs 3-month avg",
+            f"{label} vs 3-mo MTD avg",
             d3_text,
-            f"Avg: ₹{avg_3/1e7:.2f} Cr",
+            f"Avg MTD: ₹{avg_3/1e7:.2f} Cr",
             d3_color, "#378ADD",
         ), unsafe_allow_html=True)
     with c3:
         st.markdown(_kpi_card(
-            "vs 6-month avg",
+            f"{label} vs 6-mo MTD avg",
             d6_text,
-            f"Avg: ₹{avg_6/1e7:.2f} Cr",
+            f"Avg MTD: ₹{avg_6/1e7:.2f} Cr",
             d6_color, "#1D9E75",
         ), unsafe_allow_html=True)
     with c4:

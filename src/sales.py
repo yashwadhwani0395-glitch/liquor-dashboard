@@ -18,7 +18,13 @@ except ImportError:  # fallback if dateutil missing
     relativedelta = None
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
+from utils.helpers import (
+    format_inr,
+    CASES_SQL_EXPR as _CASES,
+    same_mtd_window,
+    mtd_sum_in_window,
+    mtd_label,
+)
 
 # ── Sales transaction type IDs ──────────────────────────────────────────────
 SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
@@ -200,6 +206,56 @@ def _load_monthly_revenue(months: int = 24,
     if not df.empty:
         df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
         df["Cases"]   = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_daily_revenue(months: int = 24,
+                        principal_ids: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Per-DAY revenue for the last `months` months. Used by MTD-to-MTD
+    benchmark cards so the day cutoff can be set dynamically from
+    today.day rather than baked into the SQL aggregation level.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    company_sql = ""
+    company_params: tuple = ()
+    if principal_ids:
+        company_sql = f"AND b.CompanyID IN ({','.join('?' * len(principal_ids))})"
+        company_params = principal_ids
+
+    sql = f"""
+        SELECT
+            CAST(h.VoucherDate AS date)        AS BillDate,
+            SUM(CAST(vi.TotalAmount AS FLOAT)) AS Revenue,
+            SUM({_CASES})                      AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months}, GETDATE())
+          {company_sql}
+        GROUP BY CAST(h.VoucherDate AS date)
+        ORDER BY BillDate
+    """
+    df = run_query(sql, company_params)
+    if df.empty:
+        return pd.DataFrame(columns=["BillDate", "Revenue", "Cases"])
+    df["BillDate"] = pd.to_datetime(df["BillDate"])
+    df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
+    df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
     return df
 
 
@@ -475,48 +531,76 @@ def _section_kpis(kpi: dict) -> None:
         ), unsafe_allow_html=True)
 
 
-def _section_benchmarks(monthly_df: pd.DataFrame) -> None:
-    """3 cards: this month vs same-month-LY, 3mo avg, 6mo avg."""
-    st.markdown("##### This month vs benchmarks")
-    if monthly_df.empty:
-        st.info("Insufficient monthly data to compute benchmarks.")
+def _section_benchmarks(daily_df: pd.DataFrame) -> None:
+    """3 cards: MTD-this-month vs SAME-MTD-window in (a) LY same month,
+    (b) trailing-3-month average, (c) trailing-6-month average.
+
+    The day cutoff is derived from today.day every render — no hard-coded
+    day numbers. On May-19 each card compares May 1-19 ranges; on
+    May-31 each card compares full months.
+
+    Fixes the previous apples-to-oranges bug where current partial
+    month was being compared to FULL prior periods (which made the
+    comparison spuriously look -45% to -90% mid-month).
+    """
+    st.markdown("##### This month vs benchmarks  ·  *MTD-to-MTD comparison*")
+    if daily_df.empty:
+        st.info("Insufficient daily data to compute benchmarks.")
         return
 
-    monthly = monthly_df.set_index("Month")["Revenue"]
-    current_month = _last_n_month_strs(1)[0]
-    if current_month not in monthly.index:
-        st.info(f"No revenue yet for {_fmt_month(current_month)}.")
+    today = pd.Timestamp.today().normalize()
+    label = mtd_label(today)
+    cur_start, cur_end = today.replace(day=1), today
+
+    # Current MTD
+    curr_rev = mtd_sum_in_window(daily_df, "BillDate", "Revenue",
+                                 cur_start, cur_end)
+
+    if curr_rev <= 0:
+        st.info(f"No revenue yet for {today.strftime('%b %Y')} "
+                f"(window: {label}).")
         return
 
-    curr_rev   = float(monthly.get(current_month, 0))
+    # vs Same Month LY (12 months back, same day range)
+    ly_start, ly_end = same_mtd_window(today, months_back=12)
+    ly_rev = mtd_sum_in_window(daily_df, "BillDate", "Revenue",
+                               ly_start, ly_end)
 
-    # Same month last year
-    yr, mo = int(current_month[:4]), int(current_month[5:])
-    ly_key = f"{yr-1:04d}-{mo:02d}"
-    ly_rev = float(monthly.get(ly_key, 0))
-
-    # 3mo and 6mo averages (excluding current month)
-    prev_3 = _last_n_month_strs(4)[:-1]
-    prev_6 = _last_n_month_strs(7)[:-1]
-    avg_3 = float(monthly.reindex(prev_3).fillna(0).mean())
-    avg_6 = float(monthly.reindex(prev_6).fillna(0).mean())
+    # Trailing 3 and 6 months — average of each same-MTD window
+    prev_3_mtds = [
+        mtd_sum_in_window(daily_df, "BillDate", "Revenue",
+                          *same_mtd_window(today, months_back=i))
+        for i in range(1, 4)
+    ]
+    prev_6_mtds = [
+        mtd_sum_in_window(daily_df, "BillDate", "Revenue",
+                          *same_mtd_window(today, months_back=i))
+        for i in range(1, 7)
+    ]
+    avg_3 = sum(prev_3_mtds) / max(len(prev_3_mtds), 1)
+    avg_6 = sum(prev_6_mtds) / max(len(prev_6_mtds), 1)
 
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(_bench_card(
-            f"{_fmt_month(current_month)} · vs Same Month LY",
-            _fmt_month(ly_key), curr_rev, ly_rev, "#1B4F72",
+            f"{label} vs Same Month LY",
+            f"LY {ly_start.strftime('%b')} {label}",
+            curr_rev, ly_rev, "#1B4F72",
         ), unsafe_allow_html=True)
     with c2:
         st.markdown(_bench_card(
-            f"{_fmt_month(current_month)} · vs 3-month avg",
-            "3mo avg", curr_rev, avg_3, "#378ADD",
+            f"{label} vs 3-mo avg ({label})",
+            "3-mo avg MTD", curr_rev, avg_3, "#378ADD",
         ), unsafe_allow_html=True)
     with c3:
         st.markdown(_bench_card(
-            f"{_fmt_month(current_month)} · vs 6-month avg",
-            "6mo avg", curr_rev, avg_6, "#1D9E75",
+            f"{label} vs 6-mo avg ({label})",
+            "6-mo avg MTD", curr_rev, avg_6, "#1D9E75",
         ), unsafe_allow_html=True)
+    st.caption(
+        f"All three cards compare the **first {today.day} days** of "
+        f"each month — apples to apples. Auto-updates daily."
+    )
 
 
 def _fy_of(ym: str) -> int:
@@ -705,6 +789,9 @@ def render() -> None:
     with st.spinner("Loading sales data…"):
         kpi          = _load_period_kpis(start, end, ly_start, ly_end, principal_ids)
         monthly_df   = _load_monthly_revenue(24, principal_ids)
+        # Daily revenue: feeds the MTD-to-MTD benchmark cards (need
+        # day-level granularity so today.day drives the cutoff).
+        daily_df     = _load_daily_revenue(24, principal_ids)
         principal_df = _load_principal_growth(start, end, ly_start, ly_end)
         channel_df   = _load_channel_revenue(start, end, principal_ids)
         brands_df    = _load_brand_growth(start, end, ly_start, ly_end, principal_ids)
@@ -716,7 +803,7 @@ def render() -> None:
     # ── Sections ──
     _section_kpis(kpi)
     st.divider()
-    _section_benchmarks(monthly_df)
+    _section_benchmarks(daily_df)
     st.divider()
     _section_trend(monthly_df)
     st.divider()
