@@ -84,3 +84,25 @@ These appear in `MsSalesmanMaster` but should NOT be treated as collectable hand
 | `src/principal.py` | `PRINCIPAL_CONFIG` | Meeting Pack salesman scoreboard composition |
 
 When the team changes, update **`docs/team_structure.md` first**, then sync the four constants above (they all derive from this single source of truth).
+
+## Wine Shop Pair Fallback (debtors.py only)
+
+Wine shop teams share outlets but split principals:
+
+| Pair | USL (SM1) | Diageo + BF (SM2) |
+|------|-----------|-------------------|
+| A | Sachin Kamble (000012) | Ajay (000030) |
+| B | Shashank (000014) | Deepak Patil (000004) |
+
+ERP `MsPartyMaster` has SM2 blank for 115 wine-shop parties
+(80 in Pair A, 35 in Pair B). The `WINE_PAIR_FALLBACK` rule in
+`src/debtors.py` routes Diageo/BF bills at these parties to the
+correct pair-mate.
+
+This rule is **NOT** applied in `sales_plan.py` / `sales.py` — those
+modules show sales attribution from the field as-is.
+
+Accountant cleanup path: populate SM2 in `MsPartyMaster` with
+the correct partner ID for the 115 affected parties. Once
+populated, the explicit SM2 takes precedence (step 1 fires
+first) and `WINE_PAIR_FALLBACK` silently bypasses.
