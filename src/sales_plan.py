@@ -26,6 +26,8 @@ from src.distribution import (
 )
 from src.targets import (
     load_principal_target, save_principal_target,
+    append_undo_entry, get_last_undo_entry, can_undo, restore_undo_entry,
+    PRINCIPAL_TARGETS_FILE, BRAND_TARGETS_FILE,
     load_focus_brand,     save_focus_brand,
     load_party_target_override, save_party_target_override,
     delete_party_target_override,
@@ -894,6 +896,116 @@ def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float],
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# EDIT TARGET — two-step confirm + undo log + restore button
+# ═══════════════════════════════════════════════════════════════════════════════
+# The bare "Edit target" button used to delete the principal_targets.json entry
+# on a single click — that's how a misclick could nuke a month's plan. The
+# replacement below routes every destructive action through st.session_state:
+#
+#   1. click ✏️ Edit target  → set pending_clear flag, rerun.
+#   2. dashboard renders a red "About to clear X cs — confirm?" banner with
+#      [✓ Confirm] [✗ Cancel] buttons.
+#   3. on Confirm: snapshot the current entry to data/target_undo_log.json,
+#      then delete; on Cancel: just clear the flag.
+#
+# Separately, if a previous destructive edit exists in the undo log for this
+# (principal, month), an ↩️ Undo last change button is offered. It restores
+# the old snapshot AND records the restore in the log (so the undo itself is
+# undoable).
+def _edit_target_controls(principal: str, op_month: str,
+                          target_entry: dict) -> None:
+    """Render the Edit/Undo controls under the hero card.
+
+    Uses session_state to keep the multi-step confirm flow alive across
+    Streamlit reruns. All keys are scoped to (principal, op_month) so
+    multiple principals can be edited in the same session without
+    interference.
+    """
+    import streamlit as st  # local import keeps the helper self-contained
+
+    pending_clear_key = f"_clear_pending__{principal}__{op_month}"
+    pending_undo_key  = f"_undo_pending__{principal}__{op_month}"
+
+    # ── Row of buttons (Edit + Undo if available) ──
+    has_undo = can_undo(principal, op_month, kind="principal_target")
+    cols = st.columns([1, 1, 4]) if has_undo else st.columns([1, 5])
+    with cols[0]:
+        if st.button("✏️ Edit target", key=f"edit_tgt_{principal}_{op_month}"):
+            st.session_state[pending_clear_key] = True
+            st.rerun()
+    if has_undo:
+        with cols[1]:
+            if st.button("↩️ Undo last change",
+                         key=f"undo_tgt_{principal}_{op_month}"):
+                st.session_state[pending_undo_key] = get_last_undo_entry(
+                    principal, op_month, kind="principal_target")
+                st.rerun()
+
+    # ── Confirm banner for CLEAR ──
+    if st.session_state.get(pending_clear_key):
+        cur_total = int(target_entry.get("total_cases", 0))
+        st.error(
+            f"⚠️ **About to CLEAR the {principal} {op_month} target "
+            f"({cur_total:,} cases).** This will also wipe the sub-team "
+            f"breakdown. An undo entry will be saved automatically — but "
+            f"confirm only if this is intentional."
+        )
+        c1, c2, _ = st.columns([1, 1, 4])
+        with c1:
+            if st.button("✓ Confirm clear",
+                         type="primary",
+                         key=f"confirm_clear_{principal}_{op_month}"):
+                # Snapshot the existing entry BEFORE deleting so undo works
+                append_undo_entry(
+                    principal, op_month,
+                    kind="principal_target",
+                    old_snapshot=target_entry,
+                    new_snapshot=None,
+                    user_action="edit_clear",
+                )
+                # Now delete
+                from src.targets import _read_json, _write_json
+                data = _read_json(PRINCIPAL_TARGETS_FILE)
+                data.pop(f"{principal}__{op_month}", None)
+                _write_json(PRINCIPAL_TARGETS_FILE, data)
+                st.session_state.pop(pending_clear_key, None)
+                st.success(f"Target cleared for {principal} {op_month}. "
+                           f"Click ↩️ Undo to restore.")
+                st.rerun()
+        with c2:
+            if st.button("✗ Cancel",
+                         key=f"cancel_clear_{principal}_{op_month}"):
+                st.session_state.pop(pending_clear_key, None)
+                st.rerun()
+
+    # ── Confirm banner for UNDO ──
+    if st.session_state.get(pending_undo_key):
+        u = st.session_state[pending_undo_key]
+        old_total = (u["old"] or {}).get("total_cases", 0)
+        new_total = (u["new"] or {}).get("total_cases", 0)
+        st.warning(
+            f"↩️ Restore {principal} {op_month} target "
+            f"from current state ({new_total:,} cs) back to "
+            f"{old_total:,} cs (saved {u['timestamp']})?"
+        )
+        c1, c2, _ = st.columns([1, 1, 4])
+        with c1:
+            if st.button("✓ Confirm undo",
+                         type="primary",
+                         key=f"confirm_undo_{principal}_{op_month}"):
+                restore_undo_entry(u)
+                st.session_state.pop(pending_undo_key, None)
+                st.success(f"Restored {principal} {op_month} target to "
+                           f"{old_total:,} cases.")
+                st.rerun()
+        with c2:
+            if st.button("✗ Cancel",
+                         key=f"cancel_undo_{principal}_{op_month}"):
+                st.session_state.pop(pending_undo_key, None)
+                st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1320,14 +1432,148 @@ def _section_brand_targets(principal: str, cid: str,
         with c_clear:
             clear = st.form_submit_button("🗑️ Clear all")
 
+    # ── Save flow: confirm if the new total is destructive vs current ──
+    pending_brand_save_key  = f"_brand_save_pending__{principal}__{op_month}"
+    pending_brand_clear_key = f"_brand_clear_pending__{principal}__{op_month}"
+
+    current_total = sum(float(v) for v in saved.values()) if saved else 0.0
+    new_total     = float(total)
+
     if submitted:
-        save_brand_targets(principal, op_month, brand_inputs)
-        st.success(f"Saved {sum(1 for v in brand_inputs.values() if v > 0)} brand targets.")
-        st.rerun()
+        # Suspicious: clearing everything via save, or dropping by >90%
+        suspicious = (
+            (new_total == 0 and current_total > 0)
+            or (current_total > 0 and new_total < 0.1 * current_total)
+        )
+        if suspicious:
+            st.session_state[pending_brand_save_key] = {
+                "inputs": dict(brand_inputs),
+                "old_total": current_total,
+                "new_total": new_total,
+            }
+            st.rerun()
+        else:
+            # Snapshot for undo, then write
+            existing_full = load_brand_targets(principal, op_month)
+            save_brand_targets(principal, op_month, brand_inputs)
+            new_full = load_brand_targets(principal, op_month)
+            append_undo_entry(
+                principal, op_month,
+                kind="brand_targets",
+                old_snapshot=existing_full,
+                new_snapshot=new_full,
+                user_action="save",
+            )
+            st.success(
+                f"Saved {sum(1 for v in brand_inputs.values() if v > 0)} "
+                f"brand targets ({new_total:,.0f} cs)."
+            )
+            st.rerun()
+
     if clear:
-        delete_brand_targets(principal, op_month)
-        st.success("Brand targets cleared.")
+        # Always require a second click to clear
+        st.session_state[pending_brand_clear_key] = True
         st.rerun()
+
+    # ── Confirmation banner: brand-targets SAVE (suspicious) ──
+    if st.session_state.get(pending_brand_save_key):
+        p = st.session_state[pending_brand_save_key]
+        st.error(
+            f"⚠️ **About to reduce brand targets from "
+            f"{p['old_total']:,.0f} cs → {p['new_total']:,.0f} cs** "
+            f"(more than 90% drop, or down to zero). Confirm only if "
+            f"this is intentional. An undo entry will be saved."
+        )
+        c1, c2, _ = st.columns([1, 1, 4])
+        with c1:
+            if st.button("✓ Confirm save",
+                         type="primary",
+                         key=f"confirm_brand_save_{principal}_{op_month}"):
+                existing_full = load_brand_targets(principal, op_month)
+                save_brand_targets(principal, op_month, p["inputs"])
+                new_full = load_brand_targets(principal, op_month)
+                append_undo_entry(
+                    principal, op_month,
+                    kind="brand_targets",
+                    old_snapshot=existing_full,
+                    new_snapshot=new_full,
+                    user_action="save_suspicious",
+                )
+                st.session_state.pop(pending_brand_save_key, None)
+                st.success("Brand targets saved. Click ↩️ Undo below if "
+                           "this was a mistake.")
+                st.rerun()
+        with c2:
+            if st.button("✗ Cancel",
+                         key=f"cancel_brand_save_{principal}_{op_month}"):
+                st.session_state.pop(pending_brand_save_key, None)
+                st.rerun()
+
+    # ── Confirmation banner: brand-targets CLEAR ──
+    if st.session_state.get(pending_brand_clear_key):
+        existing_full = load_brand_targets(principal, op_month)
+        cur_total = (sum(float(v) for v in (existing_full or {})
+                         .get("targets", {}).values())
+                     if existing_full else 0)
+        st.error(
+            f"⚠️ **About to clear ALL brand targets for {principal} "
+            f"{op_month}** ({cur_total:,.0f} cs across "
+            f"{len((existing_full or {}).get('targets', {}))} brands). "
+            f"An undo entry will be saved."
+        )
+        c1, c2, _ = st.columns([1, 1, 4])
+        with c1:
+            if st.button("✓ Confirm clear",
+                         type="primary",
+                         key=f"confirm_brand_clear_{principal}_{op_month}"):
+                append_undo_entry(
+                    principal, op_month,
+                    kind="brand_targets",
+                    old_snapshot=existing_full,
+                    new_snapshot=None,
+                    user_action="clear_all",
+                )
+                delete_brand_targets(principal, op_month)
+                st.session_state.pop(pending_brand_clear_key, None)
+                st.success("Brand targets cleared. Click ↩️ Undo below "
+                           "to restore.")
+                st.rerun()
+        with c2:
+            if st.button("✗ Cancel",
+                         key=f"cancel_brand_clear_{principal}_{op_month}"):
+                st.session_state.pop(pending_brand_clear_key, None)
+                st.rerun()
+
+    # ── Undo button for brand targets ──
+    if can_undo(principal, op_month, kind="brand_targets"):
+        pending_brand_undo_key = f"_brand_undo_pending__{principal}__{op_month}"
+        if st.button("↩️ Undo last brand-targets change",
+                     key=f"undo_brand_{principal}_{op_month}"):
+            st.session_state[pending_brand_undo_key] = get_last_undo_entry(
+                principal, op_month, kind="brand_targets")
+            st.rerun()
+        if st.session_state.get(pending_brand_undo_key):
+            u = st.session_state[pending_brand_undo_key]
+            old_n = len((u.get("old") or {}).get("targets", {}))
+            new_n = len((u.get("new") or {}).get("targets", {}))
+            st.warning(
+                f"↩️ Restore brand targets to {old_n} brands "
+                f"(from current {new_n} brands, saved {u['timestamp']})?"
+            )
+            c1, c2, _ = st.columns([1, 1, 4])
+            with c1:
+                if st.button("✓ Confirm undo",
+                             type="primary",
+                             key=f"confirm_brand_undo_{principal}_{op_month}"):
+                    restore_undo_entry(u)
+                    st.session_state.pop(pending_brand_undo_key, None)
+                    st.success(f"Restored {old_n} brand targets.")
+                    st.rerun()
+            with c2:
+                if st.button("✗ Cancel",
+                             key=f"cancel_brand_undo_{principal}_{op_month}"):
+                    st.session_state.pop(pending_brand_undo_key, None)
+                    st.rerun()
 
     # ── Matrix + summary (only if any targets exist) ──
     if not saved:
@@ -1762,14 +2008,7 @@ def render() -> None:
                          hero_total=achieved_total,
                          allowed_teams=list(cfg["subteams"].keys()))
 
-        if st.button("✏️ Edit target", key=f"edit_tgt_{op_month}"):
-            # Clear by writing empty entry so the form reappears
-            data = {}
-            from src.targets import _read_json, _write_json, PRINCIPAL_TARGETS_FILE
-            data = _read_json(PRINCIPAL_TARGETS_FILE)
-            data.pop(f"{principal}__{op_month}", None)
-            _write_json(PRINCIPAL_TARGETS_FILE, data)
-            st.rerun()
+        _edit_target_controls(principal, op_month, target_entry)
 
     st.divider()
 

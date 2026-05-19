@@ -245,3 +245,113 @@ def delete_brand_targets(principal: str, month_str: str) -> None:
     data = _read_json(BRAND_TARGETS_FILE)
     data.pop(f"{principal}__{month_str}", None)
     _write_json(BRAND_TARGETS_FILE, data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNDO LOG  (safety net for destructive target ops)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Every destructive operation (clear / edit-target / save-zero) appends an entry
+# here BEFORE the destructive write. The UI surfaces an "Undo last change"
+# button that can read the most-recent entry for (principal, month) and restore
+# the snapshot. File is committed with the repo so the safety net survives
+# Streamlit Cloud's ephemeral filesystem.
+
+import datetime as _dt
+
+TARGET_UNDO_LOG_FILE = _DATA_DIR / "target_undo_log.json"
+_UNDO_LOG_MAX = 50
+
+
+def _read_undo_log() -> dict:
+    raw = _read_json(TARGET_UNDO_LOG_FILE)
+    if not isinstance(raw, dict) or "history" not in raw:
+        return {"history": []}
+    return raw
+
+
+def append_undo_entry(
+    principal: str,
+    month_str: str,
+    kind: str,
+    old_snapshot: dict | None,
+    new_snapshot: dict | None,
+    user_action: str = "save",
+) -> None:
+    """Record a destructive target operation so it can be undone.
+
+    `kind` is one of: 'principal_target', 'brand_targets'.
+    `old_snapshot` / `new_snapshot` are the exact JSON entries before/after
+    the write (None for clears).
+    """
+    log = _read_undo_log()
+    log["history"].append({
+        "timestamp":   _dt.datetime.now().isoformat(timespec="seconds"),
+        "principal":   principal,
+        "month":       month_str,
+        "kind":        kind,
+        "user_action": user_action,
+        "old":         old_snapshot,
+        "new":         new_snapshot,
+    })
+    # Keep the file bounded.
+    if len(log["history"]) > _UNDO_LOG_MAX:
+        log["history"] = log["history"][-_UNDO_LOG_MAX:]
+    _write_json(TARGET_UNDO_LOG_FILE, log)
+
+
+def get_last_undo_entry(principal: str, month_str: str,
+                        kind: str | None = None) -> dict | None:
+    """Return the most-recent undo entry for (principal, month, [kind]).
+
+    Returns None if no entry exists.
+    """
+    log = _read_undo_log()
+    for entry in reversed(log["history"]):
+        if entry["principal"] == principal and entry["month"] == month_str:
+            if kind is None or entry["kind"] == kind:
+                return entry
+    return None
+
+
+def can_undo(principal: str, month_str: str,
+             kind: str | None = None) -> bool:
+    return get_last_undo_entry(principal, month_str, kind) is not None
+
+
+def restore_undo_entry(entry: dict) -> None:
+    """Restore the `old` snapshot from an undo entry.
+
+    Writes directly back to the underlying JSON file based on `entry['kind']`.
+    Also appends a new undo entry recording the restore (so the undo itself
+    is undoable).
+    """
+    principal  = entry["principal"]
+    month_str  = entry["month"]
+    kind       = entry["kind"]
+    old        = entry["old"]
+
+    if kind == "principal_target":
+        data = _read_json(PRINCIPAL_TARGETS_FILE)
+        # Snapshot what's there now before overwriting (to make the undo undoable)
+        current = data.get(f"{principal}__{month_str}")
+        if old is None:
+            data.pop(f"{principal}__{month_str}", None)
+        else:
+            data[f"{principal}__{month_str}"] = old
+        _write_json(PRINCIPAL_TARGETS_FILE, data)
+        append_undo_entry(principal, month_str, "principal_target",
+                          current, old, user_action="undo")
+
+    elif kind == "brand_targets":
+        data = _read_json(BRAND_TARGETS_FILE)
+        current = data.get(f"{principal}__{month_str}")
+        if old is None:
+            data.pop(f"{principal}__{month_str}", None)
+        else:
+            data[f"{principal}__{month_str}"] = old
+        _write_json(BRAND_TARGETS_FILE, data)
+        append_undo_entry(principal, month_str, "brand_targets",
+                          current, old, user_action="undo")
+
+    else:
+        raise ValueError(f"Unknown undo kind: {kind!r}")
