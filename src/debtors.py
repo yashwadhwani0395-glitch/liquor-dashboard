@@ -132,19 +132,74 @@ PRINCIPAL_MAP: dict[str, str] = {
     "C00056": "Brown-Forman",
 }
 
-# License-type → channel label (matches src/sales_plan.py:_LT_LABEL).
+# License-type → channel label. Extended from src/sales_plan.py:_LT_LABEL
+# with the codes that came back in _diag_channel.out (180003 / 180006 /
+# 180008 / 180009 were missing previously, hence the "Other" pile-up).
 CHANNEL_MAP: dict[str, str] = {
     "180001": "Wine Shop (FL-II)",
     "180002": "Permit Room (FL-III)",
+    "180003": "Club / Restaurant (FL-III)",
     "180004": "Beer Shopee (FL-BR-II)",
     "180005": "Club (FL-IV)",
-    "180007": "One-Day (FL-IV)",
+    "180006": "Country Liquor (FL-IV-A)",
+    "180007": "One-Day Permit (FL-IV)",
+    "180008": "Wholesale / Trading",
+    "180009": "Importer / Bonded",
 }
 
-# AcType3ID '130007' = Cross-Supply (special UBL bucket). Other AcType3
-# values broadly classify the account but Cross-Supply is the one that
-# meaningfully shifts the channel label.
+# AcType3ID '130007' = Cross-Supply ROUTING flag (used by sales_plan to
+# split UBL's sub-targets). It is NOT a channel — same physical outlet
+# can be wine shop + cross-supply simultaneously. Previously the
+# by-channel section was overriding the channel label with "Cross-Supply
+# (Institution)" which created a phantom channel; now retained only for
+# reference in sales-side modules but not used in Debtors channel
+# categorization.
 CROSS_SUPPLY_AC = "130007"
+
+# Placeholder salesman names in MsSalesmanMaster that are NOT real
+# field humans. Discovered via _diag_attribution.out:
+#   SURESH NAIR    (1 / 0 / 558 in SM1/SM2/SM3) — catch-all SM3 dump
+#   ROHIT LAKHAN   (0 / 0 / 175) — SM3 placeholder
+#   CROSS SUPPLY   (311 / 0 / 7) — Cross-supply marker, not a person
+#   CLOSED OUTLET  — status marker
+#   ONE DAY LIC    — status marker
+#   Z * (multiple) — ex-employees (Z RAJENDRA PRASAD, etc.)
+PLACEHOLDER_NAMES: frozenset[str] = frozenset({
+    "SURESH NAIR", "ROHIT LAKHAN", "CROSS SUPPLY",
+    "CLOSED OUTLET", "ONE DAY LIC",
+    # Trailing-period variants seen in sample data
+    "CLOSED OUTLET.", "ONE DAY LIC.",
+})
+
+
+def _is_placeholder_salesman(name: str | None) -> bool:
+    """True if the salesman name is a placeholder, not a real human.
+    Captures the PLACEHOLDER_NAMES set plus the Z-prefix legacy
+    convention (ex-employees prefixed with 'Z ')."""
+    if name is None:
+        return True
+    up = str(name).strip().upper()
+    if not up:
+        return True
+    if up in PLACEHOLDER_NAMES:
+        return True
+    if up.startswith("Z "):
+        return True
+    return False
+
+
+# Per-principal salesman field — STRICT principal-driven rule that
+# mirrors how sales attribution works in sales_plan.py. No fallback
+# chain: if the designated field is empty, the bill lands in
+# 'Unmapped' (visible to the accountant for clean-up) rather than
+# being absorbed by an unrelated placeholder name.
+PRINCIPAL_TO_SM_FIELD: dict[str, str] = {
+    "United Spirits":   "SalesManID",    # SM1
+    "Diageo":           "SalesManID1",   # SM2
+    "United Breweries": "SalesManID2",   # SM3
+    # Brown-Forman is handled separately (split by AcType3) in
+    # _attribute_salesman below.
+}
 
 
 # ── Per-principal salesman-field PRIORITY order ──────────────────────────
@@ -153,42 +208,16 @@ CROSS_SUPPLY_AC = "130007"
 #    institutions have SM1 populated (Miran Dmello routes them) but SM2
 #    blank, etc. So we try the principal's preferred field first, then
 #    fall back to SM1 / SM2 / SM3 in order. Empty / null are skipped.
-SALESMAN_PRIORITY_BY_PRINCIPAL: dict[str, tuple[str, ...]] = {
-    "United Spirits":   ("SalesManID",  "SalesManID1", "SalesManID2"),
-    "Diageo":           ("SalesManID1", "SalesManID",  "SalesManID2"),
-    "United Breweries": ("SalesManID2", "SalesManID",  "SalesManID1"),
-    # Brown-Forman is split: wine shops via SM2, institutions via SM3.
-    # Handled separately in _attribute_salesman() below.
-}
-
-# ── Real field salesmen ──────────────────────────────────────────────────
-# The "active humans" who physically visit outlets. Everything else in
-# MsSalesmanMaster is either an ex-employee (Z-prefix), a status marker
-# (CLOSED OUTLET / ONE DAY LIC), or a catch-all placeholder used when
-# no specific human handles the outlet (SURESH NAIR — 558 parties in
-# SM3 with no logical Diageo channel link, CROSS SUPPLY, ROHIT LAKHAN).
+# Note: the old SALESMAN_PRIORITY_BY_PRINCIPAL fallback chain has been
+# REMOVED. We now use the strict principal-driven rule defined above in
+# PRINCIPAL_TO_SM_FIELD — this mirrors the sales-side attribution in
+# sales_plan.py exactly so collections and sales agree on who owns
+# each outlet.
 #
-# Confirmed via _diag_attribution.out STEP B + STEP D:
-#   - Z-prefix salesmen carry 67-135 legacy parties each
-#   - SURESH NAIR has 558 SM3-only parties (catch-all)
-#   - CROSS SUPPLY has 311 SM1-only parties
-#   - CLOSED OUTLET / ONE DAY LIC are status markers
-FIELD_SALESMEN: frozenset[str] = frozenset({
-    # USL wine shops
-    "SHASHANK", "SACHIN KAMBLE",
-    # Diageo + BF wine shops
-    "AJAY", "DEEPAK PATIL",
-    # Permit Rooms (USL + Diageo)
-    "TULSIRAM", "SAURABH", "MIRAN DMELLO", "PRASHANT THORAT", "ATISH",
-    # UBL KW Beer
-    "ABID", "OMKAR PAWAR",
-    # KW Institution
-    "SHASHANK DESAI", "PRANAV", "DEEPAK PANGARE", "ANAND RAJ",
-    # PCMC Institution
-    "GAJENDRA DAS", "AMOL SATHE",
-    "RAHUL GONE",   # ERP spelling (DB typo for RAHUL GHONE — both work)
-    "RAHUL GHONE",
-})
+# The old FIELD_SALESMEN whitelist has also been removed. We now
+# identify "real field salesmen" by EXCLUSION (PLACEHOLDER_NAMES +
+# Z-prefix legacy = placeholder; everything else = field). This is
+# more robust because new hires don't need to be added to a list.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -546,8 +575,14 @@ def _fifo_unpaid(ledger: pd.DataFrame,
     unpaid["AgeBucket"]     = unpaid["AgeDays"].map(_age_bucket)
     unpaid["OverdueBucket"] = unpaid["OverdueBy"].map(_overdue_bucket)
 
+    # Channel = pure LicenseTypeID lookup. The previous code was
+    # overriding to "Cross-Supply (Institution)" when AcType3='130007',
+    # but Cross-Supply is a ROUTING flag (UBL sub-distribution path),
+    # not a channel — the same physical outlet can be wine shop +
+    # cross-supply simultaneously. Now Cross-Supply is reflected in
+    # the salesman attribution (BF / UBL split) but does NOT pollute
+    # the channel categorisation.
     unpaid["Channel"] = unpaid["LicenseTypeID"].map(CHANNEL_MAP).fillna("Other")
-    unpaid.loc[unpaid["AcType3ID"] == CROSS_SUPPLY_AC, "Channel"] = "Cross-Supply (Institution)"
 
     # Reconciliation: SUM(Remaining) per party should equal NetDr.
     # Log any mismatch > Rs1 to stderr — Cloud logs surface these.
@@ -566,42 +601,43 @@ def _fifo_unpaid(ledger: pd.DataFrame,
 
 
 def _attribute_salesman(row: pd.Series) -> str:
-    """Per-principal salesman attribution with **fallback chain**.
+    """Per-principal salesman attribution — **strict, no fallback chain**.
 
-    Each principal has a designated primary SM field, but many party
-    records in the ERP only populate one or two of the three SM fields.
-    Rather than dropping these into 'Unmapped' (the prior behavior),
-    we walk a priority list and return the first populated value.
+    Mirrors the sales-side rule used by sales_plan.py exactly, so the
+    same outlet/bill maps to the same salesman in collections as in
+    sales. A bill whose designated SM field is empty lands in
+    'Unmapped' (visible to the accountant) rather than being absorbed
+    by an unrelated placeholder name (the old fallback chain was
+    pulling 558 unrelated parties into SURESH NAIR's bucket).
 
-    Priority chain:
-      - Brown-Forman:
-          institution (AcType3='130007')  → SM3 → SM2 → SM1
-          wine shop                       → SM2 → SM1 → SM3
-      - United Spirits:                   → SM1 → SM2 → SM3
-      - Diageo:                           → SM2 → SM1 → SM3
-      - United Breweries:                 → SM3 → SM1 → SM2
-      - Adjustment / Other:               → SM1 → SM2 → SM3
-    Empty / null / whitespace-only values are skipped.
+    Rule:
+      USL bill (Principal='United Spirits')       → SM1 (SalesManID)
+      Diageo bill (Principal='Diageo')            → SM2 (SalesManID1)
+      UBL bill (Principal='United Breweries')     → SM3 (SalesManID2)
+      Brown-Forman wine shop (AcType3 != 130007)  → SM2
+      Brown-Forman Cross-Supply / institution     → SM3
+      Adjustment / Other / Non-sales row          → SM1 (party's primary)
+
+    Empty / blank-string returns '' (caller maps to 'Unmapped').
     """
     p = row.get("Principal", "")
-    if p == "Brown-Forman":
-        is_inst = row.get("AcType3ID", "") == CROSS_SUPPLY_AC
-        priority = (("SalesManID2", "SalesManID1", "SalesManID")
-                    if is_inst
-                    else ("SalesManID1", "SalesManID", "SalesManID2"))
-    elif p in SALESMAN_PRIORITY_BY_PRINCIPAL:
-        priority = SALESMAN_PRIORITY_BY_PRINCIPAL[p]
-    else:
-        # Adjustment / Other / Non-sales rows — try SM1 first
-        priority = ("SalesManID", "SalesManID1", "SalesManID2")
 
-    for col in priority:
-        sid = (row.get(col) or "")
-        if isinstance(sid, str):
-            sid = sid.strip()
-        if sid:
-            return sid
-    return ""
+    if p == "Brown-Forman":
+        # BF: SM2 for wine shops (default), SM3 for Cross-Supply
+        # institutions. Same logic as sales_plan.py BF subteam routing.
+        ac3 = (row.get("AcType3ID") or "")
+        field = "SalesManID2" if ac3 == CROSS_SUPPLY_AC else "SalesManID1"
+    elif p in PRINCIPAL_TO_SM_FIELD:
+        field = PRINCIPAL_TO_SM_FIELD[p]
+    else:
+        # Non-sales rows (JV, debit note, return cheque, etc.) — use
+        # the party's primary handler (SM1) as the default attribution.
+        field = "SalesManID"
+
+    sid = row.get(field) or ""
+    if isinstance(sid, str):
+        sid = sid.strip()
+    return sid  # empty string -> "Unmapped" downstream
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -733,11 +769,11 @@ def _section_by_channel(df: pd.DataFrame) -> None:
 def _section_by_salesman(df: pd.DataFrame) -> None:
     st.subheader("👥 Salesman collection efficiency")
     st.caption(
-        "Outstanding mapped via the per-principal handler-salesman field "
-        "with a **fallback chain** (Diageo: SM2 → SM1 → SM3; USL: SM1 → "
-        "SM2 → SM3; UBL: SM3 → SM1 → SM2; BF: split by AcType3 for "
-        "institution vs wine shop). Parties with all three SM fields "
-        "blank fall into 'Unmapped'."
+        "Outstanding mapped via the **strict per-principal SM field** "
+        "(USL: SM1; Diageo: SM2; UBL: SM3; BF: SM2 wine / SM3 Cross-"
+        "Supply) — same rule as sales attribution in sales_plan.py. "
+        "Placeholder names (SURESH NAIR / ROHIT LAKHAN / CROSS SUPPLY "
+        "/ Z-prefix ex-employees) are hidden by default."
     )
 
     sm_master = _load_salesman_master()
@@ -751,30 +787,33 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
     # Bucket every salesman name into one of three roles
     def _role(name: str) -> str:
         n = (name or "").strip().upper()
-        if n in FIELD_SALESMEN:
-            return "Field"
         if n == "UNMAPPED" or not n:
             return "Unmapped"
-        return "Placeholder"  # Z-prefix, CROSS SUPPLY, SURESH NAIR,
-                              # ROHIT LAKHAN, CLOSED OUTLET, ONE DAY LIC, etc.
+        if _is_placeholder_salesman(name):
+            return "Placeholder"
+        return "Field"
     work["SmRole"] = work["Salesman"].map(_role)
 
-    # Role-filter radio
+    # Role-filter radio — defaults to FIELD salesmen so placeholders
+    # don't pollute the operational view.
     view = st.radio(
         "Show",
-        ["Field salesmen only", "All names in ERP", "Unmapped / placeholder only"],
+        ["Field salesmen only", "All names in ERP", "Placeholders / Unmapped only"],
+        index=0,
         horizontal=True,
         key="dbt_sm_role",
         help=(
             "Field = real humans visiting outlets (Aabid, Ajay, Miran, …)\n"
-            "Placeholder = ex-employees / Cross-Supply / Suresh Nair-style "
-            "catch-alls (rarely actual collectors)\n"
-            "Unmapped = bills whose party has no SM field populated."
+            "Placeholder = ex-employees (Z-prefix), CROSS SUPPLY, "
+            "SURESH NAIR-style SM3 catch-alls, status markers like "
+            "CLOSED OUTLET / ONE DAY LIC. Their outstanding is "
+            "REAL, but the names don't represent collectable handlers.\n"
+            "Unmapped = bills whose party's designated SM field is blank."
         ),
     )
     if view == "Field salesmen only":
         view_df = work[work["SmRole"] == "Field"]
-    elif view == "Unmapped / placeholder only":
+    elif view == "Placeholders / Unmapped only":
         view_df = work[work["SmRole"].isin(["Unmapped", "Placeholder"])]
     else:
         view_df = work
