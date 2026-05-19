@@ -111,6 +111,20 @@ SALES_TT_SET: frozenset[int] = frozenset(SALES_TT)
 BS_SUNDRY_DEBTORS_CR: float = 56.0
 MANUAL_MATCHING_CR:   float = 59.06
 
+# Trader Association ban-reason decoder. AssoBan_Type is a 4-char code
+# on MsPartyMaster (BannedByAssoc='Y'). See _discover_debtors_v2.out
+# for the distribution: 571 OS6M / 28 LKDN / 18 CLDN / 1 Norm = 618
+# total banned debtors.
+BAN_REASON_MAP: dict[str, str] = {
+    "OS6M": "Outstanding > 6 months",
+    "LKDN": "Pre-LockDown legacy",
+    "CLDN": "Closed down",
+    "Norm": "Trade norms violation",
+}
+
+# Ghosted threshold (days without a sales bill).
+GHOST_DAYS: int = 90
+
 PRINCIPAL_MAP: dict[str, str] = {
     "C00025": "United Spirits",
     "C00039": "United Breweries",
@@ -255,7 +269,11 @@ def _load_ledger() -> pd.DataFrame:
             ISNULL(p.SalesManID1,   '')                        AS SalesManID1,
             ISNULL(p.SalesManID2,   '')                        AS SalesManID2,
             ISNULL(p.CreditDays,     0)                        AS PartyDefaultCD,
-            CAST(ISNULL(p.CDPercent, 0) AS float)              AS CDPercent
+            CAST(ISNULL(p.CDPercent, 0) AS float)              AS CDPercent,
+            ISNULL(p.BannedByAssoc,       '')                  AS BannedByAssoc,
+            ISNULL(p.AssoBan_Type,        '')                  AS AssoBan_Type,
+            ISNULL(p.AssoBan_Description, '')                  AS AssoBan_Description,
+            ISNULL(p.AssoBilling_YN,      '')                  AS AssoBilling_YN
         FROM TrVocDetail d
         JOIN TrVocHead   h ON h.TransTypeID = d.TransTypeID
                           AND h.VoucherNo   = d.VoucherNo
@@ -288,6 +306,80 @@ def _load_ledger() -> pd.DataFrame:
     df["Amount"]      = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
     # Ageing date — TPDate if present, else VoucherDate
     df["AgeingDate"]  = df["TPDate"].fillna(df["VoucherDate"])
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_cheque_returns_per_party() -> pd.DataFrame:
+    """Per-party cheque-return summary (TT=12 Return Cheques).
+
+    Returns columns:
+        PartyID, ReturnCount, TotalReturnedAmt, LastReturnDate,
+        DaysSinceLastReturn
+    Confirmed via _discover_debtors_v2.out Q6: 317 parties with
+    cumulative Rs22.73 Cr in cheque returns historically.
+    """
+    sql = """
+        SELECT
+            d.PartyID,
+            COUNT(DISTINCT CONCAT(h.TransTypeID, '-', h.VoucherNo))
+                                                AS ReturnCount,
+            SUM(CAST(d.Amount AS float))         AS TotalReturnedAmt,
+            CAST(MAX(h.VoucherDate) AS date)     AS LastReturnDate,
+            DATEDIFF(DAY, MAX(h.VoucherDate),
+                     CAST(GETDATE() AS date))    AS DaysSinceLastReturn
+        FROM TrVocHead   h
+        JOIN TrVocDetail d
+            ON d.TransTypeID = h.TransTypeID
+           AND d.VoucherNo   = h.VoucherNo
+           AND d.DrCrIndicator = 'D'
+           AND d.PartyID LIKE 'D%'
+        WHERE h.TransTypeID = 12
+          AND h.Cancelled   = 'N'
+        GROUP BY d.PartyID
+    """
+    df = run_query(sql)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "PartyID","ReturnCount","TotalReturnedAmt",
+            "LastReturnDate","DaysSinceLastReturn",
+        ])
+    df["TotalReturnedAmt"]    = pd.to_numeric(df["TotalReturnedAmt"], errors="coerce").fillna(0.0)
+    df["LastReturnDate"]      = pd.to_datetime(df["LastReturnDate"], errors="coerce")
+    df["DaysSinceLastReturn"] = pd.to_numeric(df["DaysSinceLastReturn"], errors="coerce").fillna(0).astype(int)
+    df["ReturnCount"]         = pd.to_numeric(df["ReturnCount"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_last_bill_per_party() -> pd.DataFrame:
+    """Per-party LAST sales-bill date (TTs in SALES_TT only).
+
+    Drives the "ghosted" detection (days since last bill >= 90 = ghosted).
+    Cancelled vouchers excluded.
+    """
+    tt_csv = ",".join(str(t) for t in SALES_TT)
+    sql = f"""
+        SELECT
+            d.PartyID,
+            CAST(MAX(h.VoucherDate) AS date)  AS LastBillDate,
+            DATEDIFF(DAY, MAX(h.VoucherDate),
+                     CAST(GETDATE() AS date)) AS DaysSinceLastBill
+        FROM TrVocHead   h
+        JOIN TrVocDetail d
+            ON d.TransTypeID = h.TransTypeID
+           AND d.VoucherNo   = h.VoucherNo
+           AND d.DrCrIndicator = 'D'
+           AND d.PartyID LIKE 'D%'
+        WHERE h.TransTypeID IN ({tt_csv})
+          AND h.Cancelled   = 'N'
+        GROUP BY d.PartyID
+    """
+    df = run_query(sql)
+    if df.empty:
+        return pd.DataFrame(columns=["PartyID","LastBillDate","DaysSinceLastBill"])
+    df["LastBillDate"]     = pd.to_datetime(df["LastBillDate"], errors="coerce")
+    df["DaysSinceLastBill"] = pd.to_numeric(df["DaysSinceLastBill"], errors="coerce").fillna(0).astype(int)
     return df
 
 
@@ -1458,9 +1550,352 @@ def _section_reconciliation(df: pd.DataFrame) -> None:
         f"Targets: **Sundry Debtors on Balance Sheet ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr** · "
         f"**Manual matching report ₹{MANUAL_MATCHING_CR:.2f} Cr**. "
         "Methodology: full-ledger FIFO across every non-cancelled "
-        f"Dr/Cr row per debtor, with post-dated TT={PDC_TT} Bank "
-        "Receipts (uncleared PDCs) excluded."
+        f"Dr/Cr row per debtor, with post-dated CR rows (uncleared "
+        f"PDCs) excluded — surfaced separately in the PDC pipeline section."
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW TIERED SECTIONS (Tier 1 / 2 / 3 of the redesigned layout)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ban_status_label(banned: str, ban_type: str) -> str:
+    """Return a one-line 'Ban Status' badge for table display."""
+    if (banned or "").strip().upper() == "Y":
+        reason = BAN_REASON_MAP.get((ban_type or "").strip(), "Banned")
+        return f"🛑 {reason}"
+    return "⚠️ Not banned"
+
+
+def _section_hero_compact(unpaid_df: pd.DataFrame,
+                          unmatched_df: pd.DataFrame) -> None:
+    """4-card compact snapshot. Replaces the verbose hero card."""
+    outstanding = float(unpaid_df["Remaining"].sum()) / 1e7 if not unpaid_df.empty else 0.0
+    unmatched   = float(unmatched_df["Excess"].sum()) / 1e7 if not unmatched_df.empty else 0.0
+    overdue     = float(unpaid_df.loc[unpaid_df["IsOverdue"], "Remaining"].sum()) / 1e7 \
+                  if not unpaid_df.empty else 0.0
+
+    if not unpaid_df.empty and unpaid_df["Remaining"].sum() > 0:
+        dso = (unpaid_df["AgeDays"] * unpaid_df["Remaining"]).sum() \
+              / unpaid_df["Remaining"].sum()
+    else:
+        dso = 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Outstanding", f"₹{outstanding:.2f} Cr")
+    c2.metric("Unmatched", f"₹{unmatched:.2f} Cr",
+              "Receipts > bills (180d, 1.20x, ≥₹1L)")
+    pct = (overdue / outstanding * 100) if outstanding else 0
+    c3.metric("Overdue", f"₹{overdue:.2f} Cr", f"{pct:.0f}% of total",
+              delta_color="inverse")
+    c4.metric("Avg DSO", f"{dso:.0f} days", "Weighted by Rs outstanding")
+
+
+def _section_dead_money(unpaid_df: pd.DataFrame,
+                        last_bill_df: pd.DataFrame) -> None:
+    """Outstanding from outlets that haven't billed in 90+ days."""
+    st.subheader("⚫ Dead Money — Parties Stopped Buying")
+    st.caption(
+        f"Outstanding from outlets that haven't billed in {GHOST_DAYS}+ "
+        "days. Hardest recovery — often a candidate for write-off or "
+        "Trader-Association escalation."
+    )
+
+    df = (
+        unpaid_df.groupby(
+            ["PartyID", "PartyName", "BannedByAssoc", "AssoBan_Type"],
+            observed=True,
+        )
+        .agg(Outstanding=("Remaining", "sum"),
+             OldestBillAge=("AgeDays", "max"))
+        .reset_index()
+    )
+    df = df.merge(
+        last_bill_df[["PartyID", "DaysSinceLastBill"]],
+        on="PartyID", how="left",
+    )
+    df["DaysSinceLastBill"] = df["DaysSinceLastBill"].fillna(9999)
+
+    ghosted = df[df["DaysSinceLastBill"] >= GHOST_DAYS] \
+        .sort_values("Outstanding", ascending=False)
+
+    if ghosted.empty:
+        st.success("✅ No ghosted parties with outstanding."); return
+
+    total_cr     = float(ghosted["Outstanding"].sum()) / 1e7
+    count        = int(len(ghosted))
+    banned_count = int((ghosted["BannedByAssoc"] == "Y").sum())
+    not_banned   = ghosted[ghosted["BannedByAssoc"] != "Y"]
+    not_banned_l = float(not_banned["Outstanding"].sum()) / 1e5
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Dead money total", f"₹{total_cr:.2f} Cr")
+    c2.metric("Parties", f"{count:,}",
+              f"{banned_count} TA-banned · {count - banned_count} not")
+    c3.metric("Not yet TA-banned",
+              f"₹{not_banned_l:,.1f} L",
+              "Escalate to association",
+              delta_color="inverse")
+
+    ghosted["Ban Status"]   = ghosted.apply(
+        lambda r: _ban_status_label(r["BannedByAssoc"], r["AssoBan_Type"]),
+        axis=1,
+    )
+    ghosted["Outstanding_L"] = ghosted["Outstanding"]      / 1e5
+    ghosted["DaysGhosted"]   = ghosted["DaysSinceLastBill"].astype(int)
+
+    disp = ghosted[["PartyName", "Ban Status", "Outstanding_L",
+                    "DaysGhosted", "OldestBillAge"]].rename(columns={
+        "PartyName": "Party",
+        "Outstanding_L": "Outstanding (₹L)",
+        "DaysGhosted": "Days No Bill",
+        "OldestBillAge": "Oldest Bill (d)",
+    })
+    styled = (
+        disp.style.format({
+            "Outstanding (₹L)": "₹{:.1f}",
+            "Days No Bill":     "{:.0f}",
+            "Oldest Bill (d)":  "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+
+    csv = ghosted[[
+        "PartyID", "PartyName", "BannedByAssoc", "AssoBan_Type",
+        "Outstanding", "DaysGhosted", "OldestBillAge",
+    ]].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download dead money list", csv,
+        f"dead_money_{date.today()}.csv", "text/csv",
+        key="dbt_dl_deadmoney",
+    )
+
+
+def _section_returns_ghosted(unpaid_df: pd.DataFrame,
+                             returns_df: pd.DataFrame,
+                             last_bill_df: pd.DataFrame) -> None:
+    """Worst case: bounced cheque + ghosted + still owing."""
+    st.subheader("🚨 Cheque Returned + Ghosted")
+    st.caption(
+        "Worst case: party issued a cheque (legal commitment), it "
+        "bounced, then stopped buying. Highest-priority recovery and "
+        "potential legal-action queue."
+    )
+
+    df = (
+        unpaid_df.groupby(
+            ["PartyID", "PartyName", "BannedByAssoc", "AssoBan_Type"],
+            observed=True,
+        )
+        .agg(Outstanding=("Remaining", "sum"))
+        .reset_index()
+    )
+    df = df.merge(returns_df, on="PartyID", how="inner")
+    df = df.merge(last_bill_df, on="PartyID", how="left")
+    df["DaysSinceLastBill"] = df["DaysSinceLastBill"].fillna(9999)
+
+    worst = df[df["DaysSinceLastBill"] >= GHOST_DAYS] \
+        .sort_values("Outstanding", ascending=False)
+
+    if worst.empty:
+        st.success("✅ No worst-case parties (bounced + ghosted)."); return
+
+    total_l = float(worst["Outstanding"].sum()) / 1e5
+
+    c1, c2 = st.columns(2)
+    c1.metric("Legal action queue", f"{len(worst):,} parties")
+    c2.metric("Outstanding", f"₹{total_l:.1f} L")
+
+    worst["Outstanding_L"] = worst["Outstanding"]       / 1e5
+    worst["Returned_L"]    = worst["TotalReturnedAmt"]  / 1e5
+    worst["Ban Status"]    = worst.apply(
+        lambda r: _ban_status_label(r["BannedByAssoc"], r["AssoBan_Type"]),
+        axis=1,
+    )
+
+    disp = worst[["PartyName", "Ban Status", "Outstanding_L",
+                  "Returned_L", "ReturnCount",
+                  "DaysSinceLastBill"]].rename(columns={
+        "PartyName": "Party",
+        "Outstanding_L": "Outstanding (₹L)",
+        "Returned_L":    "Returned (₹L)",
+        "ReturnCount":   "# Returns",
+        "DaysSinceLastBill": "Ghosted (d)",
+    })
+    styled = (
+        disp.style.format({
+            "Outstanding (₹L)": "₹{:.1f}",
+            "Returned (₹L)":    "₹{:.1f}",
+            "# Returns":        "{:.0f}",
+            "Ghosted (d)":      "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=350)
+
+
+def _section_active_bouncers(unpaid_df: pd.DataFrame,
+                             returns_df: pd.DataFrame,
+                             last_bill_df: pd.DataFrame) -> None:
+    """Bounced but still buying — recoverable via relationship."""
+    st.subheader("⚠️ Active Bouncers — Cheque Returned but Still Buying")
+    st.caption(
+        "Party's cheque bounced but they're still dealing with us. "
+        "Recoverable through relationship — top operational priority "
+        "for the sales team."
+    )
+
+    df = (
+        unpaid_df.groupby(["PartyID", "PartyName", "BannedByAssoc"],
+                          observed=True)
+        .agg(Outstanding=("Remaining", "sum"),
+             OldestBillAge=("AgeDays", "max"))
+        .reset_index()
+    )
+    df = df.merge(returns_df, on="PartyID", how="inner")
+    df = df.merge(last_bill_df, on="PartyID", how="left")
+    df["DaysSinceLastBill"] = df["DaysSinceLastBill"].fillna(9999)
+
+    active = df[df["DaysSinceLastBill"] < GHOST_DAYS] \
+        .sort_values("TotalReturnedAmt", ascending=False).head(50)
+
+    if active.empty:
+        st.success("✅ No active bouncers."); return
+
+    total_ret = float(active["TotalReturnedAmt"].sum()) / 1e7
+    total_out = float(active["Outstanding"].sum())       / 1e7
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Parties", f"{len(active):,}")
+    c2.metric("Total cheques returned", f"₹{total_ret:.2f} Cr")
+    c3.metric("Current outstanding",    f"₹{total_out:.2f} Cr")
+
+    active["Returned_L"]    = active["TotalReturnedAmt"] / 1e5
+    active["Outstanding_L"] = active["Outstanding"]      / 1e5
+
+    disp = active[["PartyName", "Returned_L", "ReturnCount",
+                   "DaysSinceLastReturn", "Outstanding_L",
+                   "OldestBillAge"]].rename(columns={
+        "PartyName": "Party",
+        "Returned_L": "Returned (₹L)",
+        "ReturnCount": "# Returns",
+        "DaysSinceLastReturn": "Last Return",
+        "Outstanding_L": "Outstanding (₹L)",
+        "OldestBillAge": "Oldest Unpaid (d)",
+    })
+    styled = (
+        disp.style.format({
+            "Returned (₹L)":     "₹{:.1f}",
+            "# Returns":         "{:.0f}",
+            "Last Return":       "{:.0f}d ago",
+            "Outstanding (₹L)":  "₹{:.1f}",
+            "Oldest Unpaid (d)": "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+
+
+def _section_billing_risk(unpaid_df: pd.DataFrame) -> None:
+    """Material outstanding but NOT TA-banned — internal hold candidate."""
+    st.subheader("⚠️ Billing Risk — Outstanding Parties NOT Banned")
+    st.caption(
+        "Material outstanding (>₹1 L, oldest bill >60 days) but "
+        "Trader-Association hasn't banned them yet. Billing department "
+        "can still raise invoices — internal hold required, plus "
+        "escalate to TA."
+    )
+
+    df = (
+        unpaid_df.groupby(["PartyID", "PartyName", "BannedByAssoc"],
+                          observed=True)
+        .agg(Outstanding=("Remaining", "sum"),
+             OldestBillAge=("AgeDays", "max"))
+        .reset_index()
+    )
+    risk = df[
+        (df["BannedByAssoc"] != "Y")
+        & (df["OldestBillAge"] > 60)
+        & (df["Outstanding"]  > 100_000)
+    ].sort_values("Outstanding", ascending=False).head(50)
+
+    if risk.empty:
+        st.success("✅ All overdue parties already TA-banned."); return
+
+    total = float(risk["Outstanding"].sum()) / 1e7
+    c1, c2 = st.columns(2)
+    c1.metric("Parties at risk", f"{len(risk):,}")
+    c2.metric("Total exposure", f"₹{total:.2f} Cr",
+              "Escalate to TA or internal hold",
+              delta_color="inverse")
+
+    risk["Outstanding_L"] = risk["Outstanding"] / 1e5
+    disp = risk[["PartyName", "Outstanding_L", "OldestBillAge"]].rename(columns={
+        "PartyName":     "Party",
+        "Outstanding_L": "Outstanding (₹L)",
+        "OldestBillAge": "Oldest Bill (d)",
+    })
+    styled = (
+        disp.style.format({
+            "Outstanding (₹L)": "₹{:.1f}",
+            "Oldest Bill (d)":  "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+
+
+def _section_banned_register(unpaid_df: pd.DataFrame) -> None:
+    """Full TA banned register grouped by reason + per-party list."""
+    df = (
+        unpaid_df.groupby(["PartyID", "PartyName", "BannedByAssoc",
+                           "AssoBan_Type"], observed=True)
+        .agg(Outstanding=("Remaining", "sum"),
+             OldestBillAge=("AgeDays", "max"))
+        .reset_index()
+    )
+    banned = df[df["BannedByAssoc"] == "Y"] \
+        .sort_values("Outstanding", ascending=False)
+
+    if banned.empty:
+        st.info("No banned parties with outstanding."); return
+
+    by_reason = (
+        banned.groupby("AssoBan_Type", observed=True)
+              .agg(Parties=("PartyID", "nunique"),
+                   Outstanding=("Outstanding", "sum"))
+              .reset_index()
+    )
+    by_reason["Outstanding_Cr"] = by_reason["Outstanding"] / 1e7
+    by_reason["Reason"]         = by_reason["AssoBan_Type"].map(BAN_REASON_MAP) \
+                                                          .fillna("—")
+    by_reason = by_reason.sort_values("Outstanding", ascending=False)
+
+    st.markdown("**Summary by ban reason:**")
+    summary_disp = by_reason[["AssoBan_Type", "Reason",
+                              "Parties", "Outstanding_Cr"]]
+    st.dataframe(
+        summary_disp.style.format({
+            "Outstanding_Cr": "₹{:.2f} Cr",
+            "Parties":        "{:.0f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+
+    banned["Outstanding_L"] = banned["Outstanding"] / 1e5
+
+    st.markdown("**Full banned register:**")
+    disp = banned[["PartyName", "AssoBan_Type", "Outstanding_L",
+                   "OldestBillAge"]].rename(columns={
+        "PartyName":      "Party",
+        "AssoBan_Type":   "Reason",
+        "Outstanding_L":  "Outstanding (₹L)",
+        "OldestBillAge":  "Oldest Bill (d)",
+    })
+    styled = (
+        disp.style.format({
+            "Outstanding (₹L)": "₹{:.1f}",
+            "Oldest Bill (d)":  "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1470,26 +1905,38 @@ def _section_reconciliation(df: pd.DataFrame) -> None:
 def render() -> None:
     st.title("📊 Debtors Ageing")
     st.caption(
-        "Bill-wise FIFO ageing with brand-specific credit terms — "
-        "**McDowell's 15d · Cash-Discount bills 17d · others 40d**. "
-        "Ageing is from **TP Date** (excise Transport-Permit, the legal "
-        "credit-period start) with fallback to VoucherDate. Refresh "
-        "from the header to bust cache after new receipts."
+        "Bill-wise FIFO ageing with Trader-Association integration. "
+        "Layout is urgency-driven: **Critical** (Dead Money + Bounced "
+        "+ Ghosted) is always visible; **Reference** sections (banned "
+        "register, salesman board, ageing buckets, gap inspection, "
+        "etc.) live in collapsible expanders at the bottom."
     )
 
-    with st.spinner("Loading full debtor ledger (may take 30-60 s on first load)…"):
-        ledger = _load_ledger()
-
     today = pd.Timestamp.today().normalize()
+    with st.spinner("Loading debtor ledger + reference tables…"):
+        ledger        = _load_ledger()
+        returns_df    = _load_cheque_returns_per_party()
+        last_bill_df  = _load_last_bill_per_party()
     with st.spinner("Computing party-level FIFO ageing…"):
-        unpaid = _fifo_unpaid(ledger, today)
+        unpaid       = _fifo_unpaid(ledger, today)
+        unmatched_df = _load_unmatched_receipts(window_days=180)
+    # Apply the same default filter the unmatched section uses (ratio
+    # 1.20, min Rs1L excess) so the hero KPI matches what the operator
+    # sees in the dedicated section.
+    if not unmatched_df.empty:
+        unmatched_df = unmatched_df[
+            (unmatched_df["Bills"] > 0)
+            & (unmatched_df["Receipts"] >= unmatched_df["Bills"] * 1.20)
+            & (unmatched_df["Excess"] >= 1e5)
+        ].copy()
 
-    # Telemetry to Streamlit Cloud logs — same pattern as sales_plan.py
+    # Telemetry to Streamlit Cloud logs
     print(
         f"[debtors] ledger_rows={len(ledger):,} unpaid_lines={len(unpaid):,} "
         f"parties={unpaid['PartyID'].nunique() if not unpaid.empty else 0} "
         f"total_outstanding_cr="
-        f"{(float(unpaid['Remaining'].sum())/1e7) if not unpaid.empty else 0:.2f}",
+        f"{(float(unpaid['Remaining'].sum())/1e7) if not unpaid.empty else 0:.2f} "
+        f"banned_parties={int((unpaid['BannedByAssoc']=='Y').groupby(unpaid['PartyID']).max().sum()) if not unpaid.empty else 0}",
         file=sys.stderr,
     )
 
@@ -1497,25 +1944,60 @@ def render() -> None:
         st.success("🎉 No outstanding debtor balances. All bills paid.")
         return
 
+    # ─────────── TIER 1: CRITICAL ───────────
     safe_section("Reconciliation",    _section_reconciliation, unpaid)
-    safe_section("Spot check",        _section_spot_check,     unpaid)
     st.divider()
-    safe_section("Gap inspection",    _section_gap_inspection, unpaid)
+    safe_section("Dead Money",        _section_dead_money,
+                 unpaid, last_bill_df)
     st.divider()
-    safe_section("Hero KPIs",         _section_hero,           unpaid)
+    safe_section("Bounced + Ghosted", _section_returns_ghosted,
+                 unpaid, returns_df, last_bill_df)
     st.divider()
-    safe_section("Ageing buckets",    _section_ageing_buckets, unpaid)
+
+    # ─────────── TIER 2: URGENT ───────────
+    safe_section("Active Bouncers",   _section_active_bouncers,
+                 unpaid, returns_df, last_bill_df)
     st.divider()
-    safe_section("By principal",      _section_by_principal,   unpaid)
-    safe_section("By channel",        _section_by_channel,     unpaid)
+    safe_section("Billing Risk",      _section_billing_risk, unpaid)
     st.divider()
-    safe_section("By salesman",       _section_by_salesman,    unpaid)
+
+    # ─────────── TIER 3: OPERATIONAL ───────────
+    safe_section("Snapshot",          _section_hero_compact,
+                 unpaid, unmatched_df)
+    safe_section("PDC Pipeline",      _section_pdc_pipeline, today)
     st.divider()
-    safe_section("Party risk",        _section_party_risk,     unpaid)
-    st.divider()
-    safe_section("Unmatched follow-up", _section_unmatched_followup)
-    st.divider()
-    safe_section("Renegotiation",     _section_renegotiate,    unpaid)
-    st.divider()
-    safe_section("PDC pipeline",      _section_pdc_pipeline,   today)
-    safe_section("Sanity check",      _section_sanity,         unpaid)
+
+    # ─────────── TIER 4: REFERENCE (collapsed) ───────────
+    with st.expander("📋 Trader Association Banned Register", expanded=False):
+        safe_section("TA Banned Register", _section_banned_register, unpaid)
+
+    with st.expander("🚨 Party Risk (Hold / Renegotiate / Watch / Good)",
+                     expanded=False):
+        safe_section("Party risk",     _section_party_risk,   unpaid)
+
+    with st.expander("👥 Salesman Collection Efficiency", expanded=False):
+        safe_section("By Salesman",    _section_by_salesman,  unpaid)
+
+    with st.expander("🏷️ By Principal / Channel", expanded=False):
+        safe_section("By Principal",   _section_by_principal, unpaid)
+        safe_section("By Channel",     _section_by_channel,   unpaid)
+
+    with st.expander("📊 Ageing Buckets Detail", expanded=False):
+        safe_section("Ageing Buckets", _section_ageing_buckets, unpaid)
+
+    with st.expander("🔍 Gap Inspection (write-offs, advances, anomalies)",
+                     expanded=False):
+        safe_section("Gap Inspection", _section_gap_inspection, unpaid)
+
+    with st.expander("💰 Unmatched Receipts Follow-up", expanded=False):
+        safe_section("Unmatched Follow-up", _section_unmatched_followup)
+
+    with st.expander("🔄 Renegotiation Candidates", expanded=False):
+        safe_section("Renegotiation",  _section_renegotiate,  unpaid)
+
+    with st.expander("✅ Spot Check (5 known high-balance parties)",
+                     expanded=False):
+        safe_section("Spot Check",     _section_spot_check,   unpaid)
+
+    with st.expander("🔧 Sanity Check vs Balance Sheet", expanded=False):
+        safe_section("Sanity Check",   _section_sanity,       unpaid)
