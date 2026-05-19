@@ -258,6 +258,28 @@ KNOWN_FIELD_SALESMEN: frozenset[str] = frozenset({
 })
 
 
+# ── Wine-shop pair fallback for blank SM2 in MsPartyMaster ──────────────
+# KWPL Wine Shop teams work in pairs sharing the same physical outlets,
+# but principal-split: USL salesman in SM1, Diageo+BF salesman in SM2.
+# Diagnostic (_diag_wine_pair.out) confirmed that 115 wine-shop parties
+# have a populated SM1 (Sachin or Shashank) but a BLANK SM2 — so any
+# Diageo or BF-wine-shop bill at one of those parties currently fails
+# to attribute to the right person.
+#
+#   Pair A: Sachin Kamble (000012, USL/SM1) + Ajay (000030, Diageo+BF/SM2)
+#           62 parties correctly paired · 80 parties SM2 blank
+#   Pair B: Shashank (000014, USL/SM1) + Deepak Patil (000004, Diageo+BF/SM2)
+#           66 parties correctly paired · 35 parties SM2 blank
+#
+# When SM2 is blank, infer the Diageo+BF pair-mate from SM1. Safe
+# because no party in the audit had a different (wrong) person in SM2
+# when populated — the field is either correct or blank.
+WINE_PAIR_FALLBACK: dict[str, str] = {
+    "000012": "000030",   # Sachin Kamble (SM1) -> Ajay (Diageo+BF)
+    "000014": "000004",   # Shashank (SM1)      -> Deepak Patil (Diageo+BF)
+}
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def _field_salesman_ids() -> frozenset[str]:
     """Cached: the set of SalesManIDs whose FullName is in
@@ -654,21 +676,12 @@ def _fifo_unpaid(ledger: pd.DataFrame,
 
 def _attribute_salesman(row: pd.Series,
                         field_sm_ids: frozenset[str] | None = None) -> str:
-    """Per-principal **smart cascade** attribution.
+    """Per-principal **smart cascade** attribution + wine-pair fallback.
 
     For each bill we walk the SM-field priority order designated for
     the bill's principal and return the FIRST field whose SalesManID
     resolves to a known field salesman. Placeholders, Z-legacy IDs
     and blanks are skipped — they're transparent to the cascade.
-
-    Rationale: the strict rule (only check the designated field)
-    leaves many bills 'Unmapped' because party-master records often
-    have only one of the three SM fields populated. The fallback
-    chain (try every field in any order) used to absorb parties into
-    SURESH NAIR (the SM3 catch-all). The smart cascade combines the
-    two: keep the principal-driven field order, but reject anything
-    that's not a field salesman so the cascade naturally skips
-    placeholders.
 
     Field priority by principal:
       USL bill (Principal='United Spirits')       → SM1 → SM2 → SM3
@@ -678,11 +691,16 @@ def _attribute_salesman(row: pd.Series,
       BF Cross-Supply / institution                → SM3 → SM2 → SM1
       Adjustment / Other / Non-sales row           → SM1 → SM2 → SM3
 
+    **Wine-pair fallback** (Diageo and BF-wine-shop only): if SM2 is
+    blank but SM1 is a known wine-shop USL salesman in
+    WINE_PAIR_FALLBACK (Sachin Kamble or Shashank), the Diageo+BF
+    pair-mate (Ajay or Deepak Patil) is inferred from SM1. Without
+    this, 115 wine-shop parties whose SM2 is blank would mis-attribute
+    Diageo/BF bills to Sachin/Shashank (USL salesmen) or Unmapped.
+
     `field_sm_ids` is the set of SalesManIDs whose FullName is in
     KNOWN_FIELD_SALESMEN. Passed in by the caller (cached via
     `_field_salesman_ids()`) so per-row apply doesn't re-build it.
-    If omitted, the function falls back to looking it up — slower
-    but safe for standalone calls.
 
     Returns the SalesManID of the first field salesman found, or ''
     (caller maps '' → 'Unmapped').
@@ -691,13 +709,18 @@ def _attribute_salesman(row: pd.Series,
         field_sm_ids = _field_salesman_ids()
 
     p = row.get("Principal", "")
+    apply_wine_pair = False  # only Diageo + BF wine shop trigger it
+
     if p == "Brown-Forman":
         ac3 = (row.get("AcType3ID") or "")
-        order = (("SalesManID2", "SalesManID1", "SalesManID")
-                 if ac3 == CROSS_SUPPLY_AC
-                 else ("SalesManID1", "SalesManID", "SalesManID2"))
+        if ac3 == CROSS_SUPPLY_AC:
+            order = ("SalesManID2", "SalesManID1", "SalesManID")
+        else:
+            order = ("SalesManID1", "SalesManID", "SalesManID2")
+            apply_wine_pair = True
     elif p == "Diageo":
         order = ("SalesManID1", "SalesManID", "SalesManID2")
+        apply_wine_pair = True
     elif p == "United Spirits":
         order = ("SalesManID",  "SalesManID1", "SalesManID2")
     elif p == "United Breweries":
@@ -705,7 +728,25 @@ def _attribute_salesman(row: pd.Series,
     else:
         order = ("SalesManID",  "SalesManID1", "SalesManID2")
 
-    for col in order:
+    # 1) Try the designated (highest-priority) field first.
+    designated = row.get(order[0]) or ""
+    if isinstance(designated, str):
+        designated = designated.strip()
+    if designated and designated in field_sm_ids:
+        return designated
+
+    # 2) Wine-pair fallback. Only fires for Diageo / BF-wine when the
+    #    designated SM2 is blank or non-field, and SM1 = Sachin/Shashank.
+    if apply_wine_pair:
+        sm1 = row.get("SalesManID") or ""
+        if isinstance(sm1, str):
+            sm1 = sm1.strip()
+        partner = WINE_PAIR_FALLBACK.get(sm1)
+        if partner and partner in field_sm_ids:
+            return partner
+
+    # 3) Cascade through the remaining fields in priority order.
+    for col in order[1:]:
         sid = row.get(col) or ""
         if isinstance(sid, str):
             sid = sid.strip()
