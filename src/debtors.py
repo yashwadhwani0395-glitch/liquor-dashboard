@@ -208,16 +208,66 @@ PRINCIPAL_TO_SM_FIELD: dict[str, str] = {
 #    institutions have SM1 populated (Miran Dmello routes them) but SM2
 #    blank, etc. So we try the principal's preferred field first, then
 #    fall back to SM1 / SM2 / SM3 in order. Empty / null are skipped.
-# Note: the old SALESMAN_PRIORITY_BY_PRINCIPAL fallback chain has been
-# REMOVED. We now use the strict principal-driven rule defined above in
-# PRINCIPAL_TO_SM_FIELD — this mirrors the sales-side attribution in
-# sales_plan.py exactly so collections and sales agree on who owns
-# each outlet.
+# ── Known field-salesman whitelist ──────────────────────────────────────
+# Real humans who physically visit outlets. Discovery on every name in
+# MsSalesmanMaster (see _diag_full_sm.out) classified each:
+#   - 17 names are field salesmen (this whitelist)
+#   - 5 are placeholders (in PLACEHOLDER_NAMES)
+#   - 8 are Z-prefix ex-employees
+#   - 2 are unclassified (RAJESH, ROHIT) — kept OUT of whitelist
+#     pending owner confirmation (see commit message).
 #
-# The old FIELD_SALESMEN whitelist has also been removed. We now
-# identify "real field salesmen" by EXCLUSION (PLACEHOLDER_NAMES +
-# Z-prefix legacy = placeholder; everything else = field). This is
-# more robust because new hires don't need to be added to a list.
+# Names match `MsSalesmanMaster.FullName` exactly after strip().upper()
+# — including DB quirks like "ABID" (not "AABID") and "RAHUL GONE" (the
+# spelling used in the ERP, instead of "RAHUL GHONE"). Both variants
+# are included so either matches.
+#
+# Used by the smart-cascade attribution in _attribute_salesman: a bill
+# walks the principal's preferred SM-field order and stops at the
+# FIRST field whose SalesManID resolves to a known field salesman.
+# Empty / placeholder / Z-legacy IDs are skipped, so blank SM2 for a
+# Diageo institution party correctly cascades to the SM1 if that SM1
+# is a field salesman (e.g. MIRAN DMELLO for Permit Rooms).
+KNOWN_FIELD_SALESMEN: frozenset[str] = frozenset({
+    # Wine Shops (FL-II)
+    "SHASHANK", "SACHIN KAMBLE",           # USL Wine Shops (SM1 channel)
+    "AJAY", "DEEPAK PATIL",                # Diageo + BF Wine Shops (SM2 channel)
+
+    # Permit Rooms (FL-III) — handle both USL and Diageo
+    "TULSIRAM", "SAURABH", "MIRAN DMELLO",
+    "PRASHANT THORAT", "ATISH",
+    "PIYUSH ARORA",                        # Hinjewadi/Wakad/Mulshi PCMC-west
+                                           # Permit Rooms (Diageo, SM3-slot;
+                                           # 75 outlets, all LicenseType
+                                           # 180002 + AcType3 130002)
+
+    # UBL KW Beer (FL-BR-II)
+    "ABID", "AABID", "OMKAR PAWAR",        # both spellings of ABID/AABID
+
+    # KW Institution (UBL + BF, NOT Diageo)
+    "SHASHANK DESAI", "PRANAV",
+    "DEEPAK PANGARE", "ANAND RAJ",         # labels exist in sales_plan
+                                           # PRINCIPAL_TEAMS even if no
+                                           # ERP-side SalesManID
+
+    # PCMC Institution
+    "GAJENDRA DAS", "AMOL SATHE",
+    "RAHUL GHONE", "RAHUL GONE",           # both spellings (ERP has "GONE")
+})
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _field_salesman_ids() -> frozenset[str]:
+    """Cached: the set of SalesManIDs whose FullName is in
+    KNOWN_FIELD_SALESMEN. Built once per session (24h TTL) so
+    per-row attribution stays fast."""
+    df = _load_salesman_master()
+    if df.empty:
+        return frozenset()
+    df = df.copy()
+    df["NameUpper"] = df["FullName"].astype(str).str.strip().str.upper()
+    keep = df["NameUpper"].isin(KNOWN_FIELD_SALESMEN)
+    return frozenset(df.loc[keep, "SalesManID"].astype(str).str.strip())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -600,44 +650,66 @@ def _fifo_unpaid(ledger: pd.DataFrame,
     return unpaid.drop(columns=["CumDr"], errors="ignore")
 
 
-def _attribute_salesman(row: pd.Series) -> str:
-    """Per-principal salesman attribution — **strict, no fallback chain**.
+def _attribute_salesman(row: pd.Series,
+                        field_sm_ids: frozenset[str] | None = None) -> str:
+    """Per-principal **smart cascade** attribution.
 
-    Mirrors the sales-side rule used by sales_plan.py exactly, so the
-    same outlet/bill maps to the same salesman in collections as in
-    sales. A bill whose designated SM field is empty lands in
-    'Unmapped' (visible to the accountant) rather than being absorbed
-    by an unrelated placeholder name (the old fallback chain was
-    pulling 558 unrelated parties into SURESH NAIR's bucket).
+    For each bill we walk the SM-field priority order designated for
+    the bill's principal and return the FIRST field whose SalesManID
+    resolves to a known field salesman. Placeholders, Z-legacy IDs
+    and blanks are skipped — they're transparent to the cascade.
 
-    Rule:
-      USL bill (Principal='United Spirits')       → SM1 (SalesManID)
-      Diageo bill (Principal='Diageo')            → SM2 (SalesManID1)
-      UBL bill (Principal='United Breweries')     → SM3 (SalesManID2)
-      Brown-Forman wine shop (AcType3 != 130007)  → SM2
-      Brown-Forman Cross-Supply / institution     → SM3
-      Adjustment / Other / Non-sales row          → SM1 (party's primary)
+    Rationale: the strict rule (only check the designated field)
+    leaves many bills 'Unmapped' because party-master records often
+    have only one of the three SM fields populated. The fallback
+    chain (try every field in any order) used to absorb parties into
+    SURESH NAIR (the SM3 catch-all). The smart cascade combines the
+    two: keep the principal-driven field order, but reject anything
+    that's not a field salesman so the cascade naturally skips
+    placeholders.
 
-    Empty / blank-string returns '' (caller maps to 'Unmapped').
+    Field priority by principal:
+      USL bill (Principal='United Spirits')       → SM1 → SM2 → SM3
+      Diageo bill                                  → SM2 → SM1 → SM3
+      UBL bill                                     → SM3 → SM1 → SM2
+      BF wine shop (AcType3 != 130007)             → SM2 → SM1 → SM3
+      BF Cross-Supply / institution                → SM3 → SM2 → SM1
+      Adjustment / Other / Non-sales row           → SM1 → SM2 → SM3
+
+    `field_sm_ids` is the set of SalesManIDs whose FullName is in
+    KNOWN_FIELD_SALESMEN. Passed in by the caller (cached via
+    `_field_salesman_ids()`) so per-row apply doesn't re-build it.
+    If omitted, the function falls back to looking it up — slower
+    but safe for standalone calls.
+
+    Returns the SalesManID of the first field salesman found, or ''
+    (caller maps '' → 'Unmapped').
     """
+    if field_sm_ids is None:
+        field_sm_ids = _field_salesman_ids()
+
     p = row.get("Principal", "")
-
     if p == "Brown-Forman":
-        # BF: SM2 for wine shops (default), SM3 for Cross-Supply
-        # institutions. Same logic as sales_plan.py BF subteam routing.
         ac3 = (row.get("AcType3ID") or "")
-        field = "SalesManID2" if ac3 == CROSS_SUPPLY_AC else "SalesManID1"
-    elif p in PRINCIPAL_TO_SM_FIELD:
-        field = PRINCIPAL_TO_SM_FIELD[p]
+        order = (("SalesManID2", "SalesManID1", "SalesManID")
+                 if ac3 == CROSS_SUPPLY_AC
+                 else ("SalesManID1", "SalesManID", "SalesManID2"))
+    elif p == "Diageo":
+        order = ("SalesManID1", "SalesManID", "SalesManID2")
+    elif p == "United Spirits":
+        order = ("SalesManID",  "SalesManID1", "SalesManID2")
+    elif p == "United Breweries":
+        order = ("SalesManID2", "SalesManID",  "SalesManID1")
     else:
-        # Non-sales rows (JV, debit note, return cheque, etc.) — use
-        # the party's primary handler (SM1) as the default attribution.
-        field = "SalesManID"
+        order = ("SalesManID",  "SalesManID1", "SalesManID2")
 
-    sid = row.get(field) or ""
-    if isinstance(sid, str):
-        sid = sid.strip()
-    return sid  # empty string -> "Unmapped" downstream
+    for col in order:
+        sid = row.get(col) or ""
+        if isinstance(sid, str):
+            sid = sid.strip()
+        if sid and sid in field_sm_ids:
+            return sid
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -776,11 +848,14 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
         "/ Z-prefix ex-employees) are hidden by default."
     )
 
-    sm_master = _load_salesman_master()
-    sm_lookup = dict(zip(sm_master["SalesManID"], sm_master["FullName"]))
+    sm_master    = _load_salesman_master()
+    sm_lookup    = dict(zip(sm_master["SalesManID"], sm_master["FullName"]))
+    field_sm_ids = _field_salesman_ids()  # pre-built once for speed
 
     work = df.copy()
-    work["SalesmanID"] = work.apply(_attribute_salesman, axis=1)
+    work["SalesmanID"] = work.apply(
+        lambda r: _attribute_salesman(r, field_sm_ids), axis=1,
+    )
     work["Salesman"]   = work["SalesmanID"].map(sm_lookup).fillna("")
     work.loc[work["Salesman"].str.strip() == "", "Salesman"] = "Unmapped"
 
