@@ -157,15 +157,17 @@ CHANNEL_MAP: dict[str, str] = {
 CROSS_SUPPLY_AC = "130007"
 
 # Placeholder salesman names in MsSalesmanMaster that are NOT real
-# field humans. Discovered via _diag_attribution.out:
+# field humans (current as of team transition May 2026):
 #   SURESH NAIR    (1 / 0 / 558 in SM1/SM2/SM3) — catch-all SM3 dump
-#   ROHIT LAKHAN   (0 / 0 / 175) — SM3 placeholder
 #   CROSS SUPPLY   (311 / 0 / 7) — Cross-supply marker, not a person
 #   CLOSED OUTLET  — status marker
 #   ONE DAY LIC    — status marker
 #   Z * (multiple) — ex-employees (Z RAJENDRA PRASAD, etc.)
+# Note: ROHIT LAKHAN moved OUT of this set in May 2026 — he was
+# reactivated as a KW Institution salesman (SM ID 000038, replacing
+# Deepak Pangare who left). He's now in KNOWN_FIELD_SALESMEN.
 PLACEHOLDER_NAMES: frozenset[str] = frozenset({
-    "SURESH NAIR", "ROHIT LAKHAN", "CROSS SUPPLY",
+    "SURESH NAIR", "CROSS SUPPLY",
     "CLOSED OUTLET", "ONE DAY LIC",
     # Trailing-period variants seen in sample data
     "CLOSED OUTLET.", "ONE DAY LIC.",
@@ -229,30 +231,30 @@ PRINCIPAL_TO_SM_FIELD: dict[str, str] = {
 # Diageo institution party correctly cascades to the SM1 if that SM1
 # is a field salesman (e.g. MIRAN DMELLO for Permit Rooms).
 KNOWN_FIELD_SALESMEN: frozenset[str] = frozenset({
-    # Wine Shops (FL-II)
-    "SHASHANK", "SACHIN KAMBLE",           # USL Wine Shops (SM1 channel)
-    "AJAY", "DEEPAK PATIL",                # Diageo + BF Wine Shops (SM2 channel)
+    # ── Wine Shops (FL-II) ─────────────────────────────────────────────
+    "SHASHANK", "SACHIN KAMBLE",           # USL Wine Shops (SM1)
+    "AJAY", "DEEPAK PATIL",                # Diageo + BF Wine Shops (SM2)
 
-    # Permit Rooms (FL-III) — handle both USL and Diageo
+    # ── Permit Rooms (FL-III) — handle both USL and Diageo ────────────
     "TULSIRAM", "SAURABH", "MIRAN DMELLO",
-    "PRASHANT THORAT", "ATISH",
-    "PIYUSH ARORA",                        # Hinjewadi/Wakad/Mulshi PCMC-west
-                                           # Permit Rooms (Diageo, SM3-slot;
-                                           # 75 outlets, all LicenseType
-                                           # 180002 + AcType3 130002)
+    "PRASHANT THORAT", "ATISH",            # 5 people post-transition
+                                           # (Rohit Lakhan moved to KW Inst)
 
-    # UBL KW Beer (FL-BR-II)
-    "ABID", "AABID", "OMKAR PAWAR",        # both spellings of ABID/AABID
+    # ── UBL KW Beer (FL-BR-II) ─────────────────────────────────────────
+    "ABID", "AABID", "OMKAR PAWAR",        # both ABID spellings, just in case
 
-    # KW Institution (UBL + BF, NOT Diageo)
+    # ── KW Institution (UBL + BF, NOT Diageo) ─────────────────────────
+    # Team transition May 2026: Anand Raj + Deepak Pangare LEFT;
+    # ROHIT LAKHAN reactivated and RAHUL GHONE promoted from PCMC.
     "SHASHANK DESAI", "PRANAV",
-    "DEEPAK PANGARE", "ANAND RAJ",         # labels exist in sales_plan
-                                           # PRINCIPAL_TEAMS even if no
-                                           # ERP-side SalesManID
+    "RAHUL GHONE", "RAHUL GONE",           # ERP has the "GONE" spelling
+    "ROHIT LAKHAN",                        # reactivated May 2026, KW Inst SM3
 
-    # PCMC Institution
+    # ── PCMC Institution ──────────────────────────────────────────────
     "GAJENDRA DAS", "AMOL SATHE",
-    "RAHUL GHONE", "RAHUL GONE",           # both spellings (ERP has "GONE")
+    "PIYUSH ARORA",                        # new hire May 2026, covers
+                                           # PCMC-west Permit Room belt
+                                           # (Hinjewadi/Wakad/Mulshi)
 })
 
 
@@ -844,8 +846,8 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
         "Outstanding mapped via the **strict per-principal SM field** "
         "(USL: SM1; Diageo: SM2; UBL: SM3; BF: SM2 wine / SM3 Cross-"
         "Supply) — same rule as sales attribution in sales_plan.py. "
-        "Placeholder names (SURESH NAIR / ROHIT LAKHAN / CROSS SUPPLY "
-        "/ Z-prefix ex-employees) are hidden by default."
+        "Placeholder names (SURESH NAIR / CROSS SUPPLY / CLOSED OUTLET "
+        "/ ONE DAY LIC / Z-prefix ex-employees) are hidden by default."
     )
 
     sm_master    = _load_salesman_master()

@@ -48,15 +48,18 @@ PRINCIPAL_CONFIG: dict[str, dict] = {
     "Brown-Forman": {
         "company_id": "C00056",
         "color":      "#EF9F27",
+        # Wine Shops (Ajay/Deepak Patil) + KW Institution
         "salesmen":   ["Ajay", "Deepak Patil",
-                       "Anand Raj", "Deepak Pangare", "Shashank Desai", "Pranav"],
+                       "Rohit Lakhan", "Shashank Desai",
+                       "Pranav", "Rahul Ghone"],
     },
     "United Breweries": {
         "company_id": "C00039",
         "color":      "#1D9E75",
+        # KW Beer (Aabid/Omkar) + KW Institution + PCMC Institution
         "salesmen":   ["Aabid", "Omkar",
-                       "Anand Raj", "Deepak Pangare", "Shashank Desai", "Pranav",
-                       "Gajendra Das", "Amol Sathe", "Rahul Ghone"],
+                       "Rohit Lakhan", "Shashank Desai", "Pranav", "Rahul Ghone",
+                       "Gajendra Das", "Amol Sathe", "Piyush Arora"],
     },
 }
 

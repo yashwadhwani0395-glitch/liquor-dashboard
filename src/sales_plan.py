@@ -63,8 +63,11 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
         "color":      "#1D9E75",
         "subteams": {
             "KW Beer":      ["Aabid", "Omkar"],
-            "Institution":  ["Anand Raj", "Deepak Pangare", "Shashank Desai",
-                             "Pranav", "Gajendra Das", "Amol Sathe", "Rahul Ghone"],
+            "Institution":  ["Rohit Lakhan", "Shashank Desai", "Pranav",
+                             "Rahul Ghone", "Gajendra Das", "Amol Sathe",
+                             "Piyush Arora"],
+            # KW Institution (Rohit/Shashank Desai/Pranav/Rahul Ghone — UBL+BF)
+            #   + PCMC Institution (Gajendra/Amol/Piyush — UBL only)
             # Cross Supply: special — no assigned salesman; identified by
             # AcType3ID = '130007' on the outlet. Handled in achievement calc.
             "Cross Supply": [],
@@ -91,7 +94,9 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
         "color":      "#EF9F27",
         "subteams": {
             "Wine Shops":   ["Ajay", "Deepak Patil"],
-            "Institution":  ["Anand Raj", "Deepak Pangare", "Shashank Desai", "Pranav"],
+            # BF Institution = KW Institution only (no PCMC)
+            "Institution":  ["Rohit Lakhan", "Shashank Desai",
+                             "Pranav", "Rahul Ghone"],
         },
     },
 }

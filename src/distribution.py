@@ -99,9 +99,15 @@ SALESMAN_MAP: dict[str, dict] = {
     "Omkar":          {"team": "UBL KW Beer",          "sm_id": "000032",
                        "sm_field": "SM3", "principals": ["C00039"]},
     # ── KW Institution (SM3 for BOTH UBL + BF) ───────────────────────────
-    "Anand Raj":      {"team": "KW Institution",       "sm_id": "000037",
+    # Team transition May 2026: Anand Raj (was 000037) + Deepak Pangare
+    # (was 000038) left the company. The ERP master reassigned those
+    # SalesManIDs:
+    #   000037 → now Rahul Ghone (moved up from PCMC to KW Institution)
+    #   000038 → now Rohit Lakhan (reactivated as KW Institution)
+    #   000043 → now Piyush Arora (new hire, PCMC Institution / west belt)
+    "Rahul Ghone":    {"team": "KW Institution",       "sm_id": "000037",
                        "sm_field": "SM3", "principals": ["C00039","C00056"]},
-    "Deepak Pangare": {"team": "KW Institution",       "sm_id": "000038",
+    "Rohit Lakhan":   {"team": "KW Institution",       "sm_id": "000038",
                        "sm_field": "SM3", "principals": ["C00039","C00056"]},
     "Shashank Desai": {"team": "KW Institution",       "sm_id": "000036",
                        "sm_field": "SM3", "principals": ["C00039","C00056"]},
@@ -112,7 +118,7 @@ SALESMAN_MAP: dict[str, dict] = {
                        "sm_field": "SM3", "principals": ["C00039"]},
     "Amol Sathe":     {"team": "PCMC Institution",     "sm_id": "000041",
                        "sm_field": "SM3", "principals": ["C00039"]},
-    "Rahul Ghone":    {"team": "PCMC Institution",     "sm_id": "000043",
+    "Piyush Arora":   {"team": "PCMC Institution",     "sm_id": "000043",
                        "sm_field": "SM3", "principals": ["C00039"]},
 }
 
