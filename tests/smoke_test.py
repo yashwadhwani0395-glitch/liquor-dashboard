@@ -133,7 +133,7 @@ print("=" * 70)
 # ── Module imports ───────────────────────────────────────────────────────
 print("\n[1/3] Module imports")
 modules = ["sales","salesman","distribution","principal","operations",
-           "sales_plan","purchase","inventory","debtors"]
+           "sales_plan","purchase","inventory","debtors","expenses"]
 for mod in modules:
     try:
         m = __import__(f"src.{mod}", fromlist=["render"])
@@ -155,6 +155,7 @@ from src.sales_plan  import render as r_sales_plan
 from src.purchase    import render as r_purchase
 from src.inventory   import render as r_inventory
 from src.debtors     import render as r_debtors
+from src.expenses    import render as r_expenses
 
 test_page("Sales Overview",   r_sales)
 test_page("Team Performance", r_salesman)
@@ -165,6 +166,7 @@ test_page("Sales Plan",       r_sales_plan)
 test_page("Purchase",         r_purchase)
 test_page("Inventory",        r_inventory)
 test_page("Debtors Ageing",   r_debtors)
+test_page("Expenses",         r_expenses)
 
 # ── Summary ──────────────────────────────────────────────────────────────
 print("\n[3/3] Summary")

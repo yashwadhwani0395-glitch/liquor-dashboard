@@ -187,11 +187,8 @@ with t3:
         render_operations()
 
 with t4:  # Expenses (slot 4 since Inventory is no longer top-level)
-    coming_soon(
-        "Expense Tracking",
-        "Operating expenses by category, monthly trends, vs revenue ratios",
-        "💸",
-    )
+    from src.expenses import render as render_expenses
+    render_expenses()
 
 with t5:  # Debtors Ageing — new first-class tab
     from src.debtors import render as render_debtors
