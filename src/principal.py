@@ -753,6 +753,23 @@ def render() -> None:
     )
     st.divider()
 
+    # Parties pulling us down — uses sales.py's reusable section,
+    # pre-filtered to this principal's universe (we pass the
+    # CompanyID into the data loader so the section sees only the
+    # principal's billings).
+    from src.sales import (
+        _load_party_daily_revenue,
+        _section_parties_pulling_down,
+    )
+    with st.spinner("Loading party-level history for pull-down analysis…"):
+        party_daily = _load_party_daily_revenue(
+            months=14, principal_ids=(company_id,),
+        )
+    _section_parties_pulling_down(
+        party_daily, section_key=f"principal_{company_id}",
+    )
+    st.divider()
+
     _render_trends(principal_master, months_12, cfg)
     st.divider()
 

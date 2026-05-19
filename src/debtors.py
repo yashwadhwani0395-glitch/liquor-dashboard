@@ -133,18 +133,48 @@ CHANNEL_MAP: dict[str, str] = {
 CROSS_SUPPLY_AC = "130007"
 
 
-# ── Per-principal salesman-field map. Each principal cares about a
-#    different field in MsPartyMaster — the field that holds the *handler*
-#    salesman for that principal's universe. Mirrors the SM-routing logic
-#    in src/sales_plan.py / distribution.py.
-SALESMAN_FIELD_BY_PRINCIPAL: dict[str, str] = {
-    "United Spirits":   "SalesManID",   # SM1
-    "Diageo":           "SalesManID1",  # SM2
-    "United Breweries": "SalesManID2",  # SM3
+# ── Per-principal salesman-field PRIORITY order ──────────────────────────
+#    Each principal has a designated "primary" SM field for its handler
+#    universe — but party records in the ERP are messy: some Diageo
+#    institutions have SM1 populated (Miran Dmello routes them) but SM2
+#    blank, etc. So we try the principal's preferred field first, then
+#    fall back to SM1 / SM2 / SM3 in order. Empty / null are skipped.
+SALESMAN_PRIORITY_BY_PRINCIPAL: dict[str, tuple[str, ...]] = {
+    "United Spirits":   ("SalesManID",  "SalesManID1", "SalesManID2"),
+    "Diageo":           ("SalesManID1", "SalesManID",  "SalesManID2"),
+    "United Breweries": ("SalesManID2", "SalesManID",  "SalesManID1"),
     # Brown-Forman is split: wine shops via SM2, institutions via SM3.
     # Handled separately in _attribute_salesman() below.
-    "Brown-Forman":     "__bf_split__",
 }
+
+# ── Real field salesmen ──────────────────────────────────────────────────
+# The "active humans" who physically visit outlets. Everything else in
+# MsSalesmanMaster is either an ex-employee (Z-prefix), a status marker
+# (CLOSED OUTLET / ONE DAY LIC), or a catch-all placeholder used when
+# no specific human handles the outlet (SURESH NAIR — 558 parties in
+# SM3 with no logical Diageo channel link, CROSS SUPPLY, ROHIT LAKHAN).
+#
+# Confirmed via _diag_attribution.out STEP B + STEP D:
+#   - Z-prefix salesmen carry 67-135 legacy parties each
+#   - SURESH NAIR has 558 SM3-only parties (catch-all)
+#   - CROSS SUPPLY has 311 SM1-only parties
+#   - CLOSED OUTLET / ONE DAY LIC are status markers
+FIELD_SALESMEN: frozenset[str] = frozenset({
+    # USL wine shops
+    "SHASHANK", "SACHIN KAMBLE",
+    # Diageo + BF wine shops
+    "AJAY", "DEEPAK PATIL",
+    # Permit Rooms (USL + Diageo)
+    "TULSIRAM", "SAURABH", "MIRAN DMELLO", "PRASHANT THORAT", "ATISH",
+    # UBL KW Beer
+    "ABID", "OMKAR PAWAR",
+    # KW Institution
+    "SHASHANK DESAI", "PRANAV", "DEEPAK PANGARE", "ANAND RAJ",
+    # PCMC Institution
+    "GAJENDRA DAS", "AMOL SATHE",
+    "RAHUL GONE",   # ERP spelling (DB typo for RAHUL GHONE — both work)
+    "RAHUL GHONE",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -444,16 +474,42 @@ def _fifo_unpaid(ledger: pd.DataFrame,
 
 
 def _attribute_salesman(row: pd.Series) -> str:
-    """Per-principal salesman attribution. Brown-Forman splits by
-    AcType3 (institution → SM3 / SalesManID2, else SM2 / SalesManID1)."""
-    p = row["Principal"]
+    """Per-principal salesman attribution with **fallback chain**.
+
+    Each principal has a designated primary SM field, but many party
+    records in the ERP only populate one or two of the three SM fields.
+    Rather than dropping these into 'Unmapped' (the prior behavior),
+    we walk a priority list and return the first populated value.
+
+    Priority chain:
+      - Brown-Forman:
+          institution (AcType3='130007')  → SM3 → SM2 → SM1
+          wine shop                       → SM2 → SM1 → SM3
+      - United Spirits:                   → SM1 → SM2 → SM3
+      - Diageo:                           → SM2 → SM1 → SM3
+      - United Breweries:                 → SM3 → SM1 → SM2
+      - Adjustment / Other:               → SM1 → SM2 → SM3
+    Empty / null / whitespace-only values are skipped.
+    """
+    p = row.get("Principal", "")
     if p == "Brown-Forman":
-        return row["SalesManID2"] if row["AcType3ID"] == CROSS_SUPPLY_AC \
-               else row["SalesManID1"]
-    field = SALESMAN_FIELD_BY_PRINCIPAL.get(p)
-    if not field or field == "__bf_split__":
-        return ""
-    return row.get(field, "") or ""
+        is_inst = row.get("AcType3ID", "") == CROSS_SUPPLY_AC
+        priority = (("SalesManID2", "SalesManID1", "SalesManID")
+                    if is_inst
+                    else ("SalesManID1", "SalesManID", "SalesManID2"))
+    elif p in SALESMAN_PRIORITY_BY_PRINCIPAL:
+        priority = SALESMAN_PRIORITY_BY_PRINCIPAL[p]
+    else:
+        # Adjustment / Other / Non-sales rows — try SM1 first
+        priority = ("SalesManID", "SalesManID1", "SalesManID2")
+
+    for col in priority:
+        sid = (row.get(col) or "")
+        if isinstance(sid, str):
+            sid = sid.strip()
+        if sid:
+            return sid
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -586,9 +642,10 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
     st.subheader("👥 Salesman collection efficiency")
     st.caption(
         "Outstanding mapped via the per-principal handler-salesman field "
-        "(SM1 for USL, SM2 for Diageo, SM3 for UBL; BF wine-shops via SM2 "
-        "and BF Cross-Supply institutions via SM3). Unmapped bills are "
-        "rolled into 'Unmapped'."
+        "with a **fallback chain** (Diageo: SM2 → SM1 → SM3; USL: SM1 → "
+        "SM2 → SM3; UBL: SM3 → SM1 → SM2; BF: split by AcType3 for "
+        "institution vs wine shop). Parties with all three SM fields "
+        "blank fall into 'Unmapped'."
     )
 
     sm_master = _load_salesman_master()
@@ -599,13 +656,47 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
     work["Salesman"]   = work["SalesmanID"].map(sm_lookup).fillna("")
     work.loc[work["Salesman"].str.strip() == "", "Salesman"] = "Unmapped"
 
-    grouped = work.groupby(["Salesman", "Principal"], observed=True)
+    # Bucket every salesman name into one of three roles
+    def _role(name: str) -> str:
+        n = (name or "").strip().upper()
+        if n in FIELD_SALESMEN:
+            return "Field"
+        if n == "UNMAPPED" or not n:
+            return "Unmapped"
+        return "Placeholder"  # Z-prefix, CROSS SUPPLY, SURESH NAIR,
+                              # ROHIT LAKHAN, CLOSED OUTLET, ONE DAY LIC, etc.
+    work["SmRole"] = work["Salesman"].map(_role)
+
+    # Role-filter radio
+    view = st.radio(
+        "Show",
+        ["Field salesmen only", "All names in ERP", "Unmapped / placeholder only"],
+        horizontal=True,
+        key="dbt_sm_role",
+        help=(
+            "Field = real humans visiting outlets (Aabid, Ajay, Miran, …)\n"
+            "Placeholder = ex-employees / Cross-Supply / Suresh Nair-style "
+            "catch-alls (rarely actual collectors)\n"
+            "Unmapped = bills whose party has no SM field populated."
+        ),
+    )
+    if view == "Field salesmen only":
+        view_df = work[work["SmRole"] == "Field"]
+    elif view == "Unmapped / placeholder only":
+        view_df = work[work["SmRole"].isin(["Unmapped", "Placeholder"])]
+    else:
+        view_df = work
+
+    if view_df.empty:
+        st.info("No rows for the selected view."); return
+
+    grouped = view_df.groupby(["Salesman", "Principal"], observed=True)
     by_sm = grouped.agg(
         Outstanding=("Remaining", "sum"),
         AvgAge=("AgeDays", "mean"),
         Parties=("PartyID", "nunique"),
     )
-    od_sum = (work[work["IsOverdue"]]
+    od_sum = (view_df[view_df["IsOverdue"]]
               .groupby(["Salesman", "Principal"], observed=True)["Remaining"].sum()
               .reindex(by_sm.index).fillna(0.0))
     by_sm["OverdueAmt"] = od_sum

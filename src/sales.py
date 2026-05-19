@@ -6,6 +6,7 @@ two questions a CFO asks first: "How are we doing this period?" and
 """
 from __future__ import annotations
 
+import calendar
 from datetime import date, timedelta
 
 import pandas as pd
@@ -256,6 +257,79 @@ def _load_daily_revenue(months: int = 24,
     df["BillDate"] = pd.to_datetime(df["BillDate"])
     df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
     df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_party_daily_revenue(months: int = 14,
+                              principal_ids: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Per-(party, day) revenue used by the 'Parties Pulling Us Down'
+    section. Pulls the last `months` calendar months (default 14 — gives
+    13 prior months + the current MTD so LYSM windows resolve).
+
+    Returns columns: PartyID, PartyName, LicenseTypeID, AcType3ID,
+    SalesManID, SalesManID1, SalesManID2, BillDate, Revenue.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    company_sql = ""
+    company_params: tuple = ()
+    if principal_ids:
+        company_sql = f"AND b.CompanyID IN ({','.join('?' * len(principal_ids))})"
+        company_params = principal_ids
+
+    sql = f"""
+        SELECT
+            d.PartyID,
+            ISNULL(p.PartyName, '(unknown)')           AS PartyName,
+            ISNULL(p.LicenseTypeID, '')                AS LicenseTypeID,
+            ISNULL(p.AcType3ID, '')                    AS AcType3ID,
+            ISNULL(p.SalesManID, '')                   AS SalesManID,
+            ISNULL(p.SalesManID1, '')                  AS SalesManID1,
+            ISNULL(p.SalesManID2, '')                  AS SalesManID2,
+            CAST(h.VoucherDate AS date)                AS BillDate,
+            SUM(CAST(vi.TotalAmount AS FLOAT))         AS Revenue
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FreeItemYN  = 'N'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY Amount DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        LEFT JOIN MsPartyMaster p  ON p.PartyID  = d.PartyID
+        JOIN MsItemMaster   im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster  b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months}, GETDATE())
+          {company_sql}
+        GROUP BY d.PartyID, p.PartyName, p.LicenseTypeID, p.AcType3ID,
+                 p.SalesManID, p.SalesManID1, p.SalesManID2,
+                 CAST(h.VoucherDate AS date)
+    """
+    df = run_query(sql, company_params)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "PartyID","PartyName","LicenseTypeID","AcType3ID",
+            "SalesManID","SalesManID1","SalesManID2",
+            "BillDate","Revenue",
+        ])
+    df["BillDate"] = pd.to_datetime(df["BillDate"])
+    df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
     return df
 
 
@@ -609,6 +683,284 @@ def _fy_of(ym: str) -> int:
     return y if m >= 4 else y - 1
 
 
+def _compute_party_pulling_down(
+    party_daily: pd.DataFrame,
+    today: pd.Timestamp,
+) -> pd.DataFrame:
+    """Per-party MTD vs L3M-avg-MTD vs LYSM-MTD comparison.
+
+    Returns one row per party with `meaningful baseline`:
+      L3M_Avg_MTD > Rs1k  OR  LYSM_MTD > Rs1k.
+    Filtering decisions (min drop %, min baseline) are layered on top
+    by the calling section; this function just produces the universe.
+    """
+    if party_daily.empty:
+        return pd.DataFrame()
+
+    day = today.day
+    cur_start, cur_end = today.replace(day=1), today
+
+    # Helper: revenue for a (party, month_start, day_cap) window
+    def window_sum(start: pd.Timestamp, day_cap: int) -> pd.Series:
+        _, last_dom = calendar.monthrange(start.year, start.month) \
+            if False else (None, calendar.monthrange(start.year, start.month)[1])
+        end_day = min(day_cap, last_dom)
+        end = start.replace(day=end_day)
+        mask = (party_daily["BillDate"] >= start) & (party_daily["BillDate"] <= end)
+        return (party_daily.loc[mask].groupby("PartyID")["Revenue"].sum())
+
+    cur     = window_sum(cur_start, day)
+    l3_wins = [window_sum(cur_start - pd.DateOffset(months=i), day)
+               for i in range(1, 4)]
+    lysm    = window_sum(cur_start - pd.DateOffset(years=1), day)
+
+    # Months active in L12M (consistency proxy)
+    one_yr_ago = cur_start - pd.DateOffset(months=12)
+    active = (
+        party_daily.loc[
+            (party_daily["BillDate"] >= one_yr_ago)
+            & (party_daily["BillDate"] < cur_start)
+        ]
+        .assign(MonthStamp=lambda d: d["BillDate"].dt.to_period("M"))
+        .groupby("PartyID")["MonthStamp"].nunique()
+    )
+
+    # Static columns per party (PartyName, channel, SM fields)
+    info = (
+        party_daily.sort_values("BillDate")
+        .groupby("PartyID")
+        .agg(PartyName=("PartyName", "first"),
+             LicenseTypeID=("LicenseTypeID", "first"),
+             AcType3ID=("AcType3ID", "first"),
+             SalesManID=("SalesManID", "first"),
+             SalesManID1=("SalesManID1", "first"),
+             SalesManID2=("SalesManID2", "first"))
+    )
+
+    # Assemble
+    all_ids = (set(cur.index) | set(lysm.index)
+               | set().union(*[set(w.index) for w in l3_wins]))
+    if not all_ids:
+        return pd.DataFrame()
+
+    rows = []
+    for pid in all_ids:
+        if pid not in info.index:
+            continue
+        ir = info.loc[pid]
+        c  = float(cur.get(pid, 0.0))
+        l3 = float(sum(w.get(pid, 0.0) for w in l3_wins) / 3.0)
+        ly = float(lysm.get(pid, 0.0))
+        # Skip parties without meaningful baseline
+        if l3 < 1000 and ly < 1000:
+            continue
+        rows.append({
+            "PartyID":            pid,
+            "PartyName":          ir["PartyName"],
+            "LicenseTypeID":      ir["LicenseTypeID"],
+            "AcType3ID":          ir["AcType3ID"],
+            "SalesManID":         ir["SalesManID"],
+            "SalesManID1":        ir["SalesManID1"],
+            "SalesManID2":        ir["SalesManID2"],
+            "MonthsActiveL12M":   int(active.get(pid, 0)),
+            "CurrentMTD":         c,
+            "L3M_Avg_MTD":        l3,
+            "LYSM_MTD":           ly,
+            "Gap_L3M":            c - l3,
+            "Gap_LYSM":           c - ly,
+            "Pct_L3M":            ((c - l3) / l3 * 100) if l3 > 0 else 0.0,
+            "Pct_LYSM":           ((c - ly) / ly * 100) if ly > 0 else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _section_parties_pulling_down(
+    party_daily: pd.DataFrame,
+    section_key: str = "sales",
+) -> None:
+    """Outlets where current MTD trails L3M-avg or LYSM materially.
+
+    The L3M / LYSM windows use the same day cutoff (today.day) as the
+    benchmarks section above — apples-to-apples by construction.
+
+    `section_key` lets the same function be reused inside the Meeting
+    Pack (principal.py) with separate Streamlit widget keys.
+    """
+    st.subheader("🔻 Parties Pulling Us Down")
+    today = pd.Timestamp.today().normalize()
+    st.caption(
+        f"Outlets where current MTD ({mtd_label(today)}) is materially "
+        "behind their L3M-avg MTD or LYSM (Last Year Same Month) MTD. "
+        "Sorted by biggest decline. Use this for daily follow-up calls "
+        "by salesman."
+    )
+
+    perf = _compute_party_pulling_down(party_daily, today)
+    if perf.empty:
+        st.info("No party data available yet for this period."); return
+
+    # Filter knobs
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        benchmark = st.radio(
+            "Compare against",
+            ["L3M avg", "LYSM", "Both (worst case)"],
+            horizontal=True,
+            key=f"{section_key}_pp_bench",
+        )
+    with c2:
+        min_drop_pct = st.slider(
+            "Min decline %", min_value=10, max_value=80, value=25, step=5,
+            key=f"{section_key}_pp_drop",
+            help="Only show parties down by at least this %.",
+        )
+    with c3:
+        min_baseline = st.number_input(
+            "Min baseline (₹ Lakhs)", min_value=0.1, value=1.0, step=0.5,
+            key=f"{section_key}_pp_base",
+            help="Filter out parties with insignificant historical revenue.",
+        )
+
+    drop_threshold = -float(min_drop_pct)
+    min_base_inr   = float(min_baseline) * 1e5
+
+    if benchmark == "L3M avg":
+        mask = (perf["Pct_L3M"] < drop_threshold) & (perf["L3M_Avg_MTD"] >= min_base_inr)
+        filt = perf[mask].sort_values("Gap_L3M").head(50).copy()
+    elif benchmark == "LYSM":
+        mask = (perf["Pct_LYSM"] < drop_threshold) & (perf["LYSM_MTD"] >= min_base_inr)
+        filt = perf[mask].sort_values("Gap_LYSM").head(50).copy()
+    else:  # Both
+        mask = (
+            ((perf["Pct_L3M"] < drop_threshold) | (perf["Pct_LYSM"] < drop_threshold))
+            & ((perf["L3M_Avg_MTD"] >= min_base_inr) | (perf["LYSM_MTD"] >= min_base_inr))
+        )
+        filt = perf[mask].copy()
+        filt["WorstGap"] = filt[["Gap_L3M", "Gap_LYSM"]].min(axis=1)
+        filt = filt.sort_values("WorstGap").head(50)
+
+    if filt.empty:
+        st.success("✅ No parties significantly down at the current filter."); return
+
+    # Status badge
+    def _status(row: pd.Series) -> str:
+        if row["CurrentMTD"] == 0 and row["MonthsActiveL12M"] >= 9:
+            return "⚫ Stopped buying"
+        if row["Pct_L3M"] < -50 or row["Pct_LYSM"] < -50:
+            return "🔴 Severe drop"
+        if row["Pct_L3M"] < -25 or row["Pct_LYSM"] < -25:
+            return "🟡 Watch"
+        return "🟢 Slight dip"
+    filt["Status"] = filt.apply(_status, axis=1)
+
+    # Salesman attribution: first-non-empty across SM1/SM2/SM3
+    sm_master_rows = run_query("""
+        SELECT ISNULL(SalesManID,'') AS SalesManID,
+               ISNULL(FullName, LTRIM(RTRIM(
+                   ISNULL(FirstName,'') + ' ' + ISNULL(LastName,'')))) AS FullName
+        FROM MsSalesmanMaster
+    """)
+    sm_dict = dict(zip(sm_master_rows["SalesManID"], sm_master_rows["FullName"])) \
+        if not sm_master_rows.empty else {}
+
+    def _primary_sm(row: pd.Series) -> str:
+        for col in ("SalesManID", "SalesManID1", "SalesManID2"):
+            sid = (row.get(col) or "").strip()
+            if sid:
+                return sid
+        return ""
+    filt["SalesmanID"] = filt.apply(_primary_sm, axis=1)
+    filt["Salesman"]   = filt["SalesmanID"].map(sm_dict).fillna("(Unmapped)")
+    filt.loc[filt["Salesman"].str.strip() == "", "Salesman"] = "(Unmapped)"
+
+    # Headline KPIs
+    total_gap_l3m = float(filt["Gap_L3M"].sum()) / 1e5
+    total_gap_lysm = float(filt["Gap_LYSM"].sum()) / 1e5
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Parties down", f"{len(filt):,}")
+    k2.metric("Total gap vs L3M",
+              f"₹{total_gap_l3m:,.1f} L",
+              delta_color="inverse")
+    k3.metric("Total gap vs LYSM",
+              f"₹{total_gap_lysm:,.1f} L",
+              delta_color="inverse")
+
+    # Worklist table — preformatted
+    work = filt.copy()
+    work["CurrentMTD_L"] = work["CurrentMTD"]  / 1e5
+    work["L3M_L"]        = work["L3M_Avg_MTD"] / 1e5
+    work["LYSM_L"]       = work["LYSM_MTD"]    / 1e5
+    work["Gap_L3M_L"]    = work["Gap_L3M"]     / 1e5
+    work["Gap_LYSM_L"]   = work["Gap_LYSM"]    / 1e5
+
+    cols = ["Status", "PartyName", "Salesman",
+            "CurrentMTD_L", "L3M_L", "Gap_L3M_L", "Pct_L3M",
+            "LYSM_L", "Gap_LYSM_L", "Pct_LYSM",
+            "MonthsActiveL12M"]
+    rename = {
+        "Status":           "Status",
+        "PartyName":        "Party",
+        "Salesman":         "Salesman",
+        "CurrentMTD_L":     "MTD (₹L)",
+        "L3M_L":            "L3M avg MTD (₹L)",
+        "Gap_L3M_L":        "Gap L3M (₹L)",
+        "Pct_L3M":          "vs L3M %",
+        "LYSM_L":           "LYSM MTD (₹L)",
+        "Gap_LYSM_L":       "Gap LYSM (₹L)",
+        "Pct_LYSM":         "vs LYSM %",
+        "MonthsActiveL12M": "Active mo (L12M)",
+    }
+    disp = work[cols].rename(columns=rename)
+    styled = (
+        disp.style.format({
+            "MTD (₹L)":        "₹{:.2f} L",
+            "L3M avg MTD (₹L)": "₹{:.2f} L",
+            "Gap L3M (₹L)":    "₹{:+.2f} L",
+            "vs L3M %":        "{:+.1f}%",
+            "LYSM MTD (₹L)":   "₹{:.2f} L",
+            "Gap LYSM (₹L)":   "₹{:+.2f} L",
+            "vs LYSM %":       "{:+.1f}%",
+            "Active mo (L12M)": "{:.0f}",
+        })
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=480)
+
+    # Salesman workload
+    st.markdown("**Recovery workload by salesman**")
+    by_sm = (
+        filt.groupby("Salesman", observed=True)
+            .agg(Parties=("PartyID", "nunique"),
+                 TotalGap_L3M=("Gap_L3M", "sum"),
+                 TotalGap_LYSM=("Gap_LYSM", "sum"))
+            .reset_index()
+            .sort_values("TotalGap_L3M")   # most-negative-first
+    )
+    by_sm["Gap_L3M_L"]  = by_sm["TotalGap_L3M"]  / 1e5
+    by_sm["Gap_LYSM_L"] = by_sm["TotalGap_LYSM"] / 1e5
+    sm_styled = (
+        by_sm[["Salesman", "Parties", "Gap_L3M_L", "Gap_LYSM_L"]].style.format({
+            "Parties":    "{:,}",
+            "Gap_L3M_L":  "₹{:+,.1f} L",
+            "Gap_LYSM_L": "₹{:+,.1f} L",
+        })
+    )
+    st.dataframe(sm_styled, use_container_width=True, hide_index=True)
+
+    # CSV
+    export = filt[[
+        "PartyID", "PartyName", "Salesman", "Status",
+        "CurrentMTD", "L3M_Avg_MTD", "LYSM_MTD",
+        "Gap_L3M", "Gap_LYSM", "Pct_L3M", "Pct_LYSM",
+        "MonthsActiveL12M",
+    ]]
+    csv = export.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download recovery list (CSV)", csv,
+        f"parties_pulling_down_{date.today()}.csv", "text/csv",
+        key=f"{section_key}_pp_dl",
+    )
+
+
 def _section_trend(monthly_df: pd.DataFrame) -> None:
     st.markdown("##### 12-month revenue trend")
     if monthly_df.empty:
@@ -792,6 +1144,9 @@ def render() -> None:
         # Daily revenue: feeds the MTD-to-MTD benchmark cards (need
         # day-level granularity so today.day drives the cutoff).
         daily_df     = _load_daily_revenue(24, principal_ids)
+        # Per-party daily: feeds the Parties Pulling Down section
+        # (14 months covers LYSM + L3M windows).
+        party_daily  = _load_party_daily_revenue(14, principal_ids)
         principal_df = _load_principal_growth(start, end, ly_start, ly_end)
         channel_df   = _load_channel_revenue(start, end, principal_ids)
         brands_df    = _load_brand_growth(start, end, ly_start, ly_end, principal_ids)
@@ -804,6 +1159,8 @@ def render() -> None:
     _section_kpis(kpi)
     st.divider()
     _section_benchmarks(daily_df)
+    st.divider()
+    _section_parties_pulling_down(party_daily, section_key="sales")
     st.divider()
     _section_trend(monthly_df)
     st.divider()
