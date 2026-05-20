@@ -171,6 +171,84 @@ def _load_outlet_history(company_id: str,
     return df
 
 
+# AcType3 → MIS "Type III" channel. PCMC + KW + One-Day institution are
+# merged into a single "Institution" card (owner preference).
+_UBL_AC3_CHANNEL = {
+    "130001": "KW Beer",
+    "130002": "Institution",      # PCMC INSTITUTION
+    "130004": "Institution",      # KW INSTITUTION
+    "130006": "Institution",      # KW INSTI ONE DAY
+    "130007": "Cross Supply",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_ubl_mis_channels(start: date, end: date) -> dict[str, float]:
+    """UBL (C00039) channel cases on the MIS 'Type III' basis.
+
+    Reverse-engineered to reproduce the MIS partywise reports (matches
+    within ~0.4%; Cross Supply exact). MIS's rule differs from the rest
+    of the dashboard in three ways, so this is a dedicated loader scoped
+    to the UBL Sales-Plan channel cards only:
+
+      1. Party attribution = the LAST debtor line on the voucher
+         (max id_key), NOT the largest-Dr-amount party the rest of the
+         dashboard uses. UBL beer bills are booked against two debtor
+         parties (a routing leg + the end outlet); MIS keys off the
+         last-entered line.
+      2. Channel = that party's AcType3 (130001 KW Beer / 130002 PCMC /
+         130004 KW Insti / 130006 One-Day / 130007 Cross Supply).
+      3. Free/scheme goods (FreeItemYN='Y') are INCLUDED (the rest of
+         the dashboard excludes them).
+
+    Returns {"KW Beer": x, "Institution": y, "Cross Supply": z}.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT ISNULL(p.AcType3ID,'') AS AcType3ID,
+               SUM({_CASES}) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            -- free goods INCLUDED to match MIS (no FreeItemYN filter)
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN (
+            -- MIS rule: last debtor line on the voucher (max id_key)
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = 'C00039'
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate BETWEEN ? AND ?
+        GROUP BY p.AcType3ID
+    """
+    df = run_query(sql, (str(start), str(end)))
+    out = {"KW Beer": 0.0, "Institution": 0.0, "Cross Supply": 0.0}
+    if df.empty:
+        return out
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    for _, r in df.iterrows():
+        ch = _UBL_AC3_CHANNEL.get(str(r["AcType3ID"]).strip())
+        if ch:
+            out[ch] += float(r["Cases"])
+    return out
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_brand_buyers(company_id: str,
                        brand_id: int,
@@ -1940,32 +2018,37 @@ def render() -> None:
         total_target = target_entry["total_cases"]
         breakdown    = target_entry.get("breakdown", {})
 
-        # Achieved this month so far for the principal
-        achieved_total = float(
-            hist[hist["BillMonth"] == op_month]["Cases"].sum()
-        )
-
-        # Achieved per sub-team. Two modes:
-        #   - team has salesman list: filter by union of their principal universes
-        #   - team has empty list and is named "Cross Supply": filter by
-        #     AcType3ID = '130007' on the outlet (special UBL cross-supply rule)
-        # Outlets with AcType3='130007' that are ALSO in Aabid/Omkar's universe
-        # are counted in BOTH KW Beer and Cross Supply — these are two views
-        # of the same outlets (the sub-targets sum to the principal total but
-        # achievement may show small overlap).
-        achieved_by_team: dict[str, float] = {}
         cm_hist = hist[hist["BillMonth"] == op_month]
-        for team_name, sms in cfg["subteams"].items():
-            if sms:
-                team_uni = frozenset().union(*[
-                    universes_by_p.get(sm, {}).get(cid, frozenset()) for sm in sms
-                ])
-                ach = float(cm_hist[cm_hist["PartyID"].isin(team_uni)]["Cases"].sum())
-            elif team_name == "Cross Supply":
-                ach = float(cm_hist[cm_hist["AcType3ID"] == "130007"]["Cases"].sum())
-            else:
-                ach = 0.0
-            achieved_by_team[team_name] = ach
+
+        # ── Achieved per sub-team ──
+        # UBL uses the MIS "Type III" rule (classify by AcType3, attribute
+        # to the last debtor line, include free goods) so the channel cards
+        # tie out to the principal's MIS reports. Every other principal keeps
+        # the salesman-universe attribution.
+        achieved_by_team: dict[str, float] = {}
+        if principal == "United Breweries":
+            mb = _month_bounds(op_month_date)
+            ch_start, ch_end = mb[0], min(mb[1], today)
+            achieved_by_team = _load_ubl_mis_channels(ch_start, ch_end)
+            # Hero = sum of the MIS channel cards so hero and cards reconcile.
+            achieved_total = float(sum(achieved_by_team.values()))
+        else:
+            # Achieved this month so far for the principal
+            achieved_total = float(cm_hist["Cases"].sum())
+            # Two modes:
+            #   - team has salesman list: filter by union of their universes
+            #   - team named "Cross Supply" with empty list: AcType3='130007'
+            for team_name, sms in cfg["subteams"].items():
+                if sms:
+                    team_uni = frozenset().union(*[
+                        universes_by_p.get(sm, {}).get(cid, frozenset()) for sm in sms
+                    ])
+                    ach = float(cm_hist[cm_hist["PartyID"].isin(team_uni)]["Cases"].sum())
+                elif team_name == "Cross Supply":
+                    ach = float(cm_hist[cm_hist["AcType3ID"] == "130007"]["Cases"].sum())
+                else:
+                    ach = 0.0
+                achieved_by_team[team_name] = ach
 
         pace = _pace_metrics(achieved_total, total_target, op_month_date)
 
