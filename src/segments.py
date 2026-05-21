@@ -353,7 +353,10 @@ def render() -> None:
                         "L3M-MTD": "{:,.0f}", "Current-MTD": "{:,.0f}",
                         "MTD Δ% vs L3M": "{:+.1f}%"})
                .map(_delta_style, subset=["MTD Δ% vs L3M"]))
-        st.dataframe(sty, use_container_width=True, hide_index=True, height=height)
+        kwargs = {"use_container_width": True, "hide_index": True}
+        if height is not None:
+            kwargs["height"] = int(height)
+        st.dataframe(sty, **kwargs)
         st.download_button(
             f"⬇️ Download — {name} · {kind}",
             tbl.to_csv(index=False).encode("utf-8-sig"),
