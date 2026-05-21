@@ -2193,10 +2193,10 @@ def render() -> None:
     st.title("📊 Debtors Ageing")
     st.caption(
         "Bill-wise FIFO ageing with Trader-Association integration. "
-        "Layout is urgency-driven: **Critical** (Dead Money + Bounced "
-        "+ Ghosted) is always visible; **Reference** sections (banned "
-        "register, salesman board, ageing buckets, gap inspection, "
-        "etc.) live in collapsible expanders at the bottom."
+        "Reconciliation strip (vs live Balance-Sheet Sundry Debtors) is "
+        "always on top; the rest is split into sub-tabs — **🚨 Critical** "
+        "(act today), **📊 Overview** (snapshot + ageing), **👥 Salesman / "
+        "Principal**, **🛑 Risk & Bans**, **🔍 Reconcile & Audit**."
     )
 
     today = pd.Timestamp.today().normalize()
@@ -2231,60 +2231,63 @@ def render() -> None:
         st.success("🎉 No outstanding debtor balances. All bills paid.")
         return
 
-    # ─────────── TIER 1: CRITICAL ───────────
+    # Reconciliation strip stays ABOVE the tabs — it's the page-level
+    # context (dashboard total vs live BS) every sub-tab is read against.
     safe_section("Reconciliation",    _section_reconciliation, unpaid)
     st.divider()
-    safe_section("Dead Money",        _section_dead_money,
-                 unpaid, last_bill_df)
-    st.divider()
-    safe_section("Bounced + Ghosted", _section_returns_ghosted,
-                 unpaid, returns_df, last_bill_df)
-    st.divider()
 
-    # ─────────── TIER 2: URGENT ───────────
-    safe_section("Active Bouncers",   _section_active_bouncers,
-                 unpaid, returns_df, last_bill_df)
-    st.divider()
-    safe_section("Billing Risk",      _section_billing_risk, unpaid)
-    st.divider()
+    # The page used to be one very long scroll. Split into sub-tabs so each
+    # workflow (collections vs. analysis vs. audit) is a short, focused view.
+    tab_critical, tab_overview, tab_people, tab_risk, tab_audit = st.tabs([
+        "🚨 Critical",
+        "📊 Overview",
+        "👥 Salesman / Principal",
+        "🛑 Risk & Bans",
+        "🔍 Reconcile & Audit",
+    ])
 
-    # ─────────── TIER 3: OPERATIONAL ───────────
-    safe_section("Snapshot",          _section_hero_compact,
-                 unpaid, unmatched_df)
-    safe_section("PDC Pipeline",      _section_pdc_pipeline, today)
-    st.divider()
+    # ─────────── 🚨 CRITICAL — act today ───────────
+    with tab_critical:
+        safe_section("Dead Money",        _section_dead_money,
+                     unpaid, last_bill_df)
+        st.divider()
+        safe_section("Bounced + Ghosted", _section_returns_ghosted,
+                     unpaid, returns_df, last_bill_df)
+        st.divider()
+        safe_section("Active Bouncers",   _section_active_bouncers,
+                     unpaid, returns_df, last_bill_df)
+        st.divider()
+        safe_section("Billing Risk",      _section_billing_risk, unpaid)
 
-    # ─────────── TIER 4: REFERENCE (collapsed) ───────────
-    with st.expander("📋 Trader Association Banned Register", expanded=False):
+    # ─────────── 📊 OVERVIEW — snapshot + ageing ───────────
+    with tab_overview:
+        safe_section("Snapshot",          _section_hero_compact,
+                     unpaid, unmatched_df)
+        safe_section("PDC Pipeline",      _section_pdc_pipeline, today)
+        st.divider()
+        safe_section("Ageing Buckets",    _section_ageing_buckets, unpaid)
+
+    # ─────────── 👥 SALESMAN / PRINCIPAL ───────────
+    with tab_people:
+        safe_section("By Salesman",       _section_by_salesman,  unpaid)
+        st.divider()
+        safe_section("By Principal",      _section_by_principal, unpaid)
+        safe_section("By Channel",        _section_by_channel,   unpaid)
+
+    # ─────────── 🛑 RISK & BANS ───────────
+    with tab_risk:
+        safe_section("Party risk",        _section_party_risk,   unpaid)
+        st.divider()
         safe_section("TA Banned Register", _section_banned_register, unpaid)
+        st.divider()
+        safe_section("Renegotiation",     _section_renegotiate,  unpaid)
 
-    with st.expander("🚨 Party Risk (Hold / Renegotiate / Watch / Good)",
-                     expanded=False):
-        safe_section("Party risk",     _section_party_risk,   unpaid)
-
-    with st.expander("👥 Salesman Collection Efficiency", expanded=False):
-        safe_section("By Salesman",    _section_by_salesman,  unpaid)
-
-    with st.expander("🏷️ By Principal / Channel", expanded=False):
-        safe_section("By Principal",   _section_by_principal, unpaid)
-        safe_section("By Channel",     _section_by_channel,   unpaid)
-
-    with st.expander("📊 Ageing Buckets Detail", expanded=False):
-        safe_section("Ageing Buckets", _section_ageing_buckets, unpaid)
-
-    with st.expander("🔍 Gap Inspection (write-offs, advances, anomalies)",
-                     expanded=False):
-        safe_section("Gap Inspection", _section_gap_inspection, unpaid)
-
-    with st.expander("💰 Unmatched Receipts Follow-up", expanded=False):
+    # ─────────── 🔍 RECONCILE & AUDIT ───────────
+    with tab_audit:
+        safe_section("Gap Inspection",    _section_gap_inspection, unpaid)
+        st.divider()
         safe_section("Unmatched Follow-up", _section_unmatched_followup)
-
-    with st.expander("🔄 Renegotiation Candidates", expanded=False):
-        safe_section("Renegotiation",  _section_renegotiate,  unpaid)
-
-    with st.expander("✅ Spot Check (5 known high-balance parties)",
-                     expanded=False):
-        safe_section("Spot Check",     _section_spot_check,   unpaid)
-
-    with st.expander("🔧 Sanity Check vs Balance Sheet", expanded=False):
-        safe_section("Sanity Check",   _section_sanity,       unpaid)
+        st.divider()
+        safe_section("Spot Check",        _section_spot_check,   unpaid)
+        st.divider()
+        safe_section("Sanity Check",      _section_sanity,       unpaid)
