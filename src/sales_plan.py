@@ -120,7 +120,17 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
 def _load_outlet_history(company_id: str,
                          end_date: date,
                          months_back: int = 7) -> pd.DataFrame:
-    """Per-(party, month) cases + revenue for this principal — last N months."""
+    """Per-(party, month) cases + revenue for this principal — last N months.
+
+    Party attribution uses the MIS rule: each voucher is credited to its
+    LAST debtor line (max id_key), NOT the largest-Dr-amount party. UBL beer
+    (and some spirit) bills carry two debtor parties — a routing leg plus the
+    end outlet — and 'largest amount' over-credited the wrong party (e.g. a
+    wine shop showing 86 cs 'So Far' when ERP shows ~20). Free/scheme goods
+    are included (no FreeItemYN filter) so per-outlet cases tie out to the
+    MIS channel cards. Keeps the whole Sales Plan (history, targets, So Far)
+    on one consistent, MIS-matching basis.
+    """
     type_ph = ",".join(str(t) for t in SALES_TYPES)
     sql = f"""
         SELECT
@@ -136,14 +146,13 @@ def _load_outlet_history(company_id: str,
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
             SELECT TransTypeID, VoucherNo, PartyID FROM (
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
-                                          ORDER BY Amount DESC) AS rn
+                                          ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
