@@ -39,6 +39,33 @@ SEGMENT_ORDER: dict[str, list[str]] = {
     "C00056": ["Brown-Forman"],
 }
 
+# Channel display order per principal (MIS Class / Type-III split)
+CHANNEL_ORDER: dict[str, list[str]] = {
+    "C00039": ["KW Beer", "KW Institution", "PCMC Institution", "Cross Supply", "Other"],
+    "C00025": ["MOP", "POP", "Retail", "One Day", "Other"],
+    "C00040": ["MOP", "POP", "Retail", "One Day", "Other"],
+    "C00056": ["Retail", "KW Institution", "Other"],
+}
+
+
+def _channel_for(cid: str, ac3: str, cls: str) -> str:
+    """MIS channel for an outlet — UBL by AcType3, spirits/BF by Class
+    (BF Institution by AcType3). Mirrors src/sales._mis_channel."""
+    ac3 = (ac3 or "").strip()
+    cls = (cls or "").strip()
+    if cid == "C00039":                       # United Breweries — Type III
+        return {
+            "130001": "KW Beer", "130004": "KW Institution",
+            "130006": "KW Institution", "130002": "PCMC Institution",
+            "130007": "Cross Supply",
+        }.get(ac3, "Other")
+    if cid == "C00056" and ac3 == "130004":   # BF KW Institution
+        return "KW Institution"
+    return {                                  # USL / Diageo / BF retail — Class
+        "060021": "MOP", "060004": "POP",
+        "060020": "Retail", "060022": "One Day",
+    }.get(cls, "Other")
+
 
 def _segment_for(cid: str, brand: str) -> str:
     """Map a MsBrandMaster.BrandName to its owner-defined segment.
@@ -111,6 +138,103 @@ def _load_brand_monthly(company_id: str, day_cutoff: int,
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_party_monthly(company_id: str, day_cutoff: int,
+                        months_back: int = 15) -> pd.DataFrame:
+    """Per (Party, yyyy-MM): full-month + MTD cases. MIS-consistent:
+    last-Dr-line party attribution, keg-aware, FY-dedup, free goods included."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            ISNULL(p.PartyName, d.PartyID)             AS Party,
+            FORMAT(h.VoucherDate, 'yyyy-MM')           AS Mon,
+            SUM({_CASES})                              AS FullCases,
+            SUM(CASE WHEN DAY(h.VoucherDate) <= ?
+                     THEN ({_CASES}) ELSE 0 END)       AS MtdCases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        LEFT JOIN MsPartyMaster p ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = ?
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY ISNULL(p.PartyName, d.PartyID), FORMAT(h.VoucherDate, 'yyyy-MM')
+    """
+    df = run_query(sql, (day_cutoff, company_id))
+    if not df.empty:
+        df["FullCases"] = pd.to_numeric(df["FullCases"], errors="coerce").fillna(0.0)
+        df["MtdCases"]  = pd.to_numeric(df["MtdCases"],  errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_channel_monthly(company_id: str, day_cutoff: int,
+                          months_back: int = 15) -> pd.DataFrame:
+    """Per (AcType3, Class, yyyy-MM): full-month + MTD cases. MIS-consistent:
+    last-Dr-line party attribution, keg-aware, FY-dedup, free goods included."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            ISNULL(p.AcType3ID, '')                    AS AcType3ID,
+            ISNULL(p.ClassID,   '')                    AS ClassID,
+            FORMAT(h.VoucherDate, 'yyyy-MM')           AS Mon,
+            SUM({_CASES})                              AS FullCases,
+            SUM(CASE WHEN DAY(h.VoucherDate) <= ?
+                     THEN ({_CASES}) ELSE 0 END)       AS MtdCases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = ?
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY p.AcType3ID, p.ClassID, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """
+    df = run_query(sql, (day_cutoff, company_id))
+    if not df.empty:
+        df["FullCases"] = pd.to_numeric(df["FullCases"], errors="coerce").fillna(0.0)
+        df["MtdCases"]  = pd.to_numeric(df["MtdCases"],  errors="coerce").fillna(0.0)
+    return df
+
+
 def _month_str(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
@@ -127,58 +251,78 @@ def _prior_months(cur: str, n: int) -> list[str]:
     return out
 
 
-def _segment_table(cid: str, raw: pd.DataFrame, today: date) -> pd.DataFrame:
-    cur = _month_str(today)
+def _trend_table(df: pd.DataFrame, group_col: str,
+                 order: list[str], today: date,
+                 sort_decline: bool = False) -> pd.DataFrame:
+    """Build the L3M/L6M/LYSM/L3M-MTD/Current-MTD trend table for any
+    grouping column. `df` must have: <group_col>, Mon, FullCases, MtdCases.
+    """
+    cur  = _month_str(today)
     lysm = f"{today.year-1:04d}-{today.month:02d}"
-    l3 = _prior_months(cur, 3)
-    l6 = _prior_months(cur, 6)
-
-    df = raw.copy()
-    df["Segment"] = df["BrandName"].map(lambda b: _segment_for(cid, b))
+    l3   = _prior_months(cur, 3)
+    l6   = _prior_months(cur, 6)
 
     def _sum(months, col):
-        return (df[df["Mon"].isin(months)]
-                .groupby("Segment")[col].sum())
+        return df[df["Mon"].isin(months)].groupby(group_col)[col].sum()
 
-    l3m   = _sum(l3, "FullCases")
-    l6m   = _sum(l6, "FullCases")
-    lysm_s = df[df["Mon"] == lysm].groupby("Segment")["FullCases"].sum()
-    l3mtd = _sum(l3, "MtdCases") / 3.0
-    curmtd = df[df["Mon"] == cur].groupby("Segment")["MtdCases"].sum()
+    l3m    = _sum(l3, "FullCases")
+    l6m    = _sum(l6, "FullCases")
+    lysm_s = df[df["Mon"] == lysm].groupby(group_col)["FullCases"].sum()
+    l3mtd  = _sum(l3, "MtdCases") / 3.0
+    curmtd = df[df["Mon"] == cur].groupby(group_col)["MtdCases"].sum()
 
-    segs = SEGMENT_ORDER.get(cid, sorted(df["Segment"].unique()))
+    groups = list(order) + [g for g in df[group_col].unique() if g not in order]
     rows = []
-    for s in segs:
+    for g in groups:
+        full3 = float(l3m.get(g, 0.0))
+        if (full3 == 0 and float(l6m.get(g, 0.0)) == 0
+                and float(lysm_s.get(g, 0.0)) == 0
+                and float(curmtd.get(g, 0.0)) == 0):
+            continue  # skip empty groups
         rows.append({
-            "Segment":      s,
-            "L3M":          float(l3m.get(s, 0.0)),
-            "L6M":          float(l6m.get(s, 0.0)),
-            "LYSM":         float(lysm_s.get(s, 0.0)),
-            "L3M-MTD":      float(l3mtd.get(s, 0.0)),
-            "Current-MTD":  float(curmtd.get(s, 0.0)),
+            group_col:     g,
+            "L3M":         full3,
+            "L6M":         float(l6m.get(g, 0.0)),
+            "LYSM":        float(lysm_s.get(g, 0.0)),
+            "L3M-MTD":     float(l3mtd.get(g, 0.0)),
+            "Current-MTD": float(curmtd.get(g, 0.0)),
         })
     out = pd.DataFrame(rows)
-    # also append any unexpected segment not in the order list
-    extra = [s for s in df["Segment"].unique() if s not in segs]
-    for s in extra:
-        out = pd.concat([out, pd.DataFrame([{
-            "Segment": s,
-            "L3M": float(l3m.get(s, 0.0)), "L6M": float(l6m.get(s, 0.0)),
-            "LYSM": float(lysm_s.get(s, 0.0)), "L3M-MTD": float(l3mtd.get(s, 0.0)),
-            "Current-MTD": float(curmtd.get(s, 0.0)),
-        }])], ignore_index=True)
-
+    if out.empty:
+        return out
+    if sort_decline:
+        # biggest absolute MTD drop first (where we're losing sales)
+        out["_drop"] = out["Current-MTD"] - out["L3M-MTD"]
+        out = out.sort_values("_drop").drop(columns="_drop").reset_index(drop=True)
     out["MTD Δ% vs L3M"] = out.apply(
         lambda r: ((r["Current-MTD"] - r["L3M-MTD"]) / r["L3M-MTD"] * 100.0)
                   if r["L3M-MTD"] > 0 else 0.0, axis=1)
-    # TOTAL row
-    tot = {"Segment": "TOTAL"}
+    tot = {group_col: "TOTAL"}
     for c in ["L3M", "L6M", "LYSM", "L3M-MTD", "Current-MTD"]:
         tot[c] = float(out[c].sum())
     tot["MTD Δ% vs L3M"] = ((tot["Current-MTD"] - tot["L3M-MTD"]) / tot["L3M-MTD"] * 100.0
                             if tot["L3M-MTD"] > 0 else 0.0)
     out = pd.concat([out, pd.DataFrame([tot])], ignore_index=True)
     return out
+
+
+def _segment_table(cid: str, raw: pd.DataFrame, today: date) -> pd.DataFrame:
+    df = raw.copy()
+    df["Segment"] = df["BrandName"].map(lambda b: _segment_for(cid, b))
+    return _trend_table(df, "Segment", SEGMENT_ORDER.get(cid, []), today)
+
+
+def _channel_table(cid: str, raw: pd.DataFrame, today: date) -> pd.DataFrame:
+    df = raw.copy()
+    df["Channel"] = df.apply(
+        lambda r: _channel_for(cid, r["AcType3ID"], r["ClassID"]), axis=1)
+    df = df.groupby(["Channel", "Mon"], as_index=False)[["FullCases", "MtdCases"]].sum()
+    return _trend_table(df, "Channel", CHANNEL_ORDER.get(cid, []), today)
+
+
+def _party_table(raw: pd.DataFrame, today: date) -> pd.DataFrame:
+    # No fixed order — sort by biggest MTD drop (where we're losing sales).
+    return _trend_table(raw, "Party", [], today, sort_decline=True)
 
 
 def render() -> None:
@@ -192,40 +336,52 @@ def render() -> None:
         f"1-{cutoff} windows. Watch **MTD Δ%** to see who's pulling down."
     )
 
-    all_frames = []
-    for name, cid in PRINCIPALS:
-        st.markdown(f"### {name}")
-        try:
-            raw = _load_brand_monthly(cid, cutoff)
-        except Exception as exc:
-            st.error(f"Could not load {name}: {exc}")
-            continue
-        if raw.empty:
-            st.info("No sales data."); continue
-        tbl = _segment_table(cid, raw, today)
+    def _delta_style(v):
+        try: n = float(v)
+        except (TypeError, ValueError): return ""
+        if n <= -10: return "color:#dc2626;font-weight:700"
+        if n < 0:    return "color:#b45309;font-weight:600"
+        return "color:#16a34a;font-weight:600"
 
-        def _delta_style(v):
-            try: n = float(v)
-            except (TypeError, ValueError): return ""
-            if n <= -10: return "color:#dc2626;font-weight:700"
-            if n < 0:    return "color:#b45309;font-weight:600"
-            return "color:#16a34a;font-weight:600"
-
+    def _show(tbl: pd.DataFrame, name: str, kind: str,
+              height: int | None = None) -> None:
+        """Render one styled table with its OWN download button."""
+        if tbl is None or tbl.empty:
+            st.caption(f"No {kind} data."); return
         sty = (tbl.style
                .format({"L3M": "{:,.0f}", "L6M": "{:,.0f}", "LYSM": "{:,.0f}",
                         "L3M-MTD": "{:,.0f}", "Current-MTD": "{:,.0f}",
                         "MTD Δ% vs L3M": "{:+.1f}%"})
                .map(_delta_style, subset=["MTD Δ% vs L3M"]))
-        st.dataframe(sty, use_container_width=True, hide_index=True)
-
-        f = tbl.copy(); f.insert(0, "Principal", name)
-        all_frames.append(f)
-
-    if all_frames:
-        combined = pd.concat(all_frames, ignore_index=True)
+        st.dataframe(sty, use_container_width=True, hide_index=True, height=height)
         st.download_button(
-            "⬇️ Download segment analysis (CSV)",
-            combined.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"segment_analysis_{today.isoformat()}.csv",
+            f"⬇️ Download — {name} · {kind}",
+            tbl.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{kind}_{name.replace(' ', '_')}_{today.isoformat()}.csv",
             mime="text/csv",
+            key=f"dl_{cid}_{kind}",
         )
+
+    for name, cid in PRINCIPALS:
+        st.markdown(f"## {name}")
+        try:
+            raw_b = _load_brand_monthly(cid, cutoff)
+            raw_c = _load_channel_monthly(cid, cutoff)
+            raw_p = _load_party_monthly(cid, cutoff)
+        except Exception as exc:
+            st.error(f"Could not load {name}: {exc}")
+            continue
+        if raw_b.empty and raw_c.empty and raw_p.empty:
+            st.info("No sales data."); continue
+
+        st.markdown("**By segment**")
+        _show(_segment_table(cid, raw_b, today), name, "segment")
+
+        st.markdown("**By channel**")
+        _show(_channel_table(cid, raw_c, today), name, "channel")
+
+        st.markdown("**By party — biggest losers first** "
+                    "(sorted by MTD drop vs the prior 3-month MTD average)")
+        _show(_party_table(raw_p, today), name, "party", height=460)
+
+        st.divider()
