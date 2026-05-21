@@ -2092,6 +2092,40 @@ def _section_salesman_scoreboard(principal: str,
                 st.rerun()
 
 
+def _section_segment_breakdown(cid: str, op_month: str) -> None:
+    """Achievement split by brand-segment for the operating month — the same
+    segments as the Segment Analysis tab (MIS-consistent: keg-aware, FY-dedup,
+    free goods included). Shows the principal 'not as a whole'."""
+    from datetime import date as _date
+    from src.segments import _load_brand_monthly, _segment_for, SEGMENT_ORDER
+
+    raw = _load_brand_monthly(cid, _date.today().day)
+    cur = raw[raw["Mon"] == op_month].copy()
+    if cur.empty:
+        st.caption("No segment data for this month.")
+        return
+    cur["Segment"] = cur["BrandName"].map(lambda b: _segment_for(cid, b))
+    seg = cur.groupby("Segment")["FullCases"].sum()
+    total = float(seg.sum())
+    if total <= 0:
+        st.caption("No segment data for this month.")
+        return
+
+    order = SEGMENT_ORDER.get(cid, [])
+    ordered = [s for s in order if s in seg.index] + \
+              [s for s in seg.index if s not in order]
+    rows = [{"Segment": s, "Cases": float(seg[s]),
+             "% of total": float(seg[s]) / total * 100.0} for s in ordered]
+    rows.append({"Segment": "TOTAL", "Cases": total, "% of total": 100.0})
+    df = pd.DataFrame(rows)
+
+    st.markdown("**Achievement by segment — this month**")
+    st.dataframe(
+        df.style.format({"Cases": "{:,.0f}", "% of total": "{:.1f}%"}),
+        use_container_width=True, hide_index=True,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2237,6 +2271,8 @@ def render() -> None:
         _subtarget_cards(target_entry, achieved_by_team,
                          hero_total=achieved_total,
                          allowed_teams=list(cfg["subteams"].keys()))
+
+        safe_section("Segments", _section_segment_breakdown, cid, op_month)
 
         _edit_target_controls(principal, op_month, target_entry)
 
