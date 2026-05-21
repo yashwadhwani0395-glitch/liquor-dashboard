@@ -573,50 +573,86 @@ def _overdue_bucket(overdue: int) -> str:
     return "Overdue 60d+"
 
 
-def _fifo_unpaid(ledger: pd.DataFrame,
-                 today: pd.Timestamp) -> pd.DataFrame:
-    """Apply party-level FIFO knock-off across the FULL TrVocDetail
-    ledger and return one row per surviving Dr entry (unpaid bill or
-    adjustment). Vectorized within each party via cumulative-sum, so
-    total wall time is O(n) on the ledger size.
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_party_closebal() -> dict[str, float]:
+    """ERP-maintained per-party closing balance (MsPartyOpening.CloseBal).
 
-    Algorithm:
-      1. Compute total Cr pool per party = SUM(Cr Amount).
-      2. Sort each party's Dr rows oldest-first by (AgeingDate, VoucherNo).
-      3. CumSum of Dr along that order. The amount that's "covered"
-         by the Cr pool is min(CumDr, CrPool). Each Dr row's Remaining
-         is its share of the residual:
-             Remaining_i = max(0, min(Amount_i, CumDr_i - CrPool))
-      4. Anything > Rs0.5 stays as "unpaid".
-
-    Side effects:
-      - Skips parties whose total Net Dr - Cr <= 0 (advance-paid or
-        even-balanced).
-      - Reconciliation: SUM(Remaining) per party MUST equal that
-        party's NetDr within rounding. We assert this; mismatches go
-        to stderr.
+    This is Teknik's OWN authoritative outstanding — it equals the party
+    ledger's closing balance and reconciles to the Balance Sheet Sundry
+    Debtors. Verified to the rupee against Teknik's screen (e.g. BLACK DOG
+    1,115,033). Summing raw TrVocDetail cannot reproduce this because the
+    ERP carries reconciled opening balances per FY that are not stored as
+    individual transactions. We therefore anchor the debtors outstanding to
+    CloseBal rather than to the raw ledger net.
     """
-    # Per-party Cr pool (all Cr rows for the party, irrespective of TT)
-    cr_pool = (
-        ledger.loc[ledger["DrCrIndicator"] == "C"]
-              .groupby("PartyID")["Amount"].sum()
-              .to_dict()
-    )
+    df = run_query("""
+        SELECT PartyID, CAST(CloseBal AS float) AS CloseBal
+        FROM MsPartyOpening WHERE PartyID LIKE 'D%'
+    """)
+    if df.empty:
+        return {}
+    return {str(r.PartyID).strip(): float(r.CloseBal) for r in df.itertuples()}
 
-    # Work only on Dr rows from here on
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_party_attrs() -> dict[str, dict]:
+    """Per-party master attributes, keyed by PartyID. Used to fabricate
+    'Opening balance' rows for dormant parties that carry a CloseBal but
+    have NO transactions in the current ledger (so no row exists to clone).
+    """
+    df = run_query("""
+        SELECT PartyID,
+               ISNULL(PartyName,'')            AS PartyName,
+               ISNULL(LicenseTypeID,'')        AS LicenseTypeID,
+               ISNULL(AcType3ID,'')            AS AcType3ID,
+               ISNULL(SalesManID,'')           AS SalesManID,
+               ISNULL(SalesManID1,'')          AS SalesManID1,
+               ISNULL(SalesManID2,'')          AS SalesManID2,
+               ISNULL(CreditDays,0)            AS PartyDefaultCD,
+               CAST(ISNULL(CDPercent,0) AS float) AS CDPercent,
+               ISNULL(BannedByAssoc,'')        AS BannedByAssoc,
+               ISNULL(AssoBan_Type,'')         AS AssoBan_Type,
+               ISNULL(AssoBan_Description,'')   AS AssoBan_Description,
+               ISNULL(AssoBilling_YN,'')       AS AssoBilling_YN
+        FROM MsPartyMaster WHERE PartyID LIKE 'D%'
+    """)
+    out: dict[str, dict] = {}
+    for r in df.itertuples(index=False):
+        d = r._asdict()
+        out[str(d.pop("PartyID")).strip()] = d
+    return out
+
+
+def _fifo_unpaid(ledger: pd.DataFrame,
+                 today: pd.Timestamp,
+                 party_closebal: dict[str, float] | None = None) -> pd.DataFrame:
+    """Allocate each party's ERP CloseBal across its Dr bills and return one
+    row per surviving (unpaid) bill, so SUM(Remaining) per party == CloseBal.
+
+    The party-level total is anchored to MsPartyOpening.CloseBal — Teknik's
+    own authoritative outstanding (ties to the ledger + Balance Sheet) — NOT
+    to the raw TrVocDetail net, which cannot reproduce the ERP's reconciled
+    opening balances.
+
+    Allocation (interim, until exact Teknik bill-matching is accessible via
+    WINFA/TempData): bills are sorted NEWEST-first per party and CloseBal is
+    laid against them top-down, so the most recent bills are treated as the
+    open ones and older bills are knocked off. A synthetic 'Opening balance'
+    row absorbs any shortfall when CloseBal exceeds the party's billed Dr in
+    the ledger (carried-forward balance not present as individual bills).
+
+    ⚠ Bill-level age is therefore an ESTIMATE; party/grand totals are EXACT.
+    """
+    if party_closebal is None:
+        party_closebal = _load_party_closebal()
+    target = {p: c for p, c in party_closebal.items() if c > 0.5}
+
     drs = ledger.loc[ledger["DrCrIndicator"] == "D"].copy()
-
-    # Pre-filter to parties with net Dr > 0 (everyone else is square).
-    party_dr = drs.groupby("PartyID")["Amount"].sum()
-    party_net = party_dr.subtract(pd.Series(cr_pool), fill_value=0.0)
-    valid_parties = party_net.loc[party_net > 0.5].index
-    drs = drs.loc[drs["PartyID"].isin(valid_parties)].copy()
+    drs = drs.loc[drs["PartyID"].isin(target.keys())].copy()
     if drs.empty:
         return drs
 
-    # Credit days per Dr row. Sales TT rows use the McDowell/CD rule;
-    # non-sales Dr rows (TT=12 bounces, TT=10 JV, TT=24 DN, etc.) get
-    # the 40-day default since they have no brand context.
+    # Credit days per Dr row (McDowell/CD rule for sales; 40-day default else)
     is_sales = drs["TransTypeID"].isin(SALES_TT_SET)
     drs["IsSalesBill"] = is_sales.astype(int)
     drs["CreditDays"] = np.where(
@@ -624,49 +660,98 @@ def _fifo_unpaid(ledger: pd.DataFrame,
         np.where(is_sales & (drs["HasCDItem"] == 1), 17, 40),
     )
     drs["Principal"] = drs["DominantPrincipal"].map(PRINCIPAL_MAP).fillna("Other")
-    # Adjustments / non-sales Dr → label distinctly so they don't get
-    # mixed with real sales bills in by-principal totals.
     drs.loc[~is_sales, "Principal"] = "Adjustment (non-sales Dr)"
 
-    # Sort by party + ageing date + voucher to lock FIFO order
-    drs = drs.sort_values(["PartyID", "AgeingDate", "VoucherNo", "TransTypeID"]) \
-             .reset_index(drop=True)
+    # NEWEST first → CloseBal lands on the most recent bills; oldest knocked off
+    drs = drs.sort_values(
+        ["PartyID", "AgeingDate", "VoucherNo", "TransTypeID"],
+        ascending=[True, False, False, False],
+    ).reset_index(drop=True)
     drs["CumDr"] = drs.groupby("PartyID")["Amount"].cumsum()
-    party_pool_series = drs["PartyID"].map(cr_pool).fillna(0.0).astype(float)
-
-    cum_unpaid       = (drs["CumDr"] - party_pool_series).clip(lower=0.0)
-    cum_unpaid_prev  = (cum_unpaid - drs["Amount"]).clip(lower=0.0)
-    drs["Remaining"] = (cum_unpaid - cum_unpaid_prev).clip(lower=0.0)
+    tgt = drs["PartyID"].map(target).astype(float)
+    cum_kept       = np.minimum(drs["CumDr"], tgt)
+    cum_kept_prev  = np.minimum(drs["CumDr"] - drs["Amount"], tgt).clip(lower=0.0)
+    drs["Remaining"] = (cum_kept - cum_kept_prev).clip(lower=0.0)
 
     unpaid = drs.loc[drs["Remaining"] > 0.5].copy()
+
+    # Shortfall: CloseBal beyond the party's billed Dr → synthetic opening row
+    sumdr = drs.groupby("PartyID")["Amount"].sum()
+    shortfall = {
+        p: target[p] - float(sumdr.get(p, 0.0))
+        for p in target
+        if target[p] - float(sumdr.get(p, 0.0)) > 0.5
+    }
+    if shortfall:
+        latest = (
+            drs[drs["PartyID"].isin(shortfall.keys())]
+            .sort_values(["PartyID", "AgeingDate"], ascending=[True, False])
+            .groupby("PartyID", as_index=False).first()
+        )
+        syn = latest.copy()
+        syn["Amount"]        = syn["PartyID"].map(shortfall).astype(float)
+        syn["Remaining"]     = syn["Amount"]
+        syn["Principal"]     = "Opening balance"
+        syn["IsSalesBill"]   = 0
+        syn["TransTypeName"] = "Opening / carried-forward balance"
+        syn["ShortName"]     = "OB"
+        syn["AgeingDate"]    = today - pd.Timedelta(days=365)   # ages into 90+
+        syn["CreditDays"]    = 40
+        unpaid = pd.concat([unpaid, syn], ignore_index=True)
+
+    # Dormant parties: CloseBal > 0 but NO Dr rows in the ledger at all
+    # (ancient carry-forward / loan balances). Fabricate an opening row from
+    # master attributes so the grand total still ties to the ledger / BS.
+    represented = set(unpaid["PartyID"]) if not unpaid.empty else set()
+    missing = {p: c for p, c in target.items() if p not in represented}
+    if missing and not unpaid.empty:
+        attrs = _load_party_attrs()
+        recs = []
+        for pid, amt in missing.items():
+            a = attrs.get(pid, {})
+            recs.append({
+                "PartyID": pid, "PartyName": a.get("PartyName", ""),
+                "TransTypeID": 0, "VoucherNo": "OB", "DrCrIndicator": "D",
+                "Amount": amt, "VoucherDate": today - pd.Timedelta(days=365),
+                "TPDate": pd.NaT,
+                "TransTypeName": "Opening / carried-forward balance",
+                "ShortName": "OB", "HasMcDowells": 0, "HasCDItem": 0,
+                "DominantPrincipal": "",
+                "LicenseTypeID": a.get("LicenseTypeID", ""),
+                "AcType3ID": a.get("AcType3ID", ""),
+                "SalesManID": a.get("SalesManID", ""),
+                "SalesManID1": a.get("SalesManID1", ""),
+                "SalesManID2": a.get("SalesManID2", ""),
+                "PartyDefaultCD": a.get("PartyDefaultCD", 0),
+                "CDPercent": a.get("CDPercent", 0.0),
+                "BannedByAssoc": a.get("BannedByAssoc", ""),
+                "AssoBan_Type": a.get("AssoBan_Type", ""),
+                "AssoBan_Description": a.get("AssoBan_Description", ""),
+                "AssoBilling_YN": a.get("AssoBilling_YN", ""),
+                "AgeingDate": today - pd.Timedelta(days=365),
+                "IsSalesBill": 0, "CreditDays": 40,
+                "Principal": "Opening balance", "Remaining": amt,
+            })
+        miss_df = pd.DataFrame(recs).reindex(columns=unpaid.columns)
+        unpaid = pd.concat([unpaid, miss_df], ignore_index=True)
+
     if unpaid.empty:
         return unpaid
 
-    # Ageing from AgeingDate (TPDate-when-present, else VoucherDate)
     unpaid["AgeDays"]       = (today - unpaid["AgeingDate"]).dt.days.astype(int)
     unpaid["OverdueBy"]     = (unpaid["AgeDays"] - unpaid["CreditDays"]).clip(lower=0)
     unpaid["IsOverdue"]     = unpaid["OverdueBy"] > 0
     unpaid["AgeBucket"]     = unpaid["AgeDays"].map(_age_bucket)
     unpaid["OverdueBucket"] = unpaid["OverdueBy"].map(_overdue_bucket)
+    unpaid["Channel"]       = unpaid["LicenseTypeID"].map(CHANNEL_MAP).fillna("Other")
 
-    # Channel = pure LicenseTypeID lookup. The previous code was
-    # overriding to "Cross-Supply (Institution)" when AcType3='130007',
-    # but Cross-Supply is a ROUTING flag (UBL sub-distribution path),
-    # not a channel — the same physical outlet can be wine shop +
-    # cross-supply simultaneously. Now Cross-Supply is reflected in
-    # the salesman attribution (BF / UBL split) but does NOT pollute
-    # the channel categorisation.
-    unpaid["Channel"] = unpaid["LicenseTypeID"].map(CHANNEL_MAP).fillna("Other")
-
-    # Reconciliation: SUM(Remaining) per party should equal NetDr.
-    # Log any mismatch > Rs1 to stderr — Cloud logs surface these.
+    # Reconciliation: SUM(Remaining) per party MUST equal CloseBal.
     recon = (unpaid.groupby("PartyID")["Remaining"].sum()
-             .subtract(party_net.loc[valid_parties], fill_value=0.0)
-             .abs())
+             .subtract(pd.Series(target), fill_value=0.0).abs())
     bad = recon[recon > 1.0]
     if not bad.empty:
         print(
-            f"[debtors] FIFO recon mismatch on {len(bad)} parties: "
+            f"[debtors] CloseBal recon mismatch on {len(bad)} parties: "
             f"max diff Rs{float(bad.max()):,.0f}",
             file=sys.stderr,
         )
