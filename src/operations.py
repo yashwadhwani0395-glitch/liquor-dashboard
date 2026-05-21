@@ -77,7 +77,7 @@ def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4

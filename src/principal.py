@@ -99,7 +99,7 @@ def _load_principal_brands(company_id: str, start: date, end: date) -> pd.DataFr
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4

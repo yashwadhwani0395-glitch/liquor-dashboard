@@ -414,7 +414,7 @@ def _load_brand_buyers(company_id: str,
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
@@ -489,7 +489,7 @@ def _load_brand_outlet_sales(company_id: str,
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
@@ -587,7 +587,7 @@ def _load_brand_achievement(company_id: str, month_str: str) -> pd.DataFrame:
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (

@@ -112,7 +112,7 @@ def _load_period_kpis(start: date, end: date,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -186,7 +186,7 @@ def _load_monthly_revenue(months: int = 24,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -234,7 +234,7 @@ def _load_daily_revenue(months: int = 24,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -293,7 +293,7 @@ def _load_party_daily_revenue(months: int = 14,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -350,7 +350,7 @@ def _load_principal_growth(start: date, end: date,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -379,9 +379,42 @@ def _load_principal_growth(start: date, end: date,
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+# MIS channel classification — mirrors the Sales-Plan cards / MIS reports.
+# UBL (C00039) splits by AcType3 ("Type III"); USL/Diageo/BF split by Class
+# (MsCodeMaster CodeType 6), with BF Institution by AcType3. Anything else
+# falls to "Other".
+def _mis_channel(company_id: str, ac3: str, cls: str) -> str:
+    company_id = (company_id or "").strip()
+    ac3 = (ac3 or "").strip()
+    cls = (cls or "").strip()
+    if company_id == "C00039":          # United Breweries — Type III
+        return {
+            "130001": "KW Beer",
+            "130004": "KW Institution",
+            "130006": "KW Institution",
+            "130002": "PCMC Institution",
+            "130007": "Cross Supply",
+        }.get(ac3, "Other")
+    if company_id == "C00056" and ac3 == "130004":   # BF KW Institution
+        return "KW Institution"
+    return {                            # USL / Diageo / BF retail — Class
+        "060021": "MOP",
+        "060004": "POP",
+        "060020": "Retail",
+        "060022": "One Day",
+    }.get(cls, "Other")
+
+
 def _load_channel_revenue(start: date, end: date,
                           principal_ids: tuple[str, ...]) -> pd.DataFrame:
-    """Per-channel revenue using LicenseType+AcType3 logic (mirrors salesman.py)."""
+    """Per-channel revenue + cases on the MIS basis (Class / Type-III).
+
+    Channel = the outlet's AcType3 (UBL) or ClassID (spirits/BF) — the same
+    split the MIS reports and Sales-Plan cards use, NOT LicenseType. Party
+    attribution = last debtor line (id_key). Free/scheme goods are INCLUDED
+    (stock physically sent; they carry units but Rs0 revenue), matching MIS
+    'Consider Qty: All'. Returns columns: Channel, Revenue, Cases.
+    """
     type_ph = ",".join(str(t) for t in SALES_TYPES)
     company_sql = ""
     company_params: tuple = ()
@@ -391,24 +424,16 @@ def _load_channel_revenue(start: date, end: date,
 
     sql = f"""
         SELECT
-            CASE
-              WHEN p.LicenseTypeID = '180001'                                THEN 'FL-II Wine Shop'
-              WHEN p.LicenseTypeID = '180004'                                THEN 'FL-BR-II Beer Shopee'
-              WHEN p.LicenseTypeID = '180005'                                THEN 'FL-IV Club'
-              WHEN p.LicenseTypeID = '180007'                                THEN 'FL-IV One Day'
-              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130004'    THEN 'FL-III KW Institution'
-              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130002'    THEN 'FL-III PCMC Institution'
-              WHEN p.LicenseTypeID = '180002'                                THEN 'FL-III Permit Room'
-              WHEN p.AcType3ID     = '130007'                                THEN 'Beer Cross Supply'
-              ELSE 'Other'
-            END AS Channel,
-            SUM(CAST(vi.TotalAmount AS FLOAT)) AS Revenue
+            b.CompanyID                                AS CompanyID,
+            ISNULL(p.AcType3ID, '')                    AS AcType3ID,
+            ISNULL(p.ClassID,   '')                    AS ClassID,
+            SUM(CAST(vi.TotalAmount AS FLOAT))         AS Revenue,
+            SUM({_CASES})                              AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -436,23 +461,19 @@ def _load_channel_revenue(start: date, end: date,
           AND h.Cancelled   = 'N'
           AND h.VoucherDate BETWEEN ? AND ?
           {company_sql}
-        GROUP BY
-            CASE
-              WHEN p.LicenseTypeID = '180001'                                THEN 'FL-II Wine Shop'
-              WHEN p.LicenseTypeID = '180004'                                THEN 'FL-BR-II Beer Shopee'
-              WHEN p.LicenseTypeID = '180005'                                THEN 'FL-IV Club'
-              WHEN p.LicenseTypeID = '180007'                                THEN 'FL-IV One Day'
-              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130004'    THEN 'FL-III KW Institution'
-              WHEN p.LicenseTypeID = '180002' AND p.AcType3ID = '130002'    THEN 'FL-III PCMC Institution'
-              WHEN p.LicenseTypeID = '180002'                                THEN 'FL-III Permit Room'
-              WHEN p.AcType3ID     = '130007'                                THEN 'Beer Cross Supply'
-              ELSE 'Other'
-            END
-        ORDER BY Revenue DESC
+        GROUP BY b.CompanyID, p.AcType3ID, p.ClassID
     """
-    df = run_query(sql, (str(start), str(end)) + company_params)
-    if not df.empty:
-        df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
+    raw = run_query(sql, (str(start), str(end)) + company_params)
+    if raw.empty:
+        return pd.DataFrame(columns=["Channel", "Revenue", "Cases"])
+    raw["Revenue"] = pd.to_numeric(raw["Revenue"], errors="coerce").fillna(0.0)
+    raw["Cases"]   = pd.to_numeric(raw["Cases"],   errors="coerce").fillna(0.0)
+    raw["Channel"] = raw.apply(
+        lambda r: _mis_channel(r["CompanyID"], r["AcType3ID"], r["ClassID"]), axis=1
+    )
+    df = (raw.groupby("Channel", as_index=False)
+              .agg(Revenue=("Revenue", "sum"), Cases=("Cases", "sum"))
+              .sort_values("Revenue", ascending=False))
     return df
 
 
@@ -480,7 +501,7 @@ def _load_brand_growth(start: date, end: date,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -1048,14 +1069,20 @@ def _section_breakdown(principal_df: pd.DataFrame,
 
     with col_r:
         st.markdown("##### Revenue by Channel")
+        st.caption("Channel = MIS Class / Type-III basis (UBL by AcType3; "
+                   "USL/Diageo/BF by Class). Includes free/scheme goods.")
         if channel_df.empty:
             st.info("No channel-level data for this period.")
         else:
             total = channel_df["Revenue"].sum()
             tbl = channel_df.copy()
             tbl["% of Total"] = (tbl["Revenue"] / total * 100).round(1)
-            tbl = tbl[["Channel", "Revenue", "% of Total"]]
+            cols = ["Channel", "Revenue", "% of Total"]
+            if "Cases" in tbl.columns:
+                cols = ["Channel", "Cases", "Revenue", "% of Total"]
+            tbl = tbl[cols]
             styled = tbl.style.format({
+                "Cases":       "{:,.0f}",
                 "Revenue":     format_inr,
                 "% of Total":  "{:.1f}%",
             })

@@ -81,7 +81,7 @@ def _load_brand_party_revenue(start: date, end: date,
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
@@ -205,7 +205,7 @@ def _load_salesman_daily_revenue(
             ON  vi.TransTypeID = h.TransTypeID
             AND vi.VoucherNo   = h.VoucherNo
             AND vi.ItemID      LIKE 'I%'
-            AND vi.FreeItemYN  = 'N'
+            -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.FinancialYear = CASE
                 WHEN MONTH(h.VoucherDate) >= 4
                 THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
