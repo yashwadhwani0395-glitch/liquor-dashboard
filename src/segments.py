@@ -365,26 +365,30 @@ def render() -> None:
             key=f"dl_{cid}_{kind}",
         )
 
-    for name, cid in PRINCIPALS:
-        st.markdown(f"## {name}")
-        try:
-            raw_b = _load_brand_monthly(cid, cutoff)
-            raw_c = _load_channel_monthly(cid, cutoff)
-            raw_p = _load_party_monthly(cid, cutoff)
-        except Exception as exc:
-            st.error(f"Could not load {name}: {exc}")
-            continue
-        if raw_b.empty and raw_c.empty and raw_p.empty:
-            st.info("No sales data."); continue
+    # Principal selector — one at a time, like the Sales Plan tab
+    names = [n for n, _ in PRINCIPALS]
+    sel = st.radio("Principal", names, horizontal=True, index=0,
+                   key="seg_principal")
+    cid = dict(PRINCIPALS)[sel]
+    name = sel
+    st.divider()
 
-        st.markdown("**By segment**")
-        _show(_segment_table(cid, raw_b, today), name, "segment")
+    try:
+        raw_b = _load_brand_monthly(cid, cutoff)
+        raw_c = _load_channel_monthly(cid, cutoff)
+        raw_p = _load_party_monthly(cid, cutoff)
+    except Exception as exc:
+        st.error(f"Could not load {name}: {exc}")
+        return
+    if raw_b.empty and raw_c.empty and raw_p.empty:
+        st.info("No sales data for this principal."); return
 
-        st.markdown("**By channel**")
-        _show(_channel_table(cid, raw_c, today), name, "channel")
+    st.markdown("**By segment**")
+    _show(_segment_table(cid, raw_b, today), name, "segment")
 
-        st.markdown("**By party — biggest losers first** "
-                    "(sorted by MTD drop vs the prior 3-month MTD average)")
-        _show(_party_table(raw_p, today), name, "party", height=460)
+    st.markdown("**By channel**")
+    _show(_channel_table(cid, raw_c, today), name, "channel")
 
-        st.divider()
+    st.markdown("**By party — biggest losers first** "
+                "(sorted by MTD drop vs the prior 3-month MTD average)")
+    _show(_party_table(raw_p, today), name, "party", height=460)
