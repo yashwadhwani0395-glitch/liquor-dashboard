@@ -162,9 +162,9 @@ with t2:
         render_inventory()
 
 with t3:
-    s_plan, s_overview, s_team, s_dist, s_meeting, s_ops = st.tabs([
+    s_plan, s_overview, s_segment, s_team, s_dist, s_meeting, s_ops = st.tabs([
         "Sales Plan",
-        "Sales Overview", "Team Performance",
+        "Sales Overview", "Segment Analysis", "Team Performance",
         "Distribution", "Meeting Pack", "Operations Rhythm",
     ])
     with s_plan:
@@ -173,6 +173,9 @@ with t3:
     with s_overview:
         from src.sales import render as render_sales
         render_sales()
+    with s_segment:
+        from src.segments import render as render_segments
+        render_segments()
     with s_team:
         from src.salesman import render as render_salesman
         render_salesman()
