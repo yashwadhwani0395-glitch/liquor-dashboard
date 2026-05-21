@@ -75,30 +75,38 @@ PRINCIPAL_TEAMS: dict[str, dict] = {
             "Cross Supply": [],
         },
     },
+    # USL + Diageo channels are the MIS "Class" buckets (MOP/POP/Retail/
+    # One Day = MsPartyMaster.ClassID via MsCodeMaster CodeType 6). MOP & POP
+    # share the same POP-team salesmen; One Day has no assigned salesman.
     "United Spirits": {
         "company_id": "C00025",
         "color":      "#1B4F72",
         "subteams": {
-            "Wine Shops":   ["Shashank", "Sachin"],
-            "Permit Rooms": ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "MOP":     ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "POP":     ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "Retail":  ["Shashank", "Sachin"],
+            "One Day": [],   # Class 060022 — no assigned salesman
         },
     },
     "Diageo": {
         "company_id": "C00040",
         "color":      "#378ADD",
         "subteams": {
-            "Wine Shops":   ["Ajay", "Deepak Patil"],
-            "Permit Rooms": ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "MOP":     ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "POP":     ["Atish", "Tulsiram", "Saurabh", "Miran", "Prashant"],
+            "Retail":  ["Ajay", "Deepak Patil"],
+            "One Day": [],   # Class 060022 — no assigned salesman
         },
     },
     "Brown-Forman": {
         "company_id": "C00056",
         "color":      "#EF9F27",
         "subteams": {
-            "Wine Shops":   ["Ajay", "Deepak Patil"],
-            # BF Institution = KW Institution only (no PCMC)
-            "Institution":  ["Rohit Lakhan", "Shashank Desai",
-                             "Pranav", "Rahul Ghone"],
+            # Retail = Class 060020 (Ajay/Deepak Diageo-base + Omkar/Aabid),
+            # single card (not sub-split). Institution = AcType3 130004.
+            "Retail":      ["Ajay", "Deepak Patil", "Omkar", "Aabid"],
+            "Institution": ["Rohit Lakhan", "Shashank Desai",
+                            "Pranav", "Rahul Ghone"],
         },
     },
 }
@@ -245,6 +253,131 @@ def _load_ubl_mis_channels(start: date, end: date) -> dict[str, float]:
     for _, r in df.iterrows():
         ch = _UBL_AC3_CHANNEL.get(str(r["AcType3ID"]).strip())
         if ch:
+            out[ch] += float(r["Cases"])
+    return out
+
+
+# Class (MsCodeMaster CodeType 6) → MIS channel for USL / Diageo.
+_CLASS_CHANNEL = {
+    "060021": "MOP",
+    "060004": "POP",
+    "060020": "Retail",
+    "060022": "One Day",
+}
+
+
+def _mis_party_voucher_join() -> str:
+    """SQL fragment: voucher → its MIS party (LAST debtor line, max id_key).
+
+    Reused by the Class-based loaders. Free goods are included (no
+    FreeItemYN filter) to match the MIS reports.
+    """
+    return """
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+    """
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_class_channels(company_id: str, start: date, end: date) -> dict[str, float]:
+    """USL/Diageo channel cases on the MIS 'Class' basis (MOP/POP/Retail/
+    One Day = ClassID), using the same mechanics validated for UBL:
+    last-debtor-line attribution + free goods included.
+
+    Reproduces the MIS partywise Class files within ~0.4% (Retail exact).
+    Returns {"MOP": ., "POP": ., "Retail": ., "One Day": .}.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT ISNULL(p.ClassID,'') AS ClassID, SUM({_CASES}) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        {_mis_party_voucher_join()}
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = ?
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate BETWEEN ? AND ?
+        GROUP BY p.ClassID
+    """
+    df = run_query(sql, (company_id, str(start), str(end)))
+    out = {"MOP": 0.0, "POP": 0.0, "Retail": 0.0, "One Day": 0.0}
+    if df.empty:
+        return out
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    for _, r in df.iterrows():
+        ch = _CLASS_CHANNEL.get(str(r["ClassID"]).strip())
+        if ch:
+            out[ch] += float(r["Cases"])
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_bf_channels(start: date, end: date) -> dict[str, float]:
+    """Brown-Forman channel cases. Mixed basis (owner spec):
+      Retail      = Class 060020 outlets
+      Institution = AcType3 130004 (KW Institution) outlets
+    Same last-Dr-line + free-goods mechanics. Returns {"Retail", "Institution"}.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            CASE
+                WHEN p.ClassID   = '060020' THEN 'Retail'
+                WHEN p.AcType3ID = '130004' THEN 'Institution'
+                ELSE 'Other'
+            END AS Channel,
+            SUM({_CASES}) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        {_mis_party_voucher_join()}
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = 'C00056'
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate BETWEEN ? AND ?
+        GROUP BY
+            CASE
+                WHEN p.ClassID   = '060020' THEN 'Retail'
+                WHEN p.AcType3ID = '130004' THEN 'Institution'
+                ELSE 'Other'
+            END
+    """
+    df = run_query(sql, (str(start), str(end)))
+    out = {"Retail": 0.0, "Institution": 0.0}
+    if df.empty:
+        return out
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    for _, r in df.iterrows():
+        ch = str(r["Channel"]).strip()
+        if ch in out:
             out[ch] += float(r["Cases"])
     return out
 
@@ -2021,16 +2154,21 @@ def render() -> None:
         cm_hist = hist[hist["BillMonth"] == op_month]
 
         # ── Achieved per sub-team ──
-        # UBL uses the MIS "Type III" rule (classify by AcType3, attribute
-        # to the last debtor line, include free goods) so the channel cards
-        # tie out to the principal's MIS reports. Every other principal keeps
-        # the salesman-universe attribution.
+        # UBL / USL / Diageo / BF use the MIS rule (classify by AcType3 or
+        # Class, attribute to the last debtor line, include free goods) so
+        # the channel cards tie out to the principal's MIS reports. Hero =
+        # sum of the MIS channel cards so hero and cards reconcile.
         achieved_by_team: dict[str, float] = {}
+        mb = _month_bounds(op_month_date)
+        ch_start, ch_end = mb[0], min(mb[1], today)
         if principal == "United Breweries":
-            mb = _month_bounds(op_month_date)
-            ch_start, ch_end = mb[0], min(mb[1], today)
             achieved_by_team = _load_ubl_mis_channels(ch_start, ch_end)
-            # Hero = sum of the MIS channel cards so hero and cards reconcile.
+            achieved_total = float(sum(achieved_by_team.values()))
+        elif principal in ("United Spirits", "Diageo"):
+            achieved_by_team = _load_class_channels(cid, ch_start, ch_end)
+            achieved_total = float(sum(achieved_by_team.values()))
+        elif principal == "Brown-Forman":
+            achieved_by_team = _load_bf_channels(ch_start, ch_end)
             achieved_total = float(sum(achieved_by_team.values()))
         else:
             # Achieved this month so far for the principal
