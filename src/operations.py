@@ -92,7 +92,7 @@ def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL

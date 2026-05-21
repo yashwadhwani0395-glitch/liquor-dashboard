@@ -218,7 +218,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
@@ -289,7 +289,7 @@ def _load_active_universe() -> pd.DataFrame:
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL

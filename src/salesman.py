@@ -95,7 +95,7 @@ def _load_brand_party_revenue(start: date, end: date,
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
@@ -217,7 +217,7 @@ def _load_salesman_daily_revenue(
             SELECT TransTypeID, VoucherNo, PartyID FROM (
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
-                                          ORDER BY Amount DESC) AS rn
+                                          ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1

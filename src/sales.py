@@ -126,7 +126,7 @@ def _load_period_kpis(start: date, end: date,
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
@@ -305,7 +305,7 @@ def _load_party_daily_revenue(months: int = 14,
             SELECT TransTypeID, VoucherNo, PartyID FROM (
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
-                                          ORDER BY Amount DESC) AS rn
+                                          ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
@@ -422,7 +422,7 @@ def _load_channel_revenue(start: date, end: date,
                 SELECT TransTypeID, VoucherNo, PartyID,
                        ROW_NUMBER() OVER (
                            PARTITION BY TransTypeID, VoucherNo
-                           ORDER BY Amount DESC
+                           ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator = 'D'
