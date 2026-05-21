@@ -2093,36 +2093,56 @@ def _section_salesman_scoreboard(principal: str,
 
 
 def _section_segment_breakdown(cid: str, op_month: str) -> None:
-    """Achievement split by brand-segment for the operating month — the same
-    segments as the Segment Analysis tab (MIS-consistent: keg-aware, FY-dedup,
-    free goods included). Shows the principal 'not as a whole'."""
+    """Segment-wise data for the principal — the same MIS-consistent
+    (keg-aware, FY-dedup, free goods included) brand-segment view as the
+    Segment Analysis tab. Shows the principal 'not as a whole': for each
+    segment, this-month achievement plus the L3M / L6M / LYSM / L3M-MTD
+    trend so the planner sees momentum, not just the running total."""
     from datetime import date as _date
-    from src.segments import _load_brand_monthly, _segment_for, SEGMENT_ORDER
+    from src.segments import _load_brand_monthly, _segment_table
 
-    raw = _load_brand_monthly(cid, _date.today().day)
-    cur = raw[raw["Mon"] == op_month].copy()
-    if cur.empty:
-        st.caption("No segment data for this month.")
-        return
-    cur["Segment"] = cur["BrandName"].map(lambda b: _segment_for(cid, b))
-    seg = cur.groupby("Segment")["FullCases"].sum()
-    total = float(seg.sum())
-    if total <= 0:
-        st.caption("No segment data for this month.")
+    today = _date.today()
+    raw = _load_brand_monthly(cid, today.day)
+    if raw.empty:
+        st.caption("No segment data for this principal.")
         return
 
-    order = SEGMENT_ORDER.get(cid, [])
-    ordered = [s for s in order if s in seg.index] + \
-              [s for s in seg.index if s not in order]
-    rows = [{"Segment": s, "Cases": float(seg[s]),
-             "% of total": float(seg[s]) / total * 100.0} for s in ordered]
-    rows.append({"Segment": "TOTAL", "Cases": total, "% of total": 100.0})
-    df = pd.DataFrame(rows)
+    tbl = _segment_table(cid, raw, today)
+    if tbl.empty:
+        st.caption("No segment data for this principal.")
+        return
 
-    st.markdown("**Achievement by segment — this month**")
-    st.dataframe(
-        df.style.format({"Cases": "{:,.0f}", "% of total": "{:.1f}%"}),
-        use_container_width=True, hide_index=True,
+    st.markdown("**Segment-wise sales — momentum vs targets**")
+    st.caption(
+        "Current-MTD = month-to-date this month · L3M-MTD = same-day-of-month "
+        "average over the last 3 months · Δ% flags which segments are "
+        "accelerating (green) or slipping (red)."
+    )
+
+    def _delta_color(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if n <= -10:
+            return "color:#dc2626;font-weight:700"
+        if n < 0:
+            return "color:#b45309;font-weight:600"
+        return "color:#16a34a;font-weight:600"
+
+    num_cols = ["L3M", "L6M", "LYSM", "L3M-MTD", "Current-MTD"]
+    sty = (
+        tbl.style
+        .format({c: "{:,.0f}" for c in num_cols} | {"MTD Δ% vs L3M": "{:+.0f}%"})
+        .map(_delta_color, subset=["MTD Δ% vs L3M"])
+    )
+    st.dataframe(sty, use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download — segment-wise (this principal)",
+        tbl.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"salesplan_segments_{cid}_{op_month}.csv",
+        mime="text/csv",
+        key=f"dl_sp_seg_{cid}",
     )
 
 
