@@ -106,8 +106,9 @@ SALES_TT_SET: frozenset[int] = frozenset(SALES_TT)
 # principle so the rule stays correct if KWPL starts using PDCs on TT=29
 # (cash receipt) or any other CR TT in future.
 
-# BS reconciliation target — Sundry Debtors line from owner's BS.
-# Tunable here in case the comparison number changes month-on-month.
+# BS reconciliation target — STATIC FALLBACK only. The live figure is read
+# from the SUNDRY DEBTORS CONTROL head via _load_bs_sundry_debtors_cr();
+# this constant is used only if that head is unreadable. (31-Mar snapshot.)
 BS_SUNDRY_DEBTORS_CR: float = 56.0
 MANUAL_MATCHING_CR:   float = 59.06
 
@@ -585,13 +586,39 @@ def _load_party_closebal() -> dict[str, float]:
     individual transactions. We therefore anchor the debtors outstanding to
     CloseBal rather than to the raw ledger net.
     """
+    # Use CloseBalTmp — Teknik's LIVE working closing balance, which matches
+    # the manual-matching screen exactly (owner-confirmed: BLACK DOG
+    # 11,15,033). The committed CloseBal column goes stale intraday (can even
+    # show negative) and must NOT be used.
     df = run_query("""
-        SELECT PartyID, CAST(CloseBal AS float) AS CloseBal
+        SELECT PartyID, CAST(CloseBalTmp AS float) AS CloseBal
         FROM MsPartyOpening WHERE PartyID LIKE 'D%'
     """)
     if df.empty:
         return {}
     return {str(r.PartyID).strip(): float(r.CloseBal) for r in df.itertuples()}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_bs_sundry_debtors_cr() -> float:
+    """LIVE 'Sundry Debtors' line off the Balance Sheet, in ₹ Cr.
+
+    Sourced from the SUNDRY DEBTORS CONTROL account head (AccHeadID 000002)
+    in MsAcHeadOpening.CloseBalTmp — the same live working balance the ERP
+    rolls up onto the Balance Sheet. This is the NET figure (debtor dues
+    minus customer advances), which is exactly what the BS shows on its
+    Sundry Debtors line. It changes daily as bills and receipts post, so we
+    read it live rather than hardcoding the 31-March snapshot.
+
+    Returns 0.0 if the head is missing (caller falls back to the constant).
+    """
+    df = run_query("""
+        SELECT CAST(CloseBalTmp AS float) AS Bal
+        FROM MsAcHeadOpening WHERE AccHeadID='000002'
+    """)
+    if df.empty or pd.isna(df.iloc[0]["Bal"]):
+        return 0.0
+    return float(df.iloc[0]["Bal"]) / 1e7
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1765,14 +1792,27 @@ def _section_reconciliation(df: pd.DataFrame) -> None:
     total_cr = float(df["Remaining"].sum()) / 1e7
     parties_n = int(df["PartyID"].nunique())
 
-    c1, c2, c3 = st.columns([2, 2, 3])
+    # LIVE Balance-Sheet Sundry Debtors (SUNDRY DEBTORS CONTROL head,
+    # CloseBalTmp). Falls back to the tunable constant only if the head is
+    # unreadable, so the comparison never silently breaks.
+    bs_live = _load_bs_sundry_debtors_cr()
+    bs_cr = bs_live if bs_live > 0 else BS_SUNDRY_DEBTORS_CR
+    bs_is_live = bs_live > 0
+
+    gap = abs(total_cr - bs_cr)
+    gap_pct = (gap / bs_cr * 100) if bs_cr else 0.0
+
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
     c1.metric("Dashboard total", f"₹{total_cr:.2f} Cr")
-    c2.metric("Parties with dues", f"{parties_n:,}")
+    c2.metric(
+        "BS Sundry Debtors (live)" if bs_is_live else "BS Sundry Debtors",
+        f"₹{bs_cr:.2f} Cr",
+        delta=f"{total_cr - bs_cr:+.2f} Cr vs dashboard",
+        delta_color="off",
+    )
+    c3.metric("Parties with dues", f"{parties_n:,}")
 
-    gap = abs(total_cr - BS_SUNDRY_DEBTORS_CR)
-    gap_pct = (gap / BS_SUNDRY_DEBTORS_CR * 100) if BS_SUNDRY_DEBTORS_CR else 0.0
-
-    with c3:
+    with c4:
         if gap_pct > 10:
             st.error(
                 f"⚠️ Gap of ₹{gap:.1f} Cr ({gap_pct:.0f}%) vs BS — "
@@ -1785,12 +1825,17 @@ def _section_reconciliation(df: pd.DataFrame) -> None:
             )
         else:
             st.success(
-                f"✅ Within {gap_pct:.0f}% of BS ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr"
+                f"✅ Within {gap_pct:.0f}% of BS ₹{bs_cr:.2f} Cr"
             )
 
+    bs_src = (
+        "live from ERP (SUNDRY DEBTORS CONTROL, updates daily)"
+        if bs_is_live
+        else f"static fallback ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr"
+    )
     st.caption(
-        f"Targets: **Sundry Debtors on Balance Sheet ₹{BS_SUNDRY_DEBTORS_CR:.0f} Cr** · "
-        f"**Manual matching report ₹{MANUAL_MATCHING_CR:.2f} Cr**. "
+        f"Targets: **Sundry Debtors on Balance Sheet ₹{bs_cr:.2f} Cr** "
+        f"({bs_src}) · **Manual matching report ₹{MANUAL_MATCHING_CR:.2f} Cr**. "
         "Methodology: full-ledger FIFO across every non-cancelled "
         f"Dr/Cr row per debtor, with post-dated CR rows (uncleared "
         f"PDCs) excluded — surfaced separately in the PDC pipeline section."
