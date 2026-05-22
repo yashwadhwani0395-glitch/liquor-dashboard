@@ -940,6 +940,83 @@ def _section_ageing_buckets(df: pd.DataFrame) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+def _section_party_age_matrix(df: pd.DataFrame) -> None:
+    """Party-wise split of each party's outstanding across the age buckets.
+    One row per party: how much of their total is 0-30 / 31-60 / 61-90 / 90+
+    days old, plus their Total and the % sitting in 90+ (the risk tail)."""
+    st.subheader("🧾 Party-wise ageing — outstanding split by bucket")
+    st.caption(
+        "Each row shows how a party's total outstanding is spread across "
+        "the age buckets. Sorted by biggest 90+ day balance (the riskiest "
+        "money). Use the search box to jump to a party."
+    )
+
+    buckets = ["0-30", "31-60", "61-90", "90+"]
+    pivot = (
+        df.pivot_table(index=["PartyID", "PartyName"], columns="AgeBucket",
+                       values="Remaining", aggfunc="sum",
+                       fill_value=0.0, observed=True)
+          .reindex(columns=buckets, fill_value=0.0)
+          .reset_index()
+    )
+    if pivot.empty:
+        st.caption("No party data.")
+        return
+
+    pivot["Total"] = pivot[buckets].sum(axis=1)
+    pivot["90+ %"] = (pivot["90+"] / pivot["Total"] * 100).where(pivot["Total"] > 0, 0.0)
+    # Only parties with a real balance; sort by the riskiest tail first.
+    pivot = pivot[pivot["Total"] > 0].copy()
+    pivot = pivot.sort_values(["90+", "Total"], ascending=[False, False])
+
+    # Optional party search
+    q = st.text_input(
+        "🔎 Search party", value="", key="party_age_search",
+        placeholder="Type part of a party name, e.g. EAGLE",
+    ).strip().upper()
+    view = pivot
+    if q:
+        view = pivot[pivot["PartyName"].str.upper().str.contains(q, na=False)]
+        if view.empty:
+            st.info(f"No party matches “{q}”.")
+            return
+
+    # Convert money columns to ₹ Lakhs for compactness
+    money_cols = buckets + ["Total"]
+    disp = view.copy()
+    for c in money_cols:
+        disp[c] = disp[c] / 1e5  # → Lakhs
+    disp = disp.rename(columns={b: f"{b} d" for b in buckets})
+    disp = disp[["PartyName"] + [f"{b} d" for b in buckets] + ["Total", "90+ %"]]
+
+    def _risk_color(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if n >= 50:
+            return "color:#dc2626;font-weight:700"
+        if n >= 25:
+            return "color:#b45309;font-weight:600"
+        return "color:#16a34a"
+
+    fmt = {f"{b} d": "₹{:.2f} L" for b in buckets}
+    fmt["Total"] = "₹{:.2f} L"
+    fmt["90+ %"] = "{:.0f}%"
+    styled = disp.style.format(fmt).map(_risk_color, subset=["90+ %"])
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=460)
+
+    # Download the full matrix in rupees (not truncated to the search)
+    csv_cols = ["PartyID", "PartyName"] + buckets + ["Total", "90+ %"]
+    st.download_button(
+        "⬇️ Download — party-wise ageing matrix (₹)",
+        pivot[csv_cols].to_csv(index=False).encode("utf-8-sig"),
+        file_name="debtors_party_age_matrix.csv",
+        mime="text/csv",
+        key="dl_party_age_matrix",
+    )
+
+
 def _grouped_summary(df: pd.DataFrame, by: str) -> pd.DataFrame:
     """Per-group: Outstanding, Bills, Parties, AvgAge, Overdue total + %."""
     grp = df.groupby(by, observed=True)
@@ -2266,6 +2343,8 @@ def render() -> None:
         safe_section("PDC Pipeline",      _section_pdc_pipeline, today)
         st.divider()
         safe_section("Ageing Buckets",    _section_ageing_buckets, unpaid)
+        st.divider()
+        safe_section("Party-wise Ageing", _section_party_age_matrix, unpaid)
 
     # ─────────── 👥 SALESMAN / PRINCIPAL ───────────
     with tab_people:
