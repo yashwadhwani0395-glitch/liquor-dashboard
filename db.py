@@ -86,23 +86,51 @@ def get_connection_status() -> bool:
 #        guidance — see "Handling Deadlocks" in SQL Server docs.
 # 1222 = lock request timeout.
 _RETRYABLE_SQL_ERRORS = (1205, 1222)
+
+# DB-Lib (pymssql) CONNECTION-level error codes. These mean the cached
+# connection has gone dead — extremely common on Streamlit Cloud, where the
+# st.cache_resource connection sits idle between reruns and the SQL Server /
+# network silently drops it. The cure is to throw the dead connection away,
+# reconnect, and retry — which run_query already does on every retry path.
+#   20047 = DBPROCESS is dead or not enabled
+#   20003 = connection to the database failed / closed
+#   20002 = Adaptive Server connection failed
+#   20017 = unexpected EOF from the server
+#   20006 = write to the server failed
+#   20009 = read/write operation failed
+#   20018 = general SQL Server error (often follows a dropped connection)
+_RETRYABLE_CONN_ERRORS = (20047, 20003, 20002, 20017, 20006, 20009, 20018)
+
+# Substrings that indicate a dead/dropped connection regardless of code.
+_CONN_ERROR_HINTS = (
+    "dbprocess is dead", "connection", "unexpected eof",
+    "write to the server failed", "not connected", "closed",
+    "adaptive server", "broken pipe", "timed out",
+)
+
 _MAX_RETRIES   = 3
 _RETRY_BACKOFF = 0.5  # seconds; doubles each retry
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """True if exc is a transient SQL Server error we should retry."""
-    # pymssql wraps the SQL Server error number in args[0]
+    """True if exc is a transient error we should retry (deadlock/lock
+    timeout OR a dead-connection error that a reconnect will fix)."""
+    # pymssql wraps the error number in args[0]
     try:
         code = exc.args[0] if exc.args else None
     except Exception:
-        return False
-    if code in _RETRYABLE_SQL_ERRORS:
+        code = None
+    if code in _RETRYABLE_SQL_ERRORS or code in _RETRYABLE_CONN_ERRORS:
         return True
-    # pymssql's OperationalError on deadlock surfaces the code inside the
-    # message bytes; check there too as a safety net.
+    # OperationalError / InterfaceError are pymssql's connection-failure
+    # classes — almost always cured by reconnecting.
+    if isinstance(exc, (pymssql.OperationalError, pymssql.InterfaceError)):
+        return True
+    # Message-based safety net for deadlocks and dropped connections.
     msg = str(exc).lower()
-    return "deadlocked" in msg or "deadlock victim" in msg
+    if "deadlocked" in msg or "deadlock victim" in msg:
+        return True
+    return any(hint in msg for hint in _CONN_ERROR_HINTS)
 
 
 def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
