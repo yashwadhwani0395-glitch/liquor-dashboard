@@ -391,15 +391,17 @@ def _load_ledger() -> pd.DataFrame:
                                     AND bpr.VoucherNo   = d.VoucherNo
         WHERE d.PartyID LIKE 'D%'
           AND h.Cancelled = 'N'
-          -- Exclude PDC entries: any CR row whose VoucherDate is in
-          -- the future (cheque entered but not yet cleared). Mirrors
-          -- the manual matching report's "Uncleared Cheques" carve-out.
-          AND NOT (d.DrCrIndicator = 'C'
-                   AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date))
-          -- Also drop any forward-dated DR rows (shouldn't exist but
-          -- protects against data-entry slip-ups).
-          AND NOT (d.DrCrIndicator = 'D'
-                   AND CAST(h.VoucherDate AS date) > CAST(GETDATE() AS date))
+          -- Only OPEN sales invoices are needed for the manual-matching
+          -- ageing — push the filter into SQL so we fetch ~17k rows instead
+          -- of the full ~165k-row ledger (keeps the Streamlit Cloud instance
+          -- well under its memory limit). _fifo_unpaid applies the same
+          -- filter defensively in pandas.
+          AND d.DrCrIndicator = 'D'
+          AND CAST(d.BalanceAmount AS float) > 0.5
+          AND d.TransTypeID IN ({sales_csv})
+          -- Drop any forward-dated DR rows (shouldn't exist but protects
+          -- against data-entry slip-ups).
+          AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
     """
     df = run_query(sql)
     if df.empty:
