@@ -1059,14 +1059,17 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
     if view_df.empty:
         st.info("No rows for the selected view."); return
 
-    grouped = view_df.groupby(["Salesman", "Principal"], observed=True)
+    # ONE row per salesman — total outstanding across every principal they
+    # handle (a salesman's parties can carry beer + spirits + adjustments,
+    # but for collection we want a single line per person).
+    grouped = view_df.groupby("Salesman", observed=True)
     by_sm = grouped.agg(
         Outstanding=("Remaining", "sum"),
         AvgAge=("AgeDays", "mean"),
         Parties=("PartyID", "nunique"),
     )
     od_sum = (view_df[view_df["IsOverdue"]]
-              .groupby(["Salesman", "Principal"], observed=True)["Remaining"].sum()
+              .groupby("Salesman", observed=True)["Remaining"].sum()
               .reindex(by_sm.index).fillna(0.0))
     by_sm["OverdueAmt"] = od_sum
     by_sm["Outstanding_Cr"] = by_sm["Outstanding"] / 1e7
@@ -1075,7 +1078,7 @@ def _section_by_salesman(df: pd.DataFrame) -> None:
     ).fillna(0.0).round(1)
     by_sm = by_sm.reset_index().sort_values("Outstanding", ascending=False)
 
-    disp = by_sm[["Salesman", "Principal", "Outstanding_Cr",
+    disp = by_sm[["Salesman", "Outstanding_Cr",
                   "Parties", "AvgAge", "CollectionEff%"]]
     styled = (
         disp.style.format({
