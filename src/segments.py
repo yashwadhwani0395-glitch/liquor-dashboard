@@ -269,6 +269,7 @@ def _load_brand_channel_monthly(company_id: str, day_cutoff: int,
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+                  AND TransTypeID IN ({type_ph})   -- sales bills only (lighter scan)
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID

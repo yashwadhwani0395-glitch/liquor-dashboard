@@ -2194,17 +2194,23 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
     # use a different channel structure → keep one combined table.
     if cid in ("C00025", "C00040"):
         raw_bc = _load_brand_channel_monthly(cid, today.day)
-        if raw_bc.empty:
-            st.caption("No segment data for this principal.")
-            return
-        tbl_a = _segment_table_channels(cid, raw_bc, {"MOP", "Retail"}, today)
-        # Everything that isn't MOP/Retail (POP, One Day, plus any unclassified
-        # 'Other') goes to the POP manager so the two tables stay exhaustive.
-        tbl_b = _segment_table_channels(
-            cid, raw_bc, {"POP", "One Day", "Other"}, today)
-        _render(tbl_a, "MOP + Retail", "mop_retail")
-        st.markdown("")
-        _render(tbl_b, "POP + One Day", "pop_oneday")
+        if not raw_bc.empty:
+            tbl_a = _segment_table_channels(cid, raw_bc, {"MOP", "Retail"}, today)
+            # Everything that isn't MOP/Retail (POP, One Day, plus any
+            # unclassified 'Other') goes to the POP manager so the two
+            # channel tables stay exhaustive.
+            tbl_b = _segment_table_channels(
+                cid, raw_bc, {"POP", "One Day", "Other"}, today)
+            _render(tbl_a, "MOP + Retail", "mop_retail")
+            st.markdown("")
+            _render(tbl_b, "POP + One Day", "pop_oneday")
+            st.markdown("")
+        else:
+            st.caption("Channel split unavailable — showing combined only.")
+        # 3rd table — combined across ALL channels (light, proven query).
+        raw = _load_brand_monthly(cid, today.day)
+        _render(_segment_table(cid, raw, today) if not raw.empty else None,
+                "Combined — all channels", "combined")
         return
 
     raw = _load_brand_monthly(cid, today.day)
