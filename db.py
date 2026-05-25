@@ -49,20 +49,29 @@ import streamlit as st   # noqa: E402  (imported again to ensure availability)
 
 @st.cache_resource(show_spinner=False)
 def get_connection() -> pymssql.Connection | None:
-    """Return a cached pymssql connection. Returns None on failure."""
-    try:
-        return pymssql.connect(
-            server=_HOST,
-            user=_USER,
-            password=_PASS,
-            database=_DBNAME,
-            port=str(_PORT),
-            timeout=15,
-            login_timeout=10,
-        )
-    except Exception as exc:
-        print(f"[db] Connection failed: {exc}", file=sys.stderr)
-        return None
+    """Return a cached pymssql connection. Retries a few times on transient
+    connect failures (common on Streamlit Cloud, where the DB momentarily
+    refuses a fresh connect under load) before giving up. Returns None only
+    if every attempt fails."""
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return pymssql.connect(
+                server=_HOST,
+                user=_USER,
+                password=_PASS,
+                database=_DBNAME,
+                port=str(_PORT),
+                timeout=30,
+                login_timeout=15,
+            )
+        except Exception as exc:
+            last_exc = exc
+            print(f"[db] Connection attempt {attempt+1}/3 failed: {exc}",
+                  file=sys.stderr)
+            time.sleep(0.5 * (2 ** attempt))
+    print(f"[db] Connection failed after 3 attempts: {last_exc}", file=sys.stderr)
+    return None
 
 
 # ── Connection status helper ───────────────────────────────────────────────
@@ -149,11 +158,26 @@ def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
     Streamlit does not cache results when the function raises, so re-raising
     forces the next call to try the DB again.
     """
+    # Acquire a connection, retrying transient None (cached dead connection /
+    # momentary connect refusal) by clearing the cache and reconnecting.
     conn = get_connection()
     if conn is None:
-        raise RuntimeError(
-            "Database connection unavailable. Check DB credentials / network."
-        )
+        for attempt in range(_MAX_RETRIES):
+            wait = _RETRY_BACKOFF * (2 ** attempt)
+            print(
+                f"[db.run_query] no connection (attempt "
+                f"{attempt+1}/{_MAX_RETRIES}), reconnecting in {wait}s",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            get_connection.clear()
+            conn = get_connection()
+            if conn is not None:
+                break
+        if conn is None:
+            raise RuntimeError(
+                "Database connection unavailable. Check DB credentials / network."
+            )
 
     # pymssql uses %s; callers use ? (pyodbc convention)
     if params:
