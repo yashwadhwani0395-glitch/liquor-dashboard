@@ -198,11 +198,8 @@ with t5:  # Debtors Ageing — new first-class tab
     render_debtors()
 
 with t6:
-    coming_soon(
-        "Cash Flow",
-        "Cash inflow/outflow, creditor outstanding, working-capital trends",
-        "💰",
-    )
+    from src.cashflow import render as render_cashflow
+    render_cashflow()
 
 with t7:
     coming_soon(
