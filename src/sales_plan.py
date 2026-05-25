@@ -2038,7 +2038,54 @@ def _section_salesman_scoreboard(principal: str,
         st.info("Set a principal target first to see allocated salesman targets.")
         return
 
-    df = pd.DataFrame(rows).sort_values("% Done", ascending=True)
+    # ── Consolidate to ONE row per salesman ──────────────────────────────
+    # A salesman can sit in several channel teams (MOP/POP/Retail/One Day),
+    # which previously produced one row per channel. The activity columns
+    # (Universe / L3M / LYSM / This Mo / WOD) are channel-independent and
+    # identical across those rows, so we take them once; the per-channel
+    # Auto Targets are SUMMED into the salesman's single target. The override
+    # is stored per-salesman (not per-channel), so it's applied once.
+    per_sm: dict[str, dict] = {}
+    for r in rows:
+        sm = r["Salesman"]
+        agg = per_sm.get(sm)
+        if agg is None:
+            agg = {
+                "Salesman":   sm,
+                "Universe":   r["Universe"],
+                "L3M Avg/mo": r["L3M Avg/mo"],
+                "LYSM":       r["LYSM"],
+                "This Mo":    r["This Mo"],
+                "WOD %":      r["WOD %"],
+                "AutoTarget": 0,
+            }
+            per_sm[sm] = agg
+        agg["AutoTarget"] += r["Auto Target"]
+
+    crows = []
+    for sm, agg in per_sm.items():
+        ov        = load_salesman_override(sm, op_month)
+        effective = ov if ov is not None else agg["AutoTarget"]
+        cases     = agg["This Mo"]
+        pct_done  = (cases / effective * 100) if effective else 0.0
+        if pct_done >= 80:    status = "✅ On Track"
+        elif pct_done >= 50:  status = "⚠️ Behind"
+        else:                 status = "🔴 Critical"
+        crows.append({
+            "Salesman":    sm,
+            "Universe":    agg["Universe"],
+            "L3M Avg/mo":  agg["L3M Avg/mo"],
+            "LYSM":        agg["LYSM"],
+            "Auto Target": int(round(agg["AutoTarget"])),
+            "Override":    int(round(ov)) if ov is not None else 0,
+            "Effective":   int(round(effective)),
+            "This Mo":     round(cases, 1),
+            "WOD %":       agg["WOD %"],
+            "% Done":      round(pct_done, 1),
+            "Status":      status,
+        })
+
+    df = pd.DataFrame(crows).sort_values("% Done", ascending=True)
 
     def _wod_style(v):
         try:    n = float(v)
@@ -2053,9 +2100,6 @@ def _section_salesman_scoreboard(principal: str,
             "Universe":     "{:,}",
             "L3M Avg/mo":   "{:.1f}",
             "LYSM":         "{:.1f}",
-            "L3M %":        "{:.1f}",
-            "LYSM %":       "{:.1f}",
-            "Share %":      "{:.1f}",
             "Auto Target":  "{:,}",
             "Override":     lambda v: "—" if v == 0 else f"{v:,}",
             "Effective":    "{:,}",
@@ -2066,9 +2110,11 @@ def _section_salesman_scoreboard(principal: str,
         .map(_wod_style, subset=["WOD %"])
     )
     st.caption(
-        f"**Share %** = L3M × {l3m_w:.0%} + Last-Year-Same-Month × {lysm_w:.0%}. "
-        "When LYSM data is missing (e.g. principal added this year), falls "
-        "back to L3M only. Weights tunable in `data/target_config.json`."
+        "One row per salesman — their channel (MOP/POP/…) targets summed into "
+        f"a single target. **Auto Target** uses L3M × {l3m_w:.0%} + "
+        f"Last-Year-Same-Month × {lysm_w:.0%} share (weights tunable in "
+        "`data/target_config.json`). **This Mo** is the salesman's actual "
+        "cases this month; **% Done** = This Mo ÷ Effective target."
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
@@ -2099,25 +2145,10 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
     segment, this-month achievement plus the L3M / L6M / LYSM / L3M-MTD
     trend so the planner sees momentum, not just the running total."""
     from datetime import date as _date
-    from src.segments import _load_brand_monthly, _segment_table
+    from src.segments import (_load_brand_monthly, _segment_table,
+                              _load_brand_channel_monthly, _segment_table_channels)
 
     today = _date.today()
-    raw = _load_brand_monthly(cid, today.day)
-    if raw.empty:
-        st.caption("No segment data for this principal.")
-        return
-
-    tbl = _segment_table(cid, raw, today)
-    if tbl.empty:
-        st.caption("No segment data for this principal.")
-        return
-
-    st.markdown("**Segment-wise sales — momentum vs targets**")
-    st.caption(
-        "Current-MTD = month-to-date this month · L3M-MTD = same-day-of-month "
-        "average over the last 3 months · Δ% flags which segments are "
-        "accelerating (green) or slipping (red)."
-    )
 
     def _delta_color(v):
         try:
@@ -2131,19 +2162,57 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
         return "color:#16a34a;font-weight:600"
 
     num_cols = ["L3M", "L6M", "LYSM", "L3M-MTD", "Current-MTD"]
-    sty = (
-        tbl.style
-        .format({c: "{:,.0f}" for c in num_cols} | {"MTD Δ% vs L3M": "{:+.0f}%"})
-        .map(_delta_color, subset=["MTD Δ% vs L3M"])
+
+    def _render(tbl, title, key_suffix):
+        if tbl is None or tbl.empty:
+            st.caption(f"No segment data for {title}.")
+            return
+        st.markdown(f"**{title}**")
+        sty = (
+            tbl.style
+            .format({c: "{:,.0f}" for c in num_cols} | {"MTD Δ% vs L3M": "{:+.0f}%"})
+            .map(_delta_color, subset=["MTD Δ% vs L3M"])
+        )
+        st.dataframe(sty, use_container_width=True, hide_index=True)
+        st.download_button(
+            f"⬇️ Download — {title}",
+            tbl.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"salesplan_segments_{cid}_{key_suffix}_{op_month}.csv",
+            mime="text/csv",
+            key=f"dl_sp_seg_{cid}_{key_suffix}",
+        )
+
+    st.markdown("**Segment-wise sales — momentum vs targets**")
+    st.caption(
+        "Current-MTD = month-to-date this month · L3M-MTD = same-day-of-month "
+        "average over the last 3 months · Δ% flags which segments are "
+        "accelerating (green) or slipping (red)."
     )
-    st.dataframe(sty, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download — segment-wise (this principal)",
-        tbl.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"salesplan_segments_{cid}_{op_month}.csv",
-        mime="text/csv",
-        key=f"dl_sp_seg_{cid}",
-    )
+
+    # Spirits (USL / Diageo) — split by channel class because MOP+Retail and
+    # POP report to different managers. Two tables. Other principals (UBL/BF)
+    # use a different channel structure → keep one combined table.
+    if cid in ("C00025", "C00040"):
+        raw_bc = _load_brand_channel_monthly(cid, today.day)
+        if raw_bc.empty:
+            st.caption("No segment data for this principal.")
+            return
+        tbl_a = _segment_table_channels(cid, raw_bc, {"MOP", "Retail"}, today)
+        # Everything that isn't MOP/Retail (POP, One Day, plus any unclassified
+        # 'Other') goes to the POP manager so the two tables stay exhaustive.
+        tbl_b = _segment_table_channels(
+            cid, raw_bc, {"POP", "One Day", "Other"}, today)
+        _render(tbl_a, "MOP + Retail", "mop_retail")
+        st.markdown("")
+        _render(tbl_b, "POP + One Day", "pop_oneday")
+        return
+
+    raw = _load_brand_monthly(cid, today.day)
+    if raw.empty:
+        st.caption("No segment data for this principal.")
+        return
+    _render(_segment_table(cid, raw, today),
+            "Segment-wise (this principal)", "all")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

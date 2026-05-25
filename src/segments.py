@@ -235,6 +235,75 @@ def _load_channel_monthly(company_id: str, day_cutoff: int,
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_brand_channel_monthly(company_id: str, day_cutoff: int,
+                                months_back: int = 15) -> pd.DataFrame:
+    """Per (BrandName, AcType3, Class, yyyy-MM): full-month + MTD cases.
+    Same MIS rules as _load_brand_monthly / _load_channel_monthly, but keeps
+    BOTH the brand (→ segment) AND the outlet channel (→ MOP/POP/Retail/…),
+    so the segment trend can be sliced per channel group."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            b.BrandName                                AS BrandName,
+            ISNULL(p.AcType3ID, '')                    AS AcType3ID,
+            ISNULL(p.ClassID,   '')                    AS ClassID,
+            FORMAT(h.VoucherDate, 'yyyy-MM')           AS Mon,
+            SUM({_CASES})                              AS FullCases,
+            SUM(CASE WHEN DAY(h.VoucherDate) <= ?
+                     THEN ({_CASES}) ELSE 0 END)       AS MtdCases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
+        WHERE b.CompanyID  = ?
+          AND h.TransTypeID IN ({type_ph})
+          AND h.Cancelled  = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY b.BrandName, p.AcType3ID, p.ClassID, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """
+    df = run_query(sql, (day_cutoff, company_id))
+    if not df.empty:
+        df["FullCases"] = pd.to_numeric(df["FullCases"], errors="coerce").fillna(0.0)
+        df["MtdCases"]  = pd.to_numeric(df["MtdCases"],  errors="coerce").fillna(0.0)
+    return df
+
+
+def _segment_table_channels(cid: str, raw_bc: pd.DataFrame,
+                            channels: set[str], today: date) -> pd.DataFrame:
+    """Segment trend table restricted to a set of outlet channels (e.g.
+    {'MOP','Retail'}). `raw_bc` is _load_brand_channel_monthly output."""
+    if raw_bc.empty:
+        return raw_bc
+    df = raw_bc.copy()
+    df["Channel"] = df.apply(
+        lambda r: _channel_for(cid, r["AcType3ID"], r["ClassID"]), axis=1)
+    df = df[df["Channel"].isin(channels)]
+    if df.empty:
+        return df
+    df["Segment"] = df["BrandName"].map(lambda b: _segment_for(cid, b))
+    df = df.groupby(["Segment", "Mon"], as_index=False)[["FullCases", "MtdCases"]].sum()
+    return _trend_table(df, "Segment", SEGMENT_ORDER.get(cid, []), today)
+
+
 def _month_str(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
