@@ -854,8 +854,17 @@ def _action_for(this_mo: float, target: float | None, prev_mo: float) -> tuple[s
 def _compute_outlet_plan(hist_df: pd.DataFrame,
                         op_month: str,
                         universe: frozenset,
-                        cfg: dict) -> pd.DataFrame:
-    """Build the outlet-by-outlet plan with full metrics + smart target."""
+                        cfg: dict,
+                        pad_universe: bool = True) -> pd.DataFrame:
+    """Build the outlet-by-outlet plan with full metrics + smart target.
+
+    pad_universe=True (default, combined view): bring in every universe
+    outlet (even zero-history ones) and restrict to the universe — the full
+    territory plan. pad_universe=False (per-segment views): skip that padding
+    and the universe restriction, so the table contains ONLY outlets that
+    actually transact in the supplied history (the segment's buyers). This
+    also avoids the per-segment WHERE PartyID IN (...) padding query, which
+    is what was timing out the segment plans on Streamlit Cloud."""
     if hist_df.empty:
         return pd.DataFrame()
 
@@ -931,7 +940,7 @@ def _compute_outlet_plan(hist_df: pd.DataFrame,
 
     # Bring in universe outlets not in history
     seen = set(df["PartyID"])
-    extras = [pid for pid in universe if pid not in seen]
+    extras = [pid for pid in universe if pid not in seen] if pad_universe else []
     if extras:
         in_ph = ",".join("?" * len(extras))
         try:
@@ -963,8 +972,11 @@ def _compute_outlet_plan(hist_df: pd.DataFrame,
         except Exception:
             pass
 
-    # Restrict to universe outlets
-    df = df[df["PartyID"].isin(universe)].copy().reset_index(drop=True)
+    # Restrict to universe outlets (combined view only; segment views keep
+    # exactly their buyers).
+    if pad_universe:
+        df = df[df["PartyID"].isin(universe)].copy()
+    df = df.reset_index(drop=True)
     if df.empty:
         return df
 
@@ -1324,36 +1336,10 @@ def _section_kpis(universe: frozenset, hist_df: pd.DataFrame,
               delta_color="inverse")
 
 
-def _section_outlet_plan(plan_df: pd.DataFrame,
-                         all_subteams: dict[str, list[str]],
-                         op_month: str,
-                         seg_plans: dict[str, pd.DataFrame] | None = None) -> None:
-    st.subheader("Outlet-by-outlet plan for this month")
-    st.caption(
-        "Smart target: base × growth-factor, capped at 1.5×best-month, "
-        "floored at L3M for consistent buyers. Outlets averaging < threshold "
-        "get no target. Manual overrides always win — click 'Set override' below."
-    )
-
-    # Spirits: let the user slice the outlet plan by brand-segment. "All
-    # segments" = the combined plan; each segment uses an outlet plan built
-    # from only that segment's brands (reconciles to the Segment-wise tables).
-    if seg_plans:
-        choice = st.radio(
-            "Segment", ["All segments"] + list(seg_plans.keys()),
-            horizontal=True, key=f"plan_seg_{op_month}",
-            help="Outlet numbers below reflect only the selected segment's "
-                 "brands — matching the Segment-wise momentum tables above.",
-        )
-        if choice != "All segments":
-            plan_df = seg_plans.get(choice, pd.DataFrame())
-            st.caption(f"Showing outlets for **{choice}** only.")
-
-    if plan_df.empty:
-        st.info("No outlets to plan for this selection."); return
-
+def _render_plan_table(plan_df: pd.DataFrame, height: int = 420) -> pd.DataFrame:
+    """Render the 4-metric summary row + styled outlet table for a plan_df.
+    Returns the sorted df so the caller can reuse it (explorer / override)."""
     df = plan_df.copy()
-    # Bucket counts
     n_total    = len(df)
     n_threshold = int(df["ThresholdSkip"].sum())
     n_ceiling  = int(df["CeilingApplied"].sum())
@@ -1365,11 +1351,10 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
     s3.metric("Ceiling applied", f"{n_ceiling:,}")
     s4.metric("Manual overrides", f"{n_override:,}")
 
-    # Order: PUSH first then GROW then HOLD, within each by Avg6 desc
     rank = df["Action"].map({"🔴 PUSH": 0, "🟡 GROW": 1,
                               "✅ HOLD": 2, "· skip": 3}).fillna(4)
     df["_rank"] = rank
-    df = df.sort_values(["_rank", "Avg6"], ascending=[True, False])
+    df = df.sort_values(["_rank", "Avg6"], ascending=[True, False]).reset_index(drop=True)
 
     df["LastBillStr"] = pd.to_datetime(df["LastBill"], errors="coerce") \
         .dt.strftime("%d %b %Y").fillna("Never")
@@ -1386,7 +1371,6 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
         "Avg6":         "L6M avg/mo",
         "TargetDisp":   "Target",
         "ThisMo":       "So Far",
-        "Gap":          "Gap",
         "LastBillStr":  "Last Bill",
     })
 
@@ -1404,9 +1388,45 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
             "Gap":          "{:+,.1f}",
         })
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=420)
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=height)
+    return df
 
-    # ── Per-outlet detail expander ──
+
+def _section_outlet_plan(plan_df: pd.DataFrame,
+                         all_subteams: dict[str, list[str]],
+                         op_month: str,
+                         seg_plans: dict[str, pd.DataFrame] | None = None) -> None:
+    st.subheader("Outlet-by-outlet plan for this month")
+    st.caption(
+        "Smart target: base × growth-factor, capped at 1.5×best-month, "
+        "floored at L3M for consistent buyers. Outlets averaging < threshold "
+        "get no target. Manual overrides always win — click 'Set override' below."
+    )
+
+    if plan_df.empty:
+        st.info("No outlets to plan for this principal."); return
+
+    # ── Combined table (all brands) ──
+    df = _render_plan_table(plan_df)
+
+    # ── Per-segment tables (spirits) — one table per segment, stacked, each
+    #    showing ONLY the outlets that actually buy that segment. Mirrors the
+    #    Segment-wise momentum tables. ──
+    if seg_plans:
+        st.markdown("#### 📊 Outlet plan by segment")
+        st.caption(
+            "One table per brand-segment — only the outlets that actually buy "
+            "that segment. Reconciles to the Segment-wise tables above."
+        )
+        for seg, sp in seg_plans.items():
+            n = 0 if sp is None or sp.empty else len(sp)
+            with st.expander(f"{seg} — {n:,} outlets", expanded=False):
+                if sp is None or sp.empty:
+                    st.caption("No outlets buy this segment.")
+                else:
+                    _render_plan_table(sp, height=360)
+
+    # ── Per-outlet detail expander (combined) ──
     with st.expander("🔍 Explore one outlet (12-month history + target reasoning)"):
         # Sort by L6M desc for the dropdown
         pick = st.selectbox(
@@ -2498,7 +2518,7 @@ def render() -> None:
             for seg in segs:
                 sub = hist_seg[hist_seg["Segment"] == seg]
                 seg_plans[seg] = _compute_outlet_plan(
-                    sub, op_month, principal_uni, tgt_cfg)
+                    sub, op_month, principal_uni, tgt_cfg, pad_universe=False)
         except Exception as e:
             print(f"[sales_plan] segment outlet plan failed: {e}", file=sys.stderr)
             seg_plans = None
