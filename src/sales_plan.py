@@ -188,6 +188,76 @@ def _load_outlet_history(company_id: str,
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_outlet_history_seg(company_id: str,
+                             end_date: date,
+                             months_back: int = 13) -> pd.DataFrame:
+    """Like _load_outlet_history but ALSO carries the brand-segment, so the
+    outlet plan can be sliced per segment (Smirnoff / Black Label / … for
+    Diageo; Mid/Upper Prestige for USL). One row per (party, segment, month).
+    Same MIS basis (last-Dr-line attribution, keg-aware, free goods included)
+    so per-segment outlet numbers reconcile to the Segment-wise tables."""
+    from src.segments import _segment_for
+
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            d.PartyID,
+            ISNULL(p.PartyName, '(unknown)')          AS PartyName,
+            ISNULL(p.LicenseTypeID, '')               AS LicenseTypeID,
+            ISNULL(p.AcType3ID,     '')               AS AcType3ID,
+            b.BrandName                                AS BrandName,
+            FORMAT(h.VoucherDate, 'yyyy-MM')           AS BillMonth,
+            SUM({_CASES})        AS Cases,
+            SUM(CAST(vi.TotalAmount AS FLOAT))         AS Revenue,
+            MAX(h.VoucherDate)                          AS LastBill
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            {_FY_JOIN}
+        JOIN (
+            SELECT TransTypeID, VoucherNo, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+                                          ORDER BY id_key DESC) AS rn
+                FROM TrVocDetail
+                WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
+                  AND TransTypeID IN ({type_ph})
+            ) x WHERE rn = 1
+        ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+        JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
+        JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND b.CompanyID   = ?
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, ?)
+          AND CAST(h.VoucherDate AS date) <= ?
+        GROUP BY d.PartyID, p.PartyName, p.LicenseTypeID, p.AcType3ID,
+                 b.BrandName, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """
+    df = run_query(sql, (company_id, str(end_date), str(end_date)))
+    if df.empty:
+        raise RuntimeError(
+            f"Empty segment outlet history for {company_id} — likely "
+            f"transient DB error. Click ♻️ Recompute targets to retry."
+        )
+    df["Cases"]    = pd.to_numeric(df["Cases"],   errors="coerce").fillna(0.0)
+    df["Revenue"]  = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
+    df["LastBill"] = pd.to_datetime(df["LastBill"], errors="coerce")
+    df["Channel"]  = df["LicenseTypeID"].map(_LT_LABEL).fillna("Other")
+    df["Segment"]  = df["BrandName"].map(lambda b: _segment_for(company_id, b))
+    # Collapse brands → segment: one row per (party, segment, month)
+    df = df.groupby(
+        ["PartyID", "PartyName", "LicenseTypeID", "AcType3ID", "Channel",
+         "Segment", "BillMonth"], as_index=False
+    ).agg(Cases=("Cases", "sum"), Revenue=("Revenue", "sum"),
+          LastBill=("LastBill", "max"))
+    return df
+
+
 # AcType3 → MIS "Type III" channel. PCMC + KW + One-Day institution are
 # merged into a single "Institution" card (owner preference).
 _UBL_AC3_CHANNEL = {
@@ -1256,7 +1326,8 @@ def _section_kpis(universe: frozenset, hist_df: pd.DataFrame,
 
 def _section_outlet_plan(plan_df: pd.DataFrame,
                          all_subteams: dict[str, list[str]],
-                         op_month: str) -> None:
+                         op_month: str,
+                         seg_plans: dict[str, pd.DataFrame] | None = None) -> None:
     st.subheader("Outlet-by-outlet plan for this month")
     st.caption(
         "Smart target: base × growth-factor, capped at 1.5×best-month, "
@@ -1264,8 +1335,22 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
         "get no target. Manual overrides always win — click 'Set override' below."
     )
 
+    # Spirits: let the user slice the outlet plan by brand-segment. "All
+    # segments" = the combined plan; each segment uses an outlet plan built
+    # from only that segment's brands (reconciles to the Segment-wise tables).
+    if seg_plans:
+        choice = st.radio(
+            "Segment", ["All segments"] + list(seg_plans.keys()),
+            horizontal=True, key=f"plan_seg_{op_month}",
+            help="Outlet numbers below reflect only the selected segment's "
+                 "brands — matching the Segment-wise momentum tables above.",
+        )
+        if choice != "All segments":
+            plan_df = seg_plans.get(choice, pd.DataFrame())
+            st.caption(f"Showing outlets for **{choice}** only.")
+
     if plan_df.empty:
-        st.info("No outlets to plan for this principal."); return
+        st.info("No outlets to plan for this selection."); return
 
     df = plan_df.copy()
     # Bucket counts
@@ -2398,6 +2483,26 @@ def render() -> None:
         st.error(f"⚠️ Outlet plan failed to compute: {type(e).__name__}: {e}")
         plan_df = pd.DataFrame()
 
+    # Spirits (USL/Diageo): also build a per-segment outlet plan so the
+    # outlet list can be sliced by brand-segment (and reconcile to the
+    # Segment-wise tables). seg_plans[segment] = that segment's plan_df.
+    seg_plans: dict[str, pd.DataFrame] | None = None
+    if cid in ("C00025", "C00040"):
+        try:
+            from src.segments import SEGMENT_ORDER
+            hist_seg = _load_outlet_history_seg(
+                cid, _month_bounds(op_month_date)[1], months_back=13)
+            seg_plans = {}
+            segs = [s for s in SEGMENT_ORDER.get(cid, [])
+                    if s in set(hist_seg["Segment"])]
+            for seg in segs:
+                sub = hist_seg[hist_seg["Segment"] == seg]
+                seg_plans[seg] = _compute_outlet_plan(
+                    sub, op_month, principal_uni, tgt_cfg)
+        except Exception as e:
+            print(f"[sales_plan] segment outlet plan failed: {e}", file=sys.stderr)
+            seg_plans = None
+
     col_rc, _ = st.columns([1, 4])
     with col_rc:
         if st.button("♻️ Recompute targets", key=f"recompute_{op_month}",
@@ -2413,7 +2518,8 @@ def render() -> None:
             st.rerun()
 
     safe_section("Outlet plan",
-                 _section_outlet_plan, plan_df, cfg["subteams"], op_month)
+                 _section_outlet_plan, plan_df, cfg["subteams"], op_month,
+                 seg_plans)
     st.divider()
 
     # ── Section 4: Focus brand (lazy — only loads when opened) ──
