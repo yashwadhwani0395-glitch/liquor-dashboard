@@ -462,29 +462,51 @@ def _load_recent_vouchers(end: date, limit: int = 50,
 # SECTION RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _section_kpis(kpi: dict, gl: dict) -> None:
-    """KPI row uses GL-based totals (matches BS); cases/suppliers stay item-based."""
-    tot_delta, tot_color = _yoy_delta(gl["total_cost"], gl["ly_total_cost"])
-    exc_delta, exc_color = _yoy_delta(gl["excise_total"], gl["ly_excise_total"])
-    c_delta,   c_color   = _yoy_delta(kpi["c"], kpi["ly_c"])
-
-    exc_pct = (gl["excise_total"] / gl["total_cost"] * 100) if gl["total_cost"] else 0
+def _section_kpis(kpi: dict, gl: dict, principal_selected: bool = False) -> None:
+    """KPI row. With NO principal filter the cost cards use GL totals (match the
+    Balance Sheet, company-wide). With a principal selected the GL account can't
+    be split by principal, so the cost card switches to that principal's
+    ITEM-based invoice value (vi.TotalAmount) instead of the all-principal GL."""
+    c_delta, c_color = _yoy_delta(kpi["c"], kpi["ly_c"])
 
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(_kpi_card(
-            "Total Purchase Cost",
-            f"₹{gl['total_cost']/1e7:.2f} Cr",
-            f"Invoice ₹{gl['purchases']/1e7:.2f} Cr + Excise ₹{gl['excise_total']/1e7:.2f} Cr  ·  {tot_delta} YoY",
-            tot_color, _KPI_COLORS[0],
-        ), unsafe_allow_html=True)
-    with c2:
-        st.markdown(_kpi_card(
-            "Excise Duty Paid",
-            f"₹{gl['excise_total']/1e7:.2f} Cr",
-            f"{exc_pct:.1f}% of total  ·  {exc_delta} YoY",
-            exc_color, _KPI_COLORS[1],
-        ), unsafe_allow_html=True)
+    if principal_selected:
+        # Principal-specific: item-based invoice value (GL isn't per-principal)
+        p_delta, p_color = _yoy_delta(kpi["p"], kpi["ly_p"])
+        with c1:
+            st.markdown(_kpi_card(
+                "Purchase Cost (this principal)",
+                f"₹{kpi['p']/1e7:.2f} Cr",
+                f"Invoice value (item-based)  ·  {p_delta} YoY "
+                f"(LY ₹{kpi['ly_p']/1e7:.2f} Cr)",
+                p_color, _KPI_COLORS[0],
+            ), unsafe_allow_html=True)
+        with c2:
+            st.markdown(_kpi_card(
+                "Excise Duty Paid",
+                "company-wide",
+                "Excise/GL isn't tagged by principal — see breakdown below "
+                "(all principals)",
+                "#6b7280", _KPI_COLORS[1],
+            ), unsafe_allow_html=True)
+    else:
+        tot_delta, tot_color = _yoy_delta(gl["total_cost"], gl["ly_total_cost"])
+        exc_delta, exc_color = _yoy_delta(gl["excise_total"], gl["ly_excise_total"])
+        exc_pct = (gl["excise_total"] / gl["total_cost"] * 100) if gl["total_cost"] else 0
+        with c1:
+            st.markdown(_kpi_card(
+                "Total Purchase Cost",
+                f"₹{gl['total_cost']/1e7:.2f} Cr",
+                f"Invoice ₹{gl['purchases']/1e7:.2f} Cr + Excise ₹{gl['excise_total']/1e7:.2f} Cr  ·  {tot_delta} YoY",
+                tot_color, _KPI_COLORS[0],
+            ), unsafe_allow_html=True)
+        with c2:
+            st.markdown(_kpi_card(
+                "Excise Duty Paid",
+                f"₹{gl['excise_total']/1e7:.2f} Cr",
+                f"{exc_pct:.1f}% of total  ·  {exc_delta} YoY",
+                exc_color, _KPI_COLORS[1],
+            ), unsafe_allow_html=True)
     with c3:
         st.markdown(_kpi_card(
             "Cases Purchased",
@@ -501,10 +523,17 @@ def _section_kpis(kpi: dict, gl: dict) -> None:
         ), unsafe_allow_html=True)
 
 
-def _section_cost_breakdown(gl: dict) -> None:
+def _section_cost_breakdown(gl: dict, principal_selected: bool = False) -> None:
     """3 cards (Invoice / Excise / Total) + reconciliation table."""
     st.markdown("##### Purchase Cost Breakdown")
     st.caption("Reconciles to Balance Sheet — total cost of goods purchased")
+    if principal_selected:
+        st.info(
+            "ℹ️ This GL breakdown is **company-wide (all principals)** — the "
+            "PURCHASES-TRADING ledger isn't tagged by principal, so it doesn't "
+            "filter. The per-principal figures are in the KPI card above and "
+            "the 'By principal' / 'Purchase vs Sales' tables below."
+        )
 
     total = gl["total_cost"] or 1.0  # avoid div0 in % calc
 
@@ -826,9 +855,10 @@ def render() -> None:
         p_df   = p_df[p_df["CompanyID"].isin(principal_ids)]
         rec_df = rec_df[rec_df["CompanyID"].isin(principal_ids)]
 
-    _section_kpis(kpi, gl)
+    _principal_sel = bool(principal_ids)
+    _section_kpis(kpi, gl, _principal_sel)
     st.divider()
-    _section_cost_breakdown(gl)
+    _section_cost_breakdown(gl, _principal_sel)
     st.divider()
     st.caption(
         "Brand, principal, and reconciliation breakdowns below show "
