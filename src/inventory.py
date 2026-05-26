@@ -147,6 +147,36 @@ def _load_rollforward(after_date: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _load_rollforward_io(after_date: str) -> pd.DataFrame:
+    """Per-item Inward / Outward bottles (free goods INCLUDED) on/after the
+    baseline date — the split version of _load_rollforward, used by the stock
+    reconciliation so Opening + In − Out ties exactly to the live Closing."""
+    cols = ["ItemID", "InB", "OutB"]
+    if not after_date:
+        return pd.DataFrame(columns=cols)
+    sql = f"""
+        SELECT vi.ItemID,
+            SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS InB,
+            SUM(CASE WHEN mt.QtyInOut='O' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS OutB
+        FROM TrVocItem vi
+        JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
+        JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
+        WHERE h.Cancelled = 'N' AND mt.ItemYN = 'Y' AND mt.QtyInOut IN ('I','O')
+          AND vi.ItemID LIKE 'I%'
+          AND CAST(h.VoucherDate AS date) >= ?
+          AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
+          {_FY_JOIN}
+        GROUP BY vi.ItemID
+    """
+    df = run_query(sql, (after_date,))
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["InB"]  = pd.to_numeric(df["InB"],  errors="coerce").fillna(0).astype(int)
+    df["OutB"] = pd.to_numeric(df["OutB"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_current_stock() -> pd.DataFrame:
     """Live closing stock per item = ERP Stock & Sale baseline + live movements
     since the baseline date. Ties to the ERP report and stays current as bills
@@ -486,66 +516,47 @@ def _section_kpis(stock_df: pd.DataFrame) -> None:
         ), unsafe_allow_html=True)
 
 
-def _section_reconciliation(opening_df: pd.DataFrame,
-                            move_df: pd.DataFrame,
-                            stock_df: pd.DataFrame,
-                            start: date, end: date,
+def _section_reconciliation(stock_df: pd.DataFrame,
                             keg_aware: bool = True) -> None:
-    """ERP-style Op | In | Out | Cl reconciliation for the chosen period."""
-    st.markdown("##### Stock Reconciliation")
-    st.caption(
-        f"Opening → In → Out → Closing for the period "
-        f"{start.strftime('%d %b %Y')} → {end.strftime('%d %b %Y')}. "
-        f"Matches the ERP **Stock Balance** report (using FY-CASE dedup)."
-    )
+    """Stock flow this FY: Opening (1 Apr) + Inward − Outward = Closing (now).
+    Sourced consistently with the live stock — Opening from the S&S baseline,
+    In/Out from live movements since — so the four numbers always tie out."""
+    st.markdown("##### Stock flow this year")
 
-    # Per-item: opening bottles + in - out
-    m = opening_df.merge(move_df, on="ItemID", how="outer")
-    for c in ("OpeningBottles", "InBottles", "OutBottles", "InCases", "OutCases"):
-        m[c] = pd.to_numeric(m.get(c, 0), errors="coerce").fillna(0).astype(int)
+    base_date, base = _load_stock_baseline()
+    io = _load_rollforward_io(base_date)
 
-    # Bring in BottlesPerCase + ItemDescription (for keg-aware case math)
+    # One row per item: opening + inward − outward = closing (bottles)
     meta = stock_df[["ItemID", "BottlesPerCase", "ItemDescription"]].drop_duplicates("ItemID")
-    m = m.merge(meta, on="ItemID", how="left")
-    m["BottlesPerCase"] = pd.to_numeric(m["BottlesPerCase"], errors="coerce").fillna(0).astype(int)
+    m = meta.copy()
+    m["OpenB"] = m["ItemID"].map(lambda i: base.get(i, 0)).fillna(0)
+    io_in  = dict(zip(io["ItemID"], io["InB"]))  if not io.empty else {}
+    io_out = dict(zip(io["ItemID"], io["OutB"])) if not io.empty else {}
+    m["InB"]  = m["ItemID"].map(lambda i: io_in.get(i, 0))
+    m["OutB"] = m["ItemID"].map(lambda i: io_out.get(i, 0))
+    m["CloseB"] = m["OpenB"] + m["InB"] - m["OutB"]
+    m["BottlesPerCase"]  = pd.to_numeric(m["BottlesPerCase"], errors="coerce").fillna(0).astype(int)
     m["ItemDescription"] = m["ItemDescription"].fillna("")
-    m["ClosingBottles"] = (m["OpeningBottles"] + m["InBottles"] - m["OutBottles"]).clip(lower=0)
 
-    def _cases(row, col):
-        # Honour the keg toggle so Opening/Closing match the In/Out columns
-        # (which come from _load_movements with the same keg_aware flag).
-        if keg_aware:
-            return _kegaware_cases(row["ItemDescription"], row[col], row["BottlesPerCase"])
-        bpc = row["BottlesPerCase"]
-        return (row[col] / bpc) if bpc > 0 else 0.0
+    def _cs(col):
+        return m.apply(lambda r: _kegaware_cases(r["ItemDescription"], r[col],
+                                                 r["BottlesPerCase"]) if keg_aware
+                       else (r[col] / r["BottlesPerCase"] if r["BottlesPerCase"] > 0 else 0.0),
+                       axis=1).sum()
 
-    def _bot_rem(row, col):
-        if keg_aware and _is_keg(row["ItemDescription"]):
-            return 0
-        bpc = row["BottlesPerCase"]
-        if bpc <= 0:
-            return int(row[col])
-        return int(row[col] - (int(row[col]) // bpc) * bpc)
+    opening, inward, outward, closing = _cs("OpenB"), _cs("InB"), _cs("OutB"), _cs("CloseB")
 
-    m["OpCases"]  = m.apply(lambda r: _cases(r, "OpeningBottles"),  axis=1)
-    m["OpBotR"]   = m.apply(lambda r: _bot_rem(r, "OpeningBottles"), axis=1)
-    m["ClCases"]  = m.apply(lambda r: _cases(r, "ClosingBottles"),  axis=1)
-    m["ClBotR"]   = m.apply(lambda r: _bot_rem(r, "ClosingBottles"), axis=1)
-
-    grand = {
-        "Opening": _fmt_cases_with_remainder(int(m["OpCases"].sum()),
-                                              int(m["OpBotR"].sum())),
-        "In":      f"{int(m['InCases'].sum()):,} cs",
-        "Out":     f"{int(m['OutCases'].sum()):,} cs",
-        "Closing": _fmt_cases_with_remainder(int(m["ClCases"].sum()),
-                                              int(m["ClBotR"].sum())),
-    }
-
+    bd = base_date or "FY start"
+    st.caption(
+        f"**Opening stock ({bd})  +  Inward  −  Outward  =  Closing stock (today).** "
+        "Opening is the ERP Stock & Sale year-opening; In/Out are live bill "
+        "movements (free goods included). Cases shown rounded."
+    )
     g1, g2, g3, g4 = st.columns(4)
-    with g1: st.metric("Opening", grand["Opening"])
-    with g2: st.metric("In",      grand["In"])
-    with g3: st.metric("Out",     grand["Out"])
-    with g4: st.metric("Closing", grand["Closing"])
+    g1.metric("Opening (1 Apr)", f"{opening:,.0f} cs")
+    g2.metric("➕ Inward",        f"{inward:,.0f} cs")
+    g3.metric("➖ Outward",       f"{outward:,.0f} cs")
+    g4.metric("🟰 Closing (now)", f"{closing:,.0f} cs")
 
 
 def _section_by_principal(stock_df: pd.DataFrame) -> None:
@@ -833,8 +844,6 @@ def render() -> None:
     # Reconciliation period (defaults to FY start through as_of)
     with st.spinner("Loading stock + movement data…"):
         stock_df    = _build_stock_df(as_of_date)
-        opening_df  = _load_opening_stock()
-        move_df     = _load_movements(fy_start, as_of_date, keg_aware=keg_aware)
         origin_df   = _load_item_origin()
         vel_30      = _load_sales_velocity(as_of_date, days_back=30, keg_aware=keg_aware)
         vel_90      = _load_sales_velocity(as_of_date, days_back=90, keg_aware=keg_aware)
@@ -866,7 +875,7 @@ def render() -> None:
     safe_section("KPIs",            _section_kpis,            stock_df)
     st.divider()
     safe_section("Stock reconciliation", _section_reconciliation,
-                 opening_df, move_df, stock_df, fy_start, as_of_date, keg_aware)
+                 stock_df, keg_aware)
     st.divider()
     safe_section("By principal",    _section_by_principal,    stock_df)
     st.divider()

@@ -138,7 +138,8 @@ def keg_mode_toggle(key: str, *, label: str = "Keg counting",
     Purchase/Sales (MIS basis), plain for Inventory stock (the ERP Stock &
     Sale report counts kegs as raw units)."""
     import streamlit as _st
-    opts = ["Volume-converted (20LT=2.56 cs)", "Count keg as 1 case"]
+    opts = ["Volume-converted (20LT=2.56 · 30LT=3.85 · 50LT=6.41 cs)",
+            "Count keg as 1 case"]
     choice = _st.radio(
         label, opts,
         index=0 if default_keg_aware else 1, horizontal=True, key=key,
