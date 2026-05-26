@@ -212,8 +212,11 @@ def _load_current_stock() -> pd.DataFrame:
     df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce").fillna(0).astype(int)
     df["ValRateCase"]    = pd.to_numeric(df["ValRateCase"],    errors="coerce").fillna(0.0)
     df["ValRateBottle"]  = pd.to_numeric(df["ValRateBottle"],  errors="coerce").fillna(0.0)
+    # Clamp at 0: re-coded SKUs (price change → new ItemID) can roll forward
+    # negative when their pre-recode outflow lands on the new code. A negative
+    # physical stock is meaningless and would silently drag down totals.
     df["ClosingBottles"] = df["ItemID"].map(
-        lambda i: base.get(i, 0) + roll.get(i, 0)).astype(int)
+        lambda i: base.get(i, 0) + roll.get(i, 0)).clip(lower=0).astype(int)
     df["Principal"]      = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
     df["ClosingCases"]   = df.apply(
         lambda r: _kegaware_cases(r["ItemDescription"], r["ClosingBottles"],
@@ -694,7 +697,9 @@ def _section_slow_movers(stock_df: pd.DataFrame, vel_df: pd.DataFrame,
     merged = stock_df.merge(vel_df[["ItemID", "Cases", "LastSale"]],
                             on="ItemID", how="left").rename(columns={"Cases": "Sales30"})
     merged["Sales30"] = pd.to_numeric(merged["Sales30"], errors="coerce").fillna(0.0)
-    merged["Value"]   = merged["ClosingCases"] * merged["ValRateCase"]
+    # Valuation is ALWAYS on physical (un-converted) units — a keg is one keg,
+    # never 6.41 cases. Keg-aware cases are only for purchase/sales reporting.
+    merged["Value"]   = merged["ClosingCasesPlain"] * merged["ValRateCase"]
 
     slow = merged[
         (merged["ClosingCases"] > threshold_cases) & (merged["Sales30"] < 10)

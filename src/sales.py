@@ -121,11 +121,11 @@ def _load_period_kpis(start: date, end: date,
                      + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
             END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID
             FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
                        ROW_NUMBER() OVER (
-                           PARTITION BY TransTypeID, VoucherNo
+                           PARTITION BY TransTypeID, VoucherNo, FinancialYear
                            ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
@@ -133,6 +133,7 @@ def _load_period_kpis(start: date, end: date,
                   AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+             AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         WHERE h.TransTypeID IN ({type_ph})
@@ -302,14 +303,15 @@ def _load_party_daily_revenue(months: int = 14,
                      + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
             END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         LEFT JOIN MsPartyMaster p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster   im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster  b  ON b.BrandID = im.BrandID
@@ -442,11 +444,11 @@ def _load_channel_revenue(start: date, end: date,
                      + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
             END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID
             FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
                        ROW_NUMBER() OVER (
-                           PARTITION BY TransTypeID, VoucherNo
+                           PARTITION BY TransTypeID, VoucherNo, FinancialYear
                            ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
@@ -454,6 +456,7 @@ def _load_channel_revenue(start: date, end: date,
                   AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+             AND d.FinancialYear = h.FinancialYear
         LEFT JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID

@@ -200,16 +200,24 @@ def render() -> None:
         for label, val in (extra_rows or []):
             st.markdown(f"&nbsp;&nbsp;**{label}** — {_cr(val)}")
 
+    # Net result balances the two sides. A profit (net_result > 0) is a source
+    # of funds → shown on Liabilities. A loss (net_result < 0) is a debit
+    # balance → shown on Assets as "Accumulated loss" so the columns still foot.
+    liab_extra  = ([("Net result (P&L / retained)", net_result)]
+                   if net_result > 0 else [])
+    asset_extra = [("Closing Stock (live inventory)", stock_val)]
+    if net_result < 0:
+        asset_extra.append(("Accumulated loss (P&L)", -net_result))
+
     lc, ac = st.columns(2)
     with lc:
         st.subheader("Liabilities")
         st.caption(f"Total **{_cr(liab_total)}**")
-        _side("LIABILITIES",
-              [("Net result (P&L / retained)", net_result)] if net_result > 0 else [])
+        _side("LIABILITIES", liab_extra)
     with ac:
         st.subheader("Assets")
         st.caption(f"Total **{_cr(assets_total)}**")
-        _side("ASSETS", [("Closing Stock (live inventory)", stock_val)])
+        _side("ASSETS", asset_extra)
 
     st.divider()
 

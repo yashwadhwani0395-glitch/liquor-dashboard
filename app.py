@@ -139,7 +139,7 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
     )
 
 
-_PAGES = ["Overview", "Purchase", "Sales",
+_PAGES = ["Overview", "Purchase", "Sales", "Discounts",
           "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
 page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
                 label_visibility="collapsed")
@@ -189,6 +189,10 @@ elif page == "Sales":
     else:
         from src.operations import render as render_operations
         render_operations()
+
+elif page == "Discounts":
+    from src.discounts import render as render_discounts
+    render_discounts()
 
 elif page == "Expenses":
     from src.expenses import render as render_expenses

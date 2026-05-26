@@ -149,14 +149,15 @@ def _load_outlet_history(company_id: str,
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
@@ -218,15 +219,16 @@ def _load_outlet_history_seg(company_id: str,
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
                   AND TransTypeID IN ({type_ph})
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
@@ -307,14 +309,15 @@ def _load_ubl_mis_channels(start: date, end: date) -> dict[str, float]:
               END
         JOIN (
             -- MIS rule: last debtor line on the voucher (max id_key)
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
@@ -353,14 +356,15 @@ def _mis_party_voucher_join() -> str:
     """
     return """
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
     """
 
 
@@ -488,14 +492,15 @@ def _load_brand_buyers(company_id: str,
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
@@ -563,14 +568,15 @@ def _load_brand_outlet_sales(company_id: str,
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID
@@ -661,14 +667,15 @@ def _load_brand_achievement(company_id: str, month_str: str) -> pd.DataFrame:
             AND vi.ItemID      LIKE 'I%'
             {_FY_JOIN}
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d  ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+            AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster   p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster    im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster   b  ON b.BrandID  = im.BrandID

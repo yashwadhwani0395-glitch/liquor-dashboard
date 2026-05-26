@@ -2,7 +2,7 @@
 
 Per-principal brand-group segments with trend metrics so the owner can spot
 which segment is pulling volume down:
-    L3M | L6M | LYSM | L3M-MTD | Current-MTD | MTD Δ% (vs L3M-MTD)
+    L3M | L6M | LYSM | LYSM-MTD | L3M-MTD | Current-MTD | MTD Δ% (vs L3M-MTD)
 
 Case math is MIS-consistent with the rest of the dashboard:
   - keg-aware CASES_SQL_EXPR (50/30/20 LT volume conversion)
@@ -162,14 +162,15 @@ def _load_party_monthly(company_id: str, day_cutoff: int,
                 ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
               END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         LEFT JOIN MsPartyMaster p ON p.PartyID = d.PartyID
@@ -211,14 +212,15 @@ def _load_channel_monthly(company_id: str, day_cutoff: int,
                 ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
               END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
@@ -263,15 +265,16 @@ def _load_brand_channel_monthly(company_id: str, day_cutoff: int,
                 ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
               END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
-                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
                                           ORDER BY id_key DESC) AS rn
                 FROM TrVocDetail
                 WHERE PartyID IS NOT NULL AND DrCrIndicator='D' AND PartyID LIKE 'D%'
                   AND TransTypeID IN ({type_ph})   -- sales bills only (lighter scan)
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
@@ -324,7 +327,7 @@ def _prior_months(cur: str, n: int) -> list[str]:
 def _trend_table(df: pd.DataFrame, group_col: str,
                  order: list[str], today: date,
                  sort_decline: bool = False) -> pd.DataFrame:
-    """Build the L3M/L6M/LYSM/L3M-MTD/Current-MTD trend table for any
+    """Build the L3M/L6M/LYSM/LYSM-MTD/L3M-MTD/Current-MTD trend table for any
     grouping column. `df` must have: <group_col>, Mon, FullCases, MtdCases.
     """
     cur  = _month_str(today)
@@ -337,7 +340,11 @@ def _trend_table(df: pd.DataFrame, group_col: str,
 
     l3m    = _sum(l3, "FullCases")
     l6m    = _sum(l6, "FullCases")
+    # LYSM = full last-year-same-month volume (reference).
     lysm_s = df[df["Mon"] == lysm].groupby(group_col)["FullCases"].sum()
+    # LYSM-MTD = the 1-cutoff window of LYSM, directly comparable to Current-MTD
+    # for a true year-over-year MTD read.
+    lysm_mtd = df[df["Mon"] == lysm].groupby(group_col)["MtdCases"].sum()
     l3mtd  = _sum(l3, "MtdCases") / 3.0
     curmtd = df[df["Mon"] == cur].groupby(group_col)["MtdCases"].sum()
 
@@ -354,6 +361,7 @@ def _trend_table(df: pd.DataFrame, group_col: str,
             "L3M":         full3,
             "L6M":         float(l6m.get(g, 0.0)),
             "LYSM":        float(lysm_s.get(g, 0.0)),
+            "LYSM-MTD":    float(lysm_mtd.get(g, 0.0)),
             "L3M-MTD":     float(l3mtd.get(g, 0.0)),
             "Current-MTD": float(curmtd.get(g, 0.0)),
         })
@@ -368,7 +376,7 @@ def _trend_table(df: pd.DataFrame, group_col: str,
         lambda r: ((r["Current-MTD"] - r["L3M-MTD"]) / r["L3M-MTD"] * 100.0)
                   if r["L3M-MTD"] > 0 else 0.0, axis=1)
     tot = {group_col: "TOTAL"}
-    for c in ["L3M", "L6M", "LYSM", "L3M-MTD", "Current-MTD"]:
+    for c in ["L3M", "L6M", "LYSM", "LYSM-MTD", "L3M-MTD", "Current-MTD"]:
         tot[c] = float(out[c].sum())
     tot["MTD Δ% vs L3M"] = ((tot["Current-MTD"] - tot["L3M-MTD"]) / tot["L3M-MTD"] * 100.0
                             if tot["L3M-MTD"] > 0 else 0.0)
@@ -420,6 +428,7 @@ def render() -> None:
             st.caption(f"No {kind} data."); return
         sty = (tbl.style
                .format({"L3M": "{:,.0f}", "L6M": "{:,.0f}", "LYSM": "{:,.0f}",
+                        "LYSM-MTD": "{:,.0f}",
                         "L3M-MTD": "{:,.0f}", "Current-MTD": "{:,.0f}",
                         "MTD Δ% vs L3M": "{:+.1f}%"})
                .map(_delta_style, subset=["MTD Δ% vs L3M"]))

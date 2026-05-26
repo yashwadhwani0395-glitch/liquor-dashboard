@@ -87,11 +87,11 @@ def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
                      + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
             END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID
             FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
                        ROW_NUMBER() OVER (
-                           PARTITION BY TransTypeID, VoucherNo
+                           PARTITION BY TransTypeID, VoucherNo, FinancialYear
                            ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
@@ -100,6 +100,7 @@ def _load_daily_billing(month_start: date, month_end: date) -> pd.DataFrame:
                   AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
         WHERE h.TransTypeID IN ({type_ph})

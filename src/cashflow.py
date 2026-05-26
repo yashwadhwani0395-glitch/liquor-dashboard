@@ -21,9 +21,10 @@ A single page that answers "where is our money?":
      payments + excise/duty (cash OUT), with the net.
 
 Data-model notes (verified live, May-2026):
-  • Purchases credit, and payments debit, the single SUNDRY CREDITORS CONTROL
-    head 000002→debtors / 000003→creditors; the principal identity is the
-    PartyID on that line (C00025 USL, C00039 UBL, C00056 BF, …).
+  • Purchases credit, and payments debit, the SUNDRY CREDITORS CONTROL head
+    000003 (head 000002 is the SUNDRY DEBTORS control, used elsewhere). The
+    principal identity is the PartyID on that line (C00025 USL, C00039 UBL,
+    C00056 BF, …).
   • Diageo (C00040) has NO supplier ledger — its brands are bought through
     United Spirits / import, so Diageo's money rolls into USL. (Diageo still
     appears in the stock/trading block via its own brand CompanyID.)

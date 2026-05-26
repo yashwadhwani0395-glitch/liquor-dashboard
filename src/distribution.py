@@ -213,11 +213,11 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
                      + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
             END
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID
             FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
                        ROW_NUMBER() OVER (
-                           PARTITION BY TransTypeID, VoucherNo
+                           PARTITION BY TransTypeID, VoucherNo, FinancialYear
                            ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
@@ -225,6 +225,7 @@ def _load_master(months_back: int = 13) -> pd.DataFrame:
                       AND PartyID LIKE 'D%'   -- customer outlets only
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster p  ON p.PartyID  = d.PartyID
         JOIN MsItemMaster  im ON im.ItemID  = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID  = im.BrandID
@@ -284,11 +285,11 @@ def _load_active_universe() -> pd.DataFrame:
             -- free goods INCLUDED (stock sent to outlet; Rs0 revenue)
             AND vi.ItemID      LIKE 'I%'
         JOIN (
-            SELECT TransTypeID, VoucherNo, PartyID
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID
             FROM (
-                SELECT TransTypeID, VoucherNo, PartyID,
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
                        ROW_NUMBER() OVER (
-                           PARTITION BY TransTypeID, VoucherNo
+                           PARTITION BY TransTypeID, VoucherNo, FinancialYear
                            ORDER BY id_key DESC
                        ) AS rn
                 FROM TrVocDetail
@@ -297,6 +298,7 @@ def _load_active_universe() -> pd.DataFrame:
                   AND PartyID LIKE 'D%'
             ) x WHERE rn = 1
         ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
         JOIN MsPartyMaster p  ON p.PartyID = d.PartyID
         JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
         JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
