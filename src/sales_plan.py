@@ -1409,14 +1409,16 @@ def _section_outlet_plan(plan_df: pd.DataFrame,
     # ── Combined table (all brands) ──
     df = _render_plan_table(plan_df)
 
-    # ── Per-segment tables (spirits) — one table per segment, stacked, each
-    #    showing ONLY the outlets that actually buy that segment. Mirrors the
-    #    Segment-wise momentum tables. ──
+    # ── Per-group tables — spirits split by brand-segment, UBL by channel
+    #    (KW Beer / Cross Supply / KW & PCMC Institution). One table per group,
+    #    showing ONLY the outlets in that group. Mirrors the Segment-wise
+    #    momentum tables above. ──
     if seg_plans:
-        st.markdown("#### 📊 Outlet plan by segment")
+        st.markdown("#### 📊 Outlet plan — broken down")
         st.caption(
-            "One table per brand-segment — only the outlets that actually buy "
-            "that segment. Reconciles to the Segment-wise tables above."
+            "One table per group (brand-segment for spirits, channel for UBL) "
+            "— only the outlets in that group. Reconciles to the breakdown "
+            "tables above."
         )
         for seg, sp in seg_plans.items():
             n = 0 if sp is None or sp.empty else len(sp)
@@ -2295,8 +2297,7 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
     )
 
     # Spirits (USL / Diageo) — split by channel class because MOP+Retail and
-    # POP report to different managers. Two tables. Other principals (UBL/BF)
-    # use a different channel structure → keep one combined table.
+    # POP report to different managers. Two tables.
     if cid in ("C00025", "C00040"):
         raw_bc = _load_brand_channel_monthly(cid, today.day)
         if not raw_bc.empty:
@@ -2318,12 +2319,46 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
                 "Combined — all channels", "combined")
         return
 
+    # UBL — split by AcType3 channel: KW Beer / Cross Supply / KW Institution /
+    # PCMC Institution. Each table shows UBL's segments (Super Premium HUMSA /
+    # Mainstream / Economy) so the planner sees segment momentum per channel.
+    if cid == "C00039":
+        raw_bc = _load_brand_channel_monthly(cid, today.day)
+        if not raw_bc.empty:
+            ubl_channels = [
+                ("KW Beer",          {"KW Beer"},          "kw_beer"),
+                ("Cross Supply",     {"Cross Supply"},     "cross_supply"),
+                ("KW Institution",   {"KW Institution"},   "kw_insti"),
+                ("PCMC Institution", {"PCMC Institution"}, "pcmc_insti"),
+                ("Other",            {"Other"},            "other"),
+            ]
+            for title, chans, key in ubl_channels:
+                tbl = _segment_table_channels(cid, raw_bc, chans, today)
+                if tbl is not None and not tbl.empty:
+                    _render(tbl, title, key)
+                    st.markdown("")
+        else:
+            st.caption("Channel split unavailable — showing combined only.")
+        raw = _load_brand_monthly(cid, today.day)
+        _render(_segment_table(cid, raw, today) if not raw.empty else None,
+                "Combined — all channels", "combined")
+        return
+
     raw = _load_brand_monthly(cid, today.day)
     if raw.empty:
         st.caption("No segment data for this principal.")
         return
     _render(_segment_table(cid, raw, today),
             "Segment-wise (this principal)", "all")
+
+
+def _channel_for_ubl(ac3: str) -> str:
+    """UBL AcType3 → channel label (mirrors segments._channel_for for C00039)."""
+    return {
+        "130001": "KW Beer", "130004": "KW Institution",
+        "130006": "KW Institution", "130002": "PCMC Institution",
+        "130007": "Cross Supply",
+    }.get((ac3 or "").strip(), "Other")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2521,6 +2556,23 @@ def render() -> None:
                     sub, op_month, principal_uni, tgt_cfg, pad_universe=False)
         except Exception as e:
             print(f"[sales_plan] segment outlet plan failed: {e}", file=sys.stderr)
+            seg_plans = None
+    # UBL: split the outlet plan by AcType3 channel (KW Beer / Cross Supply /
+    # KW Institution / PCMC Institution) — each outlet sits in one channel.
+    elif cid == "C00039":
+        try:
+            h = hist.copy()
+            h["Channel"] = h["AcType3ID"].map(_channel_for_ubl)
+            seg_plans = {}
+            for ch in ["KW Beer", "Cross Supply", "KW Institution",
+                       "PCMC Institution", "Other"]:
+                sub = h[h["Channel"] == ch]
+                if sub.empty:
+                    continue
+                seg_plans[ch] = _compute_outlet_plan(
+                    sub, op_month, principal_uni, tgt_cfg, pad_universe=False)
+        except Exception as e:
+            print(f"[sales_plan] UBL channel outlet plan failed: {e}", file=sys.stderr)
             seg_plans = None
 
     col_rc, _ = st.columns([1, 4])
