@@ -117,16 +117,12 @@ with _btn:
         get_connection.clear()
         st.rerun()
 
-# ── Top-level tabs ───────────────────────────────────────────────────────────
-# Inventory is no longer a top-level tab — it lives under Purchase as a sub-tab,
-# since stock is the direct consequence of purchase activity. The new
-# Debtors Ageing tab sits between Expenses and Cash Flow as a first-class
-# receivables view.
-t1, t2, t3, t4, t5, t6, t7 = st.tabs([
-    "Overview", "Purchase", "Sales",
-    "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet",
-])
-
+# ── Navigation ───────────────────────────────────────────────────────────────
+# IMPORTANT: we use radio-based navigation (NOT st.tabs) so that ONLY the
+# selected page's render() runs each script pass. st.tabs executes every tab
+# body on every rerun, which loaded all ~12 data-heavy pages into memory at
+# once and crashed the Streamlit Cloud instance (OOM). Rendering one page at a
+# time keeps peak memory to a single page.
 
 def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
     """Render a centered placeholder + 'under construction' notice."""
@@ -143,64 +139,69 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
     )
 
 
-with t1:
+_PAGES = ["Overview", "Purchase", "Sales",
+          "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
+page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
+                label_visibility="collapsed")
+st.divider()
+
+if page == "Overview":
     coming_soon(
         "Overview Dashboard",
         "Consolidated KPIs from every module — revenue, margin, debtors, stock value, P&L summary",
         "📊",
     )
 
-with t2:
-    p_overview, p_inventory = st.tabs([
-        "📦 Purchase Overview", "🏭 Inventory",
-    ])
-    with p_overview:
+elif page == "Purchase":
+    sub = st.radio("View", ["📦 Purchase Overview", "🏭 Inventory"],
+                   horizontal=True, key="pur_nav", label_visibility="collapsed")
+    if sub.endswith("Purchase Overview"):
         from src.purchase import render as render_purchase
         render_purchase()
-    with p_inventory:
+    else:
         from src.inventory import render as render_inventory
         render_inventory()
 
-with t3:
-    s_plan, s_overview, s_segment, s_team, s_dist, s_meeting, s_ops = st.tabs([
-        "Sales Plan",
-        "Sales Overview", "Segment Analysis", "Team Performance",
-        "Distribution", "Meeting Pack", "Operations Rhythm",
-    ])
-    with s_plan:
+elif page == "Sales":
+    _SALES = ["Sales Plan", "Sales Overview", "Segment Analysis",
+              "Team Performance", "Distribution", "Meeting Pack",
+              "Operations Rhythm"]
+    sub = st.radio("View", _SALES, horizontal=True, key="sales_nav",
+                   label_visibility="collapsed")
+    if sub == "Sales Plan":
         from src.sales_plan import render as render_sales_plan
         render_sales_plan()
-    with s_overview:
+    elif sub == "Sales Overview":
         from src.sales import render as render_sales
         render_sales()
-    with s_segment:
+    elif sub == "Segment Analysis":
         from src.segments import render as render_segments
         render_segments()
-    with s_team:
+    elif sub == "Team Performance":
         from src.salesman import render as render_salesman
         render_salesman()
-    with s_dist:
+    elif sub == "Distribution":
         from src.distribution import render as render_distribution
         render_distribution()
-    with s_meeting:
+    elif sub == "Meeting Pack":
         from src.principal import render as render_principal
         render_principal()
-    with s_ops:
+    else:
         from src.operations import render as render_operations
         render_operations()
 
-with t4:  # Expenses (slot 4 since Inventory is no longer top-level)
+elif page == "Expenses":
     from src.expenses import render as render_expenses
     render_expenses()
 
-with t5:  # Debtors Ageing — new first-class tab
+elif page == "Debtors Ageing":
     from src.debtors import render as render_debtors
     render_debtors()
 
-with t6:
+elif page == "Cash Flow":
     from src.cashflow import render as render_cashflow
     render_cashflow()
 
-with t7:
+elif page == "Balance Sheet":
     from src.balance_sheet import render as render_balance_sheet
     render_balance_sheet()
