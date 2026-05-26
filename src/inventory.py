@@ -118,9 +118,11 @@ def _load_stock_baseline() -> tuple[str, dict]:
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_rollforward(after_date: str) -> dict:
     """Net stock movement per item (bottles, In − Out, FREE GOODS INCLUDED)
-    for vouchers dated AFTER the baseline date through today. FY-CASE deduped.
-    Free goods are included because dispatched free stock physically leaves
-    the godown (matches the ERP Stock & Sale 'Out')."""
+    for vouchers dated ON/AFTER the baseline date through today. FY-CASE
+    deduped. The baseline is the FY-opening stock (start of 1 April), so we
+    include movements from that date onward (>=). Free goods are included
+    because dispatched free stock physically leaves the godown (matches the
+    ERP Stock & Sale 'Out')."""
     if not after_date:
         return {}
     sql = f"""
@@ -133,7 +135,7 @@ def _load_rollforward(after_date: str) -> dict:
         JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
         WHERE h.Cancelled = 'N' AND mt.ItemYN = 'Y' AND mt.QtyInOut IN ('I','O')
           AND vi.ItemID LIKE 'I%'
-          AND CAST(h.VoucherDate AS date) >  ?
+          AND CAST(h.VoucherDate AS date) >= ?
           AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
           {_FY_JOIN}
         GROUP BY vi.ItemID
@@ -819,10 +821,10 @@ def render() -> None:
     _bdate, _bitems = _load_stock_baseline()
     if _bdate:
         st.caption(
-            f"📦 Stock anchored to the ERP **Stock & Sale** export of "
-            f"**{_bdate}** ({len(_bitems)} items), rolled forward with live "
-            f"bill movements since. Drop a newer S&S export into "
-            f"`data/stock_baseline.json` to re-sync."
+            f"📦 Stock = **FY-opening ({_bdate})** from the ERP Stock & Sale "
+            f"report + live bill movements since. Computed automatically — "
+            f"you only upload the S&S **once a year on 1 April** to set the new "
+            f"FY opening. ({len(_bitems)} opening items.)"
         )
     else:
         st.caption("⚠️ No S&S baseline found — showing MsItemBatchOpening "
