@@ -202,8 +202,5 @@ with t6:
     render_cashflow()
 
 with t7:
-    coming_soon(
-        "Balance Sheet",
-        "Use Tally or your accounting software for the full balance sheet. Key ratios will be added here later.",
-        "📋",
-    )
+    from src.balance_sheet import render as render_balance_sheet
+    render_balance_sheet()
