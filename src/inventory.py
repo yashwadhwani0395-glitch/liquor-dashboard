@@ -19,7 +19,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES, safe_section
+from utils.helpers import (format_inr, CASES_SQL_EXPR as _CASES, safe_section,
+                          cases_sql, keg_mode_toggle)
 
 
 def _safe_format(df: "pd.DataFrame", fmt: dict) -> dict:
@@ -64,6 +65,31 @@ _FY_JOIN = """
 # DATA LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _kegaware_cases(desc: str, units: float, bpc) -> float:
+    """Convert a physical quantity (bottles, or keg count) to case-equivalents
+    using the SAME keg rule as CASES_SQL_EXPR (20LT=2.56, 30LT=3.85, 50LT=6.41
+    cases; everything else = bottles / BottlesPerCase). Keeps the Inventory
+    page's case counts consistent with Purchase / Sales / Sales-Plan."""
+    d = str(desc or "").upper().replace(" ", "")
+    u = float(units or 0)
+    if "50LT" in d:
+        return u * (50.0 / 7.8)
+    if "30LT" in d:
+        return u * (30.0 / 7.8)
+    if "20LT" in d:
+        return u * (20.0 / 7.8)
+    try:
+        b = float(bpc or 0)
+    except (TypeError, ValueError):
+        b = 0.0
+    return (u / b) if b > 0 else 0.0
+
+
+def _is_keg(desc: str) -> bool:
+    d = str(desc or "").upper().replace(" ", "")
+    return ("50LT" in d) or ("30LT" in d) or ("20LT" in d)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_current_stock() -> pd.DataFrame:
     """Live closing stock per item (today). Source: MsItemBatchOpening."""
@@ -92,33 +118,44 @@ def _load_current_stock() -> pd.DataFrame:
         df["ValRateBottle"]  = pd.to_numeric(df["ValRateBottle"],  errors="coerce").fillna(0.0)
         df["Principal"]      = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
         df["ClosingCases"]   = df.apply(
+            lambda r: _kegaware_cases(r["ItemDescription"], r["ClosingBottles"],
+                                      r["BottlesPerCase"]),
+            axis=1,
+        )
+        # Plain physical-unit cases (kegs counted as 1) — for VALUE only, since
+        # ValuationCaseRate is a per-physical-unit rate (matches the ERP stock
+        # value report). Display counts use the keg-aware ClosingCases above.
+        df["ClosingCasesPlain"] = df.apply(
             lambda r: (r["ClosingBottles"] / r["BottlesPerCase"])
                       if r["BottlesPerCase"] > 0 else 0.0,
             axis=1,
         )
         df["CaseRem"]      = df["ClosingCases"].astype(int)
         df["BottleRem"]    = df.apply(
-            lambda r: int(r["ClosingBottles"] - r["CaseRem"] * r["BottlesPerCase"])
-                      if r["BottlesPerCase"] > 0 else int(r["ClosingBottles"]),
+            lambda r: 0 if _is_keg(r["ItemDescription"])
+                      else (int(r["ClosingBottles"] - r["CaseRem"] * r["BottlesPerCase"])
+                            if r["BottlesPerCase"] > 0 else int(r["ClosingBottles"])),
             axis=1,
         )
     return df
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_movements(start: date, end: date) -> pd.DataFrame:
+def _load_movements(start: date, end: date, keg_aware: bool = True) -> pd.DataFrame:
     """Per-item In/Out bottle + case movements between start and end.
 
     Uses the FY-CASE filter so duplicate-FY rows in TrVocItem are dropped.
     Verified vs ERP Stock-Balance report (FY 2025-26): In within 0.005%.
+    keg_aware toggles volume-conversion of kegs in the case columns.
     """
+    _CX = cases_sql(keg_aware)
     sql = f"""
         SELECT
             vi.ItemID,
             SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS InBottles,
             SUM(CASE WHEN mt.QtyInOut='O' THEN ISNULL(vi.TotalBottleQty,0) ELSE 0 END) AS OutBottles,
-            SUM(CASE WHEN mt.QtyInOut='I' THEN {_CASES} ELSE 0 END) AS InCases,
-            SUM(CASE WHEN mt.QtyInOut='O' THEN {_CASES} ELSE 0 END) AS OutCases
+            SUM(CASE WHEN mt.QtyInOut='I' THEN {_CX} ELSE 0 END) AS InCases,
+            SUM(CASE WHEN mt.QtyInOut='O' THEN {_CX} ELSE 0 END) AS OutCases
         FROM TrVocItem vi
         JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
         JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
@@ -193,13 +230,13 @@ def _load_item_origin() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_sales_velocity(as_of_date: date, days_back: int = 30) -> pd.DataFrame:
+def _load_sales_velocity(as_of_date: date, days_back: int = 30,
+                         keg_aware: bool = True) -> pd.DataFrame:
     """Per-item sales cases in last N days + last sale date (FY-CASE filtered)."""
     sql = f"""
         SELECT
             vi.ItemID,
-            SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
-                / NULLIF(im.BottlesPerCase, 0))      AS Cases,
+            SUM({cases_sql(keg_aware)})               AS Cases,
             MAX(h.VoucherDate)                        AS LastSale
         FROM TrVocItem vi
         JOIN TrVocHead    h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
@@ -274,16 +311,22 @@ def _build_stock_df(as_of: date) -> pd.DataFrame:
             ).clip(lower=0).astype(int)
             out = merged.drop(columns=["InBottles", "OutBottles"], errors="ignore")
 
-    # Recompute cases/remainder from updated ClosingBottles
+    # Recompute cases/remainder from updated ClosingBottles (keg-aware)
     out["ClosingCases"] = out.apply(
+        lambda r: _kegaware_cases(r["ItemDescription"], r["ClosingBottles"],
+                                  r["BottlesPerCase"]),
+        axis=1,
+    )
+    out["ClosingCasesPlain"] = out.apply(
         lambda r: (r["ClosingBottles"] / r["BottlesPerCase"])
                   if r["BottlesPerCase"] > 0 else 0.0,
         axis=1,
     )
     out["CaseRem"]   = out["ClosingCases"].astype(int)
     out["BottleRem"] = out.apply(
-        lambda r: int(r["ClosingBottles"] - r["CaseRem"] * r["BottlesPerCase"])
-                  if r["BottlesPerCase"] > 0 else int(r["ClosingBottles"]),
+        lambda r: 0 if _is_keg(r["ItemDescription"])
+                  else (int(r["ClosingBottles"] - r["CaseRem"] * r["BottlesPerCase"])
+                        if r["BottlesPerCase"] > 0 else int(r["ClosingBottles"])),
         axis=1,
     )
     return out
@@ -301,7 +344,7 @@ def _section_kpis(stock_df: pd.DataFrame) -> None:
 
     # Inventory value uses Valuation rate (already includes excise / landed cost)
     merged = stock_df.copy()
-    merged["Value"] = merged["ClosingCases"] * merged["ValRateCase"]
+    merged["Value"] = merged["ClosingCasesPlain"] * merged["ValRateCase"]
     total_value = float(merged["Value"].sum())
 
     out_of_stock = int((stock_df["ClosingBottles"] <= 0).sum())
@@ -344,7 +387,8 @@ def _section_kpis(stock_df: pd.DataFrame) -> None:
 def _section_reconciliation(opening_df: pd.DataFrame,
                             move_df: pd.DataFrame,
                             stock_df: pd.DataFrame,
-                            start: date, end: date) -> None:
+                            start: date, end: date,
+                            keg_aware: bool = True) -> None:
     """ERP-style Op | In | Out | Cl reconciliation for the chosen period."""
     st.markdown("##### Stock Reconciliation")
     st.caption(
@@ -358,21 +402,28 @@ def _section_reconciliation(opening_df: pd.DataFrame,
     for c in ("OpeningBottles", "InBottles", "OutBottles", "InCases", "OutCases"):
         m[c] = pd.to_numeric(m.get(c, 0), errors="coerce").fillna(0).astype(int)
 
-    # Bring in BottlesPerCase + only "having balances" filter
-    bpc = stock_df[["ItemID", "BottlesPerCase"]].drop_duplicates("ItemID")
-    m = m.merge(bpc, on="ItemID", how="left")
+    # Bring in BottlesPerCase + ItemDescription (for keg-aware case math)
+    meta = stock_df[["ItemID", "BottlesPerCase", "ItemDescription"]].drop_duplicates("ItemID")
+    m = m.merge(meta, on="ItemID", how="left")
     m["BottlesPerCase"] = pd.to_numeric(m["BottlesPerCase"], errors="coerce").fillna(0).astype(int)
+    m["ItemDescription"] = m["ItemDescription"].fillna("")
     m["ClosingBottles"] = (m["OpeningBottles"] + m["InBottles"] - m["OutBottles"]).clip(lower=0)
 
     def _cases(row, col):
+        # Honour the keg toggle so Opening/Closing match the In/Out columns
+        # (which come from _load_movements with the same keg_aware flag).
+        if keg_aware:
+            return _kegaware_cases(row["ItemDescription"], row[col], row["BottlesPerCase"])
         bpc = row["BottlesPerCase"]
-        return (row[col] // bpc) if bpc > 0 else 0
+        return (row[col] / bpc) if bpc > 0 else 0.0
 
     def _bot_rem(row, col):
+        if keg_aware and _is_keg(row["ItemDescription"]):
+            return 0
         bpc = row["BottlesPerCase"]
         if bpc <= 0:
             return int(row[col])
-        return int(row[col] - (row[col] // bpc) * bpc)
+        return int(row[col] - (int(row[col]) // bpc) * bpc)
 
     m["OpCases"]  = m.apply(lambda r: _cases(r, "OpeningBottles"),  axis=1)
     m["OpBotR"]   = m.apply(lambda r: _bot_rem(r, "OpeningBottles"), axis=1)
@@ -401,7 +452,7 @@ def _section_by_principal(stock_df: pd.DataFrame) -> None:
         st.info("No stock data."); return
 
     df = stock_df.copy()
-    df["Value"] = df["ClosingCases"] * df["ValRateCase"]
+    df["Value"] = df["ClosingCasesPlain"] * df["ValRateCase"]
     g = (
         df[df["ClosingBottles"] > 0]
         .groupby("Principal", as_index=False)
@@ -429,7 +480,7 @@ def _section_top_items(stock_df: pd.DataFrame, origin_df: pd.DataFrame) -> None:
         st.info("No stock data."); return
 
     df = stock_df.merge(origin_df, on="ItemID", how="left").fillna({"Origin": "Domestic"})
-    df["Value"] = df["ClosingCases"] * df["ValRateCase"]
+    df["Value"] = df["ClosingCasesPlain"] * df["ValRateCase"]
     top = df[df["Value"] > 0].sort_values("Value", ascending=False).head(20).copy()
     if top.empty:
         st.info("No items with value > 0."); return
@@ -662,17 +713,26 @@ def render() -> None:
             key="inv_view_filter",
         )
 
+    keg_aware = keg_mode_toggle("inv_keg_mode")
+
     # Reconciliation period (defaults to FY start through as_of)
     with st.spinner("Loading stock + movement data…"):
         stock_df    = _build_stock_df(as_of_date)
         opening_df  = _load_opening_stock()
-        move_df     = _load_movements(fy_start, as_of_date)
+        move_df     = _load_movements(fy_start, as_of_date, keg_aware=keg_aware)
         origin_df   = _load_item_origin()
-        vel_30      = _load_sales_velocity(as_of_date, days_back=30)
-        vel_90      = _load_sales_velocity(as_of_date, days_back=90)
+        vel_30      = _load_sales_velocity(as_of_date, days_back=30, keg_aware=keg_aware)
+        vel_90      = _load_sales_velocity(as_of_date, days_back=90, keg_aware=keg_aware)
 
     if stock_df.empty:
         st.error("No stock data returned."); return
+
+    # Apply keg mode to the stock case counts (value always uses the plain
+    # physical-unit basis via ClosingCasesPlain, so it's unaffected).
+    if not keg_aware:
+        stock_df = stock_df.copy()
+        stock_df["ClosingCases"] = stock_df["ClosingCasesPlain"]
+        stock_df["CaseRem"]      = stock_df["ClosingCases"].astype(int)
 
     if principal_filter:
         stock_df = stock_df[stock_df["Principal"].isin(principal_filter)]
@@ -691,7 +751,7 @@ def render() -> None:
     safe_section("KPIs",            _section_kpis,            stock_df)
     st.divider()
     safe_section("Stock reconciliation", _section_reconciliation,
-                 opening_df, move_df, stock_df, fy_start, as_of_date)
+                 opening_df, move_df, stock_df, fy_start, as_of_date, keg_aware)
     st.divider()
     safe_section("By principal",    _section_by_principal,    stock_df)
     st.divider()

@@ -18,7 +18,8 @@ except ImportError:
     relativedelta = None
 
 from db import run_query
-from utils.helpers import format_inr, CASES_SQL_EXPR as _CASES
+from utils.helpers import (format_inr, CASES_SQL_EXPR as _CASES,
+                          cases_sql, keg_mode_toggle)
 
 # ── Transaction types ────────────────────────────────────────────────────────
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
@@ -129,7 +130,8 @@ def _kpi_card(label: str, value: str, delta_text: str,
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_kpis(start: date, end: date,
                         ly_start: date, ly_end: date,
-                        principal_ids: tuple[str, ...]) -> dict:
+                        principal_ids: tuple[str, ...],
+                        keg_aware: bool = True) -> dict:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     company_sql = ""
     company_params: tuple = ()
@@ -141,8 +143,8 @@ def _load_purchase_kpis(start: date, end: date,
         SELECT
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
           SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS C,
-          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyC,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {cases_sql(keg_aware)} ELSE 0 END) AS C,
+          SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {cases_sql(keg_aware)} ELSE 0 END) AS LyC,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS LyI,
           COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN b.CompanyID END) AS Sup,
@@ -254,15 +256,16 @@ def _load_purchase_gl(start: date, end: date,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_by_principal(start: date, end: date,
-                                ly_start: date, ly_end: date) -> pd.DataFrame:
+                                ly_start: date, ly_end: date,
+                                keg_aware: bool = True) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     sql = f"""
         SELECT
             b.CompanyID,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS P,
             SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS LyP,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS C,
-            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyC,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {cases_sql(keg_aware)} ELSE 0 END) AS C,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {cases_sql(keg_aware)} ELSE 0 END) AS LyC,
             COUNT(DISTINCT CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN h.VoucherNo END) AS I
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -292,16 +295,17 @@ def _load_purchase_by_principal(start: date, end: date,
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
+def _load_purchase_vs_sales(start: date, end: date,
+                            keg_aware: bool = True) -> pd.DataFrame:
     """Per principal: (cases bought + value) vs (cases sold + value)."""
     pu_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     ms_ph = ",".join(str(t) for t in SALES_TYPES)
     sql = f"""
         SELECT
             b.CompanyID,
-            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN {_CASES} ELSE 0 END) AS BCases,
+            SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN {cases_sql(keg_aware)} ELSE 0 END) AS BCases,
             SUM(CASE WHEN h.TransTypeID IN ({pu_ph}) THEN vi.TotalAmount ELSE 0 END) AS BVal,
-            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN {_CASES} ELSE 0 END) AS SCases,
+            SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN {cases_sql(keg_aware)} ELSE 0 END) AS SCases,
             SUM(CASE WHEN h.TransTypeID IN ({ms_ph}) THEN vi.TotalAmount ELSE 0 END) AS SVal
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -330,7 +334,8 @@ def _load_purchase_vs_sales(start: date, end: date) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_purchase_monthly(months: int = 24,
-                           principal_ids: tuple[str, ...] = ()) -> pd.DataFrame:
+                           principal_ids: tuple[str, ...] = (),
+                           keg_aware: bool = True) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     company_sql = ""
     company_params: tuple = ()
@@ -342,7 +347,7 @@ def _load_purchase_monthly(months: int = 24,
         SELECT
             FORMAT(h.VoucherDate, 'yyyy-MM') AS Month,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase,
-            SUM({_CASES}) AS Cases
+            SUM({cases_sql(keg_aware)}) AS Cases
         FROM TrVocHead h
         JOIN TrVocItem vi
             ON  vi.TransTypeID = h.TransTypeID
@@ -368,7 +373,8 @@ def _load_purchase_monthly(months: int = 24,
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_top_brands_purchased(start: date, end: date,
-                               principal_ids: tuple[str, ...]) -> pd.DataFrame:
+                               principal_ids: tuple[str, ...],
+                               keg_aware: bool = True) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     company_sql = ""
     company_params: tuple = ()
@@ -379,7 +385,7 @@ def _load_top_brands_purchased(start: date, end: date,
     sql = f"""
         SELECT TOP 15
             b.BrandName, b.CompanyID,
-            SUM({_CASES}) AS Cases,
+            SUM({cases_sql(keg_aware)}) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Purchase
         FROM TrVocHead h
         JOIN TrVocItem vi
@@ -406,14 +412,15 @@ def _load_top_brands_purchased(start: date, end: date,
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_recent_vouchers(end: date, limit: int = 50) -> pd.DataFrame:
+def _load_recent_vouchers(end: date, limit: int = 50,
+                          keg_aware: bool = True) -> pd.DataFrame:
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     sql = f"""
         SELECT TOP {limit}
             h.VoucherDate,
             h.VoucherNo,
             h.TransTypeID,
-            SUM({_CASES}) AS Cases,
+            SUM({cases_sql(keg_aware)}) AS Cases,
             SUM(CAST(vi.TotalAmount AS FLOAT))  AS Amount,
             -- Principal inferred from brand CompanyID majority on the voucher
             (
@@ -793,6 +800,8 @@ def render() -> None:
         st.warning("Start date must be before end date.")
         return
 
+    keg_aware = keg_mode_toggle("purchase_keg_mode")
+
     ly_start, ly_end = _shift_year(start, 1), _shift_year(end, 1)
     reverse_map = {v: k for k, v in _PRINCIPAL_NAMES.items()}
     principal_ids: tuple[str, ...] = tuple(
@@ -800,13 +809,13 @@ def render() -> None:
     )
 
     with st.spinner("Loading purchase data…"):
-        kpi          = _load_purchase_kpis(start, end, ly_start, ly_end, principal_ids)
+        kpi          = _load_purchase_kpis(start, end, ly_start, ly_end, principal_ids, keg_aware)
         gl           = _load_purchase_gl(start, end, ly_start, ly_end)
-        p_df         = _load_purchase_by_principal(start, end, ly_start, ly_end)
-        rec_df       = _load_purchase_vs_sales(start, end)
-        monthly_df   = _load_purchase_monthly(24, principal_ids)
-        brands_df    = _load_top_brands_purchased(start, end, principal_ids)
-        vouchers_df  = _load_recent_vouchers(end)
+        p_df         = _load_purchase_by_principal(start, end, ly_start, ly_end, keg_aware)
+        rec_df       = _load_purchase_vs_sales(start, end, keg_aware)
+        monthly_df   = _load_purchase_monthly(24, principal_ids, keg_aware)
+        brands_df    = _load_top_brands_purchased(start, end, principal_ids, keg_aware)
+        vouchers_df  = _load_recent_vouchers(end, keg_aware=keg_aware)
 
     if gl["total_cost"] == 0 and gl["ly_total_cost"] == 0 and kpi["p"] == 0:
         st.warning("No purchase data for the selected period or filters.")

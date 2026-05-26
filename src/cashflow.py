@@ -94,7 +94,17 @@ def _cr(x: float) -> str:
 def _load_stock_value_by_principal() -> pd.DataFrame:
     """Per-principal FY-opening AND live-closing stock — cases + ₹ at the
     ERP landed-cost rate (ValuationCaseRate)."""
-    sql = """
+    # Keg-aware case conversion (20LT=2.56, 30LT=3.85, 50LT=6.41) — matches
+    # CASES_SQL_EXPR used on purchase/sales. Applied to the case COUNTS only;
+    # VALUE stays on plain physical units × ValuationCaseRate (per-unit rate
+    # that ties to the ERP stock-value report).
+    def _kegcase(qty: str) -> str:
+        return f"""(CASE
+            WHEN im.ItemDescription LIKE '%50 LT%' OR im.ItemDescription LIKE '%50LT%' OR im.ItemDescription LIKE '%50LTR%' THEN {qty}*(50.0/7.8)
+            WHEN im.ItemDescription LIKE '%30 LT%' OR im.ItemDescription LIKE '%30LT%' OR im.ItemDescription LIKE '%30LTR%' THEN {qty}*(30.0/7.8)
+            WHEN im.ItemDescription LIKE '%20 LT%' OR im.ItemDescription LIKE '%20LT%' OR im.ItemDescription LIKE '%20LTR%' THEN {qty}*(20.0/7.8)
+            ELSE {qty} / NULLIF(im.BottlesPerCase, 0) END)"""
+    sql = f"""
         SELECT
             ISNULL(b.CompanyID, '')               AS CompanyID,
             SUM(ISNULL(bo.OpeningQty, 0))         AS OpenBottles,
@@ -105,12 +115,8 @@ def _load_stock_value_by_principal() -> pd.DataFrame:
             SUM(CASE WHEN im.BottlesPerCase > 0
                      THEN ISNULL(bo.ClosingQty,0) / CAST(im.BottlesPerCase AS float)
                           * ISNULL(im.ValuationCaseRate,0) ELSE 0 END) AS CloseValue,
-            SUM(CASE WHEN im.BottlesPerCase > 0
-                     THEN ISNULL(bo.OpeningQty,0) / CAST(im.BottlesPerCase AS float)
-                     ELSE 0 END)                  AS OpenCases,
-            SUM(CASE WHEN im.BottlesPerCase > 0
-                     THEN ISNULL(bo.ClosingQty,0) / CAST(im.BottlesPerCase AS float)
-                     ELSE 0 END)                  AS CloseCases
+            SUM({_kegcase('ISNULL(bo.OpeningQty,0)')})  AS OpenCases,
+            SUM({_kegcase('ISNULL(bo.ClosingQty,0)')})  AS CloseCases
         FROM MsItemBatchOpening bo
         JOIN MsItemMaster  im ON im.ItemID = bo.ItemID
         LEFT JOIN MsBrandMaster b ON b.BrandID = im.BrandID

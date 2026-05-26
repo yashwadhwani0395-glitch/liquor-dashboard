@@ -116,6 +116,35 @@ CASES_SQL_EXPR: str = """(CASE
 END)"""
 
 
+# Plain case expression — kegs counted as 1 physical unit (no volume
+# conversion). Same shape as CASES_SQL_EXPR's ELSE branch.
+CASES_SQL_PLAIN: str = (
+    "(CAST(vi.TotalBottleQty AS decimal(18,4)) / NULLIF(im.BottlesPerCase, 0))"
+)
+
+
+def cases_sql(keg_aware: bool) -> str:
+    """Return the case-equivalent SQL fragment.
+    keg_aware=True  → kegs volume-converted (20LT=2.56 … 50LT=6.41 cases).
+    keg_aware=False → kegs counted as 1 case (plain BottlesPerCase math)."""
+    return CASES_SQL_EXPR if keg_aware else CASES_SQL_PLAIN
+
+
+def keg_mode_toggle(key: str, *, label: str = "Keg counting") -> bool:
+    """Render a small radio to switch keg case-counting. Returns True for the
+    volume-converted (keg-aware) mode, False for plain (1 keg = 1 case).
+    Default is keg-aware (the ERP/MIS basis)."""
+    import streamlit as _st
+    choice = _st.radio(
+        label,
+        ["Volume-converted (20LT=2.56 cs)", "Count keg as 1 case"],
+        index=0, horizontal=True, key=key,
+        help="Volume-converted matches the ERP/MIS case basis used on "
+             "Purchase & Sales. 'Count keg as 1 case' shows raw keg units.",
+    )
+    return choice.startswith("Volume")
+
+
 def safe_section(title: str, render_func, *args, **kwargs):
     """Run a render function inside an error boundary.
 
