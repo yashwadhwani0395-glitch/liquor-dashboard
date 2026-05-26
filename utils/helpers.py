@@ -130,17 +130,21 @@ def cases_sql(keg_aware: bool) -> str:
     return CASES_SQL_EXPR if keg_aware else CASES_SQL_PLAIN
 
 
-def keg_mode_toggle(key: str, *, label: str = "Keg counting") -> bool:
+def keg_mode_toggle(key: str, *, label: str = "Keg counting",
+                    default_keg_aware: bool = True) -> bool:
     """Render a small radio to switch keg case-counting. Returns True for the
     volume-converted (keg-aware) mode, False for plain (1 keg = 1 case).
-    Default is keg-aware (the ERP/MIS basis)."""
+    default_keg_aware sets which option is pre-selected — keg-aware for
+    Purchase/Sales (MIS basis), plain for Inventory stock (the ERP Stock &
+    Sale report counts kegs as raw units)."""
     import streamlit as _st
+    opts = ["Volume-converted (20LT=2.56 cs)", "Count keg as 1 case"]
     choice = _st.radio(
-        label,
-        ["Volume-converted (20LT=2.56 cs)", "Count keg as 1 case"],
-        index=0, horizontal=True, key=key,
+        label, opts,
+        index=0 if default_keg_aware else 1, horizontal=True, key=key,
         help="Volume-converted matches the ERP/MIS case basis used on "
-             "Purchase & Sales. 'Count keg as 1 case' shows raw keg units.",
+             "Purchase & Sales. 'Count keg as 1 case' shows raw keg units "
+             "(matches the ERP Stock & Sale report).",
     )
     return choice.startswith("Volume")
 

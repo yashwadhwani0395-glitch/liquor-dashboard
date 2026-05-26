@@ -12,6 +12,9 @@ Movement classification: MsTransType.QtyInOut (I = inward, O = outward).
 """
 from __future__ import annotations
 
+import json
+import os
+import sys
 from datetime import date
 
 import pandas as pd
@@ -21,6 +24,13 @@ import streamlit as st
 from db import run_query
 from utils.helpers import (format_inr, CASES_SQL_EXPR as _CASES, safe_section,
                           cases_sql, keg_mode_toggle)
+
+# ERP Stock & Sale baseline — anchors live stock to the ERP's authoritative
+# closing, then rolls forward with live movements (the ERP's per-item opening
+# stock isn't stored in any accessible table, so we can't compute it purely
+# live; this baseline is refreshed by dropping in a newer S&S export).
+_BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "data",
+                              "stock_baseline.json")
 
 
 def _safe_format(df: "pd.DataFrame", fmt: dict) -> dict:
@@ -91,8 +101,101 @@ def _is_keg(desc: str) -> bool:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _load_stock_baseline() -> tuple[str, dict]:
+    """Per-item closing stock (bottles) from the last ERP Stock & Sale export
+    — the authoritative anchor. Returns (baseline_date 'YYYY-MM-DD',
+    {ItemID: bottles}). Empty if no baseline file is present."""
+    try:
+        with open(_BASELINE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        items = {str(k): int(v) for k, v in d.get("items", {}).items()}
+        return str(d.get("baseline_date", "")), items
+    except Exception as exc:
+        print(f"[inventory] stock baseline unavailable: {exc}", file=sys.stderr)
+        return "", {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_rollforward(after_date: str) -> dict:
+    """Net stock movement per item (bottles, In − Out, FREE GOODS INCLUDED)
+    for vouchers dated AFTER the baseline date through today. FY-CASE deduped.
+    Free goods are included because dispatched free stock physically leaves
+    the godown (matches the ERP Stock & Sale 'Out')."""
+    if not after_date:
+        return {}
+    sql = f"""
+        SELECT vi.ItemID,
+            SUM(CASE WHEN mt.QtyInOut='I' THEN ISNULL(vi.TotalBottleQty,0)
+                     WHEN mt.QtyInOut='O' THEN -ISNULL(vi.TotalBottleQty,0)
+                     ELSE 0 END)                          AS NetB
+        FROM TrVocItem vi
+        JOIN TrVocHead   h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
+        JOIN MsTransType mt ON mt.TransTypeID = vi.TransTypeID
+        WHERE h.Cancelled = 'N' AND mt.ItemYN = 'Y' AND mt.QtyInOut IN ('I','O')
+          AND vi.ItemID LIKE 'I%'
+          AND CAST(h.VoucherDate AS date) >  ?
+          AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
+          {_FY_JOIN}
+        GROUP BY vi.ItemID
+    """
+    df = run_query(sql, (after_date,))
+    if df.empty:
+        return {}
+    return {str(r.ItemID).strip(): int(r.NetB or 0) for r in df.itertuples()}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _load_current_stock() -> pd.DataFrame:
-    """Live closing stock per item (today). Source: MsItemBatchOpening."""
+    """Live closing stock per item = ERP Stock & Sale baseline + live movements
+    since the baseline date. Ties to the ERP report and stays current as bills
+    post — no daily export needed. Falls back to the MsItemBatchOpening batch
+    table only if no baseline file is present."""
+    base_date, base = _load_stock_baseline()
+    if not base:
+        return _load_current_stock_legacy()
+    roll = _load_rollforward(base_date)
+    item_ids = set(base) | set(roll)
+    ph = ",".join(f"'{i}'" for i in item_ids)
+    df = run_query(f"""
+        SELECT im.ItemID,
+            ISNULL(im.ItemDescription, im.ItemID)        AS ItemDescription,
+            ISNULL(b.BrandName,        '(unknown)')      AS BrandName,
+            ISNULL(b.CompanyID,        '')               AS CompanyID,
+            ISNULL(im.BottlesPerCase,  0)                AS BottlesPerCase,
+            ISNULL(im.ValuationCaseRate,   0.0)          AS ValRateCase,
+            ISNULL(im.ValuationBottleRate, 0.0)          AS ValRateBottle
+        FROM MsItemMaster im
+        LEFT JOIN MsBrandMaster b ON b.BrandID = im.BrandID
+        WHERE im.ItemID IN ({ph})
+    """)
+    if df.empty:
+        return df
+    df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce").fillna(0).astype(int)
+    df["ValRateCase"]    = pd.to_numeric(df["ValRateCase"],    errors="coerce").fillna(0.0)
+    df["ValRateBottle"]  = pd.to_numeric(df["ValRateBottle"],  errors="coerce").fillna(0.0)
+    df["ClosingBottles"] = df["ItemID"].map(
+        lambda i: base.get(i, 0) + roll.get(i, 0)).astype(int)
+    df["Principal"]      = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
+    df["ClosingCases"]   = df.apply(
+        lambda r: _kegaware_cases(r["ItemDescription"], r["ClosingBottles"],
+                                  r["BottlesPerCase"]), axis=1)
+    df["ClosingCasesPlain"] = df.apply(
+        lambda r: (r["ClosingBottles"] / r["BottlesPerCase"])
+                  if r["BottlesPerCase"] > 0 else 0.0, axis=1)
+    df["CaseRem"]   = df["ClosingCases"].astype(int)
+    df["BottleRem"] = df.apply(
+        lambda r: 0 if _is_keg(r["ItemDescription"])
+                  else (int(r["ClosingBottles"] - r["CaseRem"] * r["BottlesPerCase"])
+                        if r["BottlesPerCase"] > 0 else int(r["ClosingBottles"])),
+        axis=1)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_current_stock_legacy() -> pd.DataFrame:
+    """Fallback: live closing stock from MsItemBatchOpening (used only when no
+    S&S baseline file exists). NOTE: this batch table doesn't reconcile to the
+    ERP Stock & Sale report for re-coded SKUs — that's why the baseline exists."""
     sql = """
         SELECT
             bo.ItemID,
@@ -122,9 +225,6 @@ def _load_current_stock() -> pd.DataFrame:
                                       r["BottlesPerCase"]),
             axis=1,
         )
-        # Plain physical-unit cases (kegs counted as 1) — for VALUE only, since
-        # ValuationCaseRate is a per-physical-unit rate (matches the ERP stock
-        # value report). Display counts use the keg-aware ClosingCases above.
         df["ClosingCasesPlain"] = df.apply(
             lambda r: (r["ClosingBottles"] / r["BottlesPerCase"])
                       if r["BottlesPerCase"] > 0 else 0.0,
@@ -713,7 +813,20 @@ def render() -> None:
             key="inv_view_filter",
         )
 
-    keg_aware = keg_mode_toggle("inv_keg_mode")
+    keg_aware = keg_mode_toggle("inv_keg_mode", default_keg_aware=False)
+
+    # Show what the stock is anchored to (ERP S&S baseline + live roll-forward)
+    _bdate, _bitems = _load_stock_baseline()
+    if _bdate:
+        st.caption(
+            f"📦 Stock anchored to the ERP **Stock & Sale** export of "
+            f"**{_bdate}** ({len(_bitems)} items), rolled forward with live "
+            f"bill movements since. Drop a newer S&S export into "
+            f"`data/stock_baseline.json` to re-sync."
+        )
+    else:
+        st.caption("⚠️ No S&S baseline found — showing MsItemBatchOpening "
+                   "(may not match the ERP Stock & Sale report).")
 
     # Reconciliation period (defaults to FY start through as_of)
     with st.spinner("Loading stock + movement data…"):
