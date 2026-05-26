@@ -12,10 +12,11 @@ Movement classification: MsTransType.QtyInOut (I = inward, O = outward).
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -44,6 +45,12 @@ def _safe_format(df: "pd.DataFrame", fmt: dict) -> dict:
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
 IMPORT_TYPES:   tuple[int, ...] = (22, 54)               # imports proper
 DAMAN_TYPES:    tuple[int, ...] = (42,)                  # Daman / cross-state
+SALES_TYPES:    tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
+
+
+def _month_first(d: date, months_offset: int = 0) -> date:
+    m = d.month - 1 + months_offset
+    return date(d.year + m // 12, m % 12 + 1, 1)
 
 _PRINCIPAL_NAMES: dict[str, str] = {
     "C00025": "United Spirits",
@@ -387,6 +394,42 @@ def _load_sales_velocity(as_of_date: date, days_back: int = 30,
         df["Cases"]    = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
         df["LastSale"] = pd.to_datetime(df["LastSale"], errors="coerce")
     return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_demand_signals(as_of: date, keg_aware: bool = True) -> pd.DataFrame:
+    """Per-item SALES demand signals for the indent predictor:
+    L3M = avg/month over the 3 prior full months · PrevMo = last full month ·
+    ThisMTD = sold so far this month. SALES_TYPES only (true outlet demand)."""
+    msf   = _month_first(as_of)               # 1st of this month
+    l3s   = _month_first(as_of, -3)           # 1st, 3 months back
+    prevs = _month_first(as_of, -1)           # 1st of last month
+    preve = msf - timedelta(days=1)           # last day of last month
+    sales = ",".join(str(t) for t in SALES_TYPES)
+    cx = cases_sql(keg_aware)
+    sql = f"""
+        SELECT vi.ItemID,
+            SUM(CASE WHEN h.VoucherDate >= ? AND h.VoucherDate < ?  THEN {cx} ELSE 0 END) AS L3MCases,
+            SUM(CASE WHEN h.VoucherDate >= ? AND h.VoucherDate <= ? THEN {cx} ELSE 0 END) AS PrevMo,
+            SUM(CASE WHEN h.VoucherDate >= ? AND h.VoucherDate <= ? THEN {cx} ELSE 0 END) AS ThisMTD
+        FROM TrVocItem vi
+        JOIN TrVocHead    h  ON h.TransTypeID = vi.TransTypeID AND h.VoucherNo = vi.VoucherNo
+        JOIN MsItemMaster im ON im.ItemID      = vi.ItemID
+        WHERE h.Cancelled = 'N' AND vi.FreeItemYN = 'N' AND vi.ItemID LIKE 'I%'
+          AND h.TransTypeID IN ({sales})
+          AND h.VoucherDate >= ? AND h.VoucherDate <= ?
+          {_FY_JOIN}
+        GROUP BY vi.ItemID
+    """
+    p = (str(l3s), str(msf), str(prevs), str(preve), str(msf), str(as_of),
+         str(l3s), str(as_of))
+    df = run_query(sql, p)
+    if df.empty:
+        return pd.DataFrame(columns=["ItemID", "L3MMonthly", "PrevMo", "ThisMTD"])
+    for c in ("L3MCases", "PrevMo", "ThisMTD"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["L3MMonthly"] = df["L3MCases"] / 3.0
+    return df[["ItemID", "L3MMonthly", "PrevMo", "ThisMTD"]]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -793,6 +836,75 @@ def _section_days_of_cover(stock_df: pd.DataFrame, vel_df: pd.DataFrame) -> None
     )
 
 
+def _section_indent_planner(stock_df: pd.DataFrame, as_of: date,
+                            keg_aware: bool = True) -> None:
+    """Predict the stock you'll fall short of this month, so you can indent
+    early. Per SKU: projected demand = balanced blend of L3M monthly, last
+    month, and this-month run-rate; remaining = projected − sold MTD; if
+    remaining > stock on hand, the gap is the indent quantity."""
+    st.markdown("##### 📋 Indent planner — stock you may fall short of")
+    days_in_month = calendar.monthrange(as_of.year, as_of.month)[1]
+    days_done = max(as_of.day, 1)
+    st.caption(
+        f"Projected demand = balanced blend of L3M monthly avg, last month, and "
+        f"this-month run-rate (day {days_done}/{days_in_month}). **Indent** = "
+        f"demand still expected this month − stock on hand. Order these early."
+    )
+
+    dem = _load_demand_signals(as_of, keg_aware=keg_aware)
+    if dem.empty:
+        st.info("No recent sales to forecast from."); return
+    m = stock_df.merge(dem, on="ItemID", how="left")
+    for c in ("L3MMonthly", "PrevMo", "ThisMTD"):
+        m[c] = pd.to_numeric(m.get(c, 0), errors="coerce").fillna(0.0)
+
+    # Run-rate projection of this month to a full month
+    m["ThisProj"] = m["ThisMTD"] / days_done * days_in_month
+    # Balanced blend (35% L3M / 30% last month / 35% this-month run-rate)
+    m["Projected"] = 0.35 * m["L3MMonthly"] + 0.30 * m["PrevMo"] + 0.35 * m["ThisProj"]
+    m["Remaining"] = (m["Projected"] - m["ThisMTD"]).clip(lower=0)
+    m["Indent"]    = (m["Remaining"] - m["ClosingCases"]).clip(lower=0)
+    daily = (m["L3MMonthly"] / 30.0).replace(0, pd.NA)
+    m["DaysCover"] = (m["ClosingCases"] / daily).fillna(9999)
+
+    short = m[m["Indent"] >= 1].sort_values("Indent", ascending=False)
+    if short.empty:
+        st.success("✅ Enough stock on hand to meet this month's projected demand "
+                   "for every SKU — nothing to indent right now.")
+        return
+
+    st.warning(f"⚠️ **{len(short)} SKUs** projected to fall short this month — "
+               f"total indent **{short['Indent'].sum():,.0f} cases**.")
+    disp = short[["BrandName", "ItemDescription", "ClosingCases", "L3MMonthly",
+                  "PrevMo", "ThisMTD", "Projected", "Remaining", "Indent",
+                  "DaysCover"]].copy()
+    fmt = {c: "{:,.0f}" for c in ["ClosingCases", "L3MMonthly", "PrevMo",
+                                  "ThisMTD", "Projected", "Remaining", "Indent"]}
+    fmt["DaysCover"] = lambda v: "—" if v >= 9999 else f"{v:,.0f} d"
+    st.dataframe(
+        disp.style.format(_safe_format(disp, fmt)),
+        use_container_width=True, hide_index=True, height=440,
+        column_config={
+            "BrandName":       st.column_config.Column("Brand"),
+            "ItemDescription": st.column_config.Column("Item"),
+            "ClosingCases":    st.column_config.Column("Stock now"),
+            "L3MMonthly":      st.column_config.Column("L3M/mo"),
+            "PrevMo":          st.column_config.Column("Last month"),
+            "ThisMTD":         st.column_config.Column("Sold MTD"),
+            "Projected":       st.column_config.Column("Projected demand"),
+            "Remaining":       st.column_config.Column("Still needed"),
+            "Indent":          st.column_config.Column("➡️ INDENT cs"),
+            "DaysCover":       st.column_config.Column("Days cover"),
+        },
+    )
+    st.download_button(
+        "⬇️ Download indent list",
+        short[["BrandName", "ItemDescription", "ClosingCases", "Projected",
+               "Remaining", "Indent"]].to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"indent_planner_{as_of:%Y%m%d}.csv", mime="text/csv",
+        key="inv_indent_dl")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -886,3 +998,5 @@ def render() -> None:
     safe_section("Out of stock",    _section_out_of_stock,    stock_df, vel_30, vel_90)
     st.divider()
     safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
+    st.divider()
+    safe_section("Indent planner",  _section_indent_planner,  stock_df, as_of_date, keg_aware)
