@@ -31,7 +31,7 @@ import pandas as pd
 import streamlit as st
 
 from db import run_query
-from utils.helpers import safe_section
+from utils.helpers import safe_section, CASES_SQL_EXPR as _CASES
 from src.segments import _segment_for, SEGMENT_ORDER, PRINCIPALS
 
 # GL head that all sales-contra (discount/scheme) service items post to.
@@ -382,6 +382,105 @@ def _section_trade_discount(months: int) -> None:
         use_container_width=True, hide_index=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Section 3 — Lifting vs discount, per principal × month
+# ─────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_lifting(months: int) -> pd.DataFrame:
+    """Keg-aware cases sold (lifting) per principal × month — MIS basis
+    (FY-dedup, SALES_TYPES, free goods included), same as Segment Analysis."""
+    type_ph = ",".join(str(t) for t in _SALES_TYPES)
+    cids = ",".join("'%s'" % c for c in _PRINCIPAL_NAMES)
+    df = run_query(f"""
+        SELECT b.CompanyID,
+               FORMAT(h.VoucherDate, 'yyyy-MM')  AS Mon,
+               SUM({_CASES})                     AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months}, GETDATE())
+          AND b.CompanyID IN ({cids})
+        GROUP BY b.CompanyID, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """)
+    if df.empty:
+        return df
+    df["Cases"]     = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    df["Principal"] = df["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
+    return df
+
+
+def _section_lifting_vs_discount(months: int) -> None:
+    st.subheader("📦 Lifting vs trade discount — per principal × month")
+    st.caption(
+        "Lifting = keg-aware cases sold (MIS basis). Discount = trade/scheme "
+        "discount on those principals' brands. ₹/case = discount ÷ lifting — "
+        "how much scheme support each case carried that month."
+    )
+    cd_ids = _load_cd_item_ids()
+    lift = _load_lifting(months)
+    disc = _load_trade_disc(months, cd_ids)
+    if lift.empty:
+        st.info("No lifting data in the window."); return
+
+    months_order = sorted(set(lift["Mon"]).union(
+        set(disc["Mon"]) if not disc.empty else set()))
+    prin_order = [n for n, _ in PRINCIPALS]
+
+    lift_pv = (lift.groupby(["Principal", "Mon"])["Cases"].sum()
+                   .unstack("Mon").reindex(index=prin_order, columns=months_order)
+                   .fillna(0.0))
+    if disc.empty:
+        disc_pv = lift_pv * 0.0
+    else:
+        disc_pv = (disc[disc["Principal"].isin(prin_order)]
+                   .groupby(["Principal", "Mon"])["TradeDisc"].sum()
+                   .unstack("Mon").reindex(index=prin_order, columns=months_order)
+                   .fillna(0.0))
+    rate_pv = (disc_pv / lift_pv.replace(0.0, float("nan")))
+
+    def _with_total(pv, total_fn):
+        out = pv.copy()
+        out["TOTAL"] = total_fn(out)
+        return out.reset_index().rename(columns={"index": "Principal"})
+
+    st.markdown("**Lifting (cases)**")
+    lc = _with_total(lift_pv, lambda o: o.sum(axis=1))
+    st.dataframe(lc.style.format({c: "{:,.0f}" for c in
+                 list(months_order) + ["TOTAL"]}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("**Trade / scheme discount (₹)**")
+    dc = _with_total(disc_pv, lambda o: o.sum(axis=1))
+    st.dataframe(dc.style.format({c: (lambda v: _lk(v)) for c in
+                 list(months_order) + ["TOTAL"]}),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("**Discount per case (₹/cs)**")
+    # Total ₹/cs = total discount ÷ total lifting (not the row-mean of rates)
+    rate_tot = (disc_pv.sum(axis=1) / lift_pv.sum(axis=1).replace(0.0, float("nan")))
+    rc = rate_pv.copy()
+    rc["TOTAL"] = rate_tot
+    rc = rc.reset_index().rename(columns={"index": "Principal"})
+    st.dataframe(rc.style.format({c: "₹{:,.1f}" for c in
+                 list(months_order) + ["TOTAL"]}, na_rep="—"),
+                 use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download lifting vs discount",
+        dc.merge(lc, on="Principal", suffixes=("_disc", "_cases"))
+          .to_csv(index=False).encode("utf-8-sig"),
+        file_name="lifting_vs_discount.csv", mime="text/csv", key="lvd_dl")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 def render() -> None:
     st.title("🏷️ Discounts & Schemes")
@@ -394,5 +493,7 @@ def render() -> None:
                       key="disc_months", format_func=lambda m: f"Last {m} months")
     st.divider()
     safe_section("Cash Discounts", _section_cash_discount, months)
+    st.divider()
+    safe_section("Lifting vs Discount", _section_lifting_vs_discount, months)
     st.divider()
     safe_section("Trade / Scheme Discounts", _section_trade_discount, months)
