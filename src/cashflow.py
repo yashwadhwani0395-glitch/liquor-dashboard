@@ -46,6 +46,12 @@ from utils.helpers import CASES_SQL_EXPR as _CASES, safe_section
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
 SALES_TYPES:    tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
+# ── Bank-movement transaction types (from MsTransType) ──────────────────────
+# Multiple TTs per category because the ERP carries one per bank ledger.
+_BR_TTS:  tuple[int, ...] = (2, 15, 17)    # Bank Receipts
+_BP_TTS:  tuple[int, ...] = (1, 14, 16)    # Bank Payments
+_CHQ_RET_TT: int = 12                       # Return Cheques (bounced instruments)
+
 # ── GL account heads (the Balance-Sheet truth) ──────────────────────────────
 _GL_DEBTORS   = "000002"   # SUNDRY DEBTORS CONTROL  (what customers owe us)
 _GL_CREDITORS = "000003"   # SUNDRY CREDITORS CONTROL (what we owe suppliers)
@@ -434,20 +440,208 @@ def _section_cash_movement(today: date) -> None:
 # RENDER
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ─────────────────────────────────────────────────────────────────────────
+# Bank movements — daily receipts / payments / cheque-returns
+# ─────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_bank_daily(days_back: int = 365) -> pd.DataFrame:
+    """One row per (date, transaction-type) covering Bank Receipts, Bank
+    Payments and Return-Cheque vouchers. Voucher amount = SUM of Dr-side
+    TrVocDetail.Amount (the two sides balance, so either gives the gross
+    voucher value)."""
+    tts = list(_BR_TTS) + list(_BP_TTS) + [_CHQ_RET_TT]
+    tt_in = ",".join(str(t) for t in tts)
+    df = run_query(f"""
+        SELECT CAST(h.VoucherDate AS date)                 AS D,
+               h.TransTypeID                                AS TT,
+               COUNT(DISTINCT h.VoucherNo)                  AS Vchs,
+               SUM(CAST(d.Amount AS float))                 AS Amt
+        FROM TrVocHead h
+        JOIN TrVocDetail d
+            ON d.TransTypeID  = h.TransTypeID
+           AND d.VoucherNo    = h.VoucherNo
+           AND d.FinancialYear= h.FinancialYear
+        WHERE h.Cancelled = 'N' AND d.DrCrIndicator = 'D'
+          AND h.TransTypeID IN ({tt_in})
+          AND h.VoucherDate >= DATEADD(DAY, -{days_back}, GETDATE())
+          AND h.VoucherDate <= GETDATE()
+        GROUP BY CAST(h.VoucherDate AS date), h.TransTypeID
+    """)
+    if df.empty:
+        return df
+    df["Amt"]  = pd.to_numeric(df["Amt"],  errors="coerce").fillna(0.0)
+    df["Vchs"] = pd.to_numeric(df["Vchs"], errors="coerce").fillna(0).astype(int)
+    df["D"]    = pd.to_datetime(df["D"])
+
+    def _cat(tt):
+        if tt in _BR_TTS:  return "BR"
+        if tt in _BP_TTS:  return "BP"
+        if tt == _CHQ_RET_TT: return "RET"
+        return "?"
+    df["Cat"] = df["TT"].map(_cat)
+    return df
+
+
+def _daily_pivot(df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot to one row per date with BR/BP/RET amount + voucher counts."""
+    if df.empty:
+        return df
+    g = df.groupby(["D", "Cat"]).agg(Amt=("Amt", "sum"), Vchs=("Vchs", "sum")) \
+          .reset_index()
+    pv = g.pivot_table(index="D", columns="Cat",
+                       values=["Amt", "Vchs"], fill_value=0).sort_index()
+    # Flatten ('Amt','BR') → 'BR_Amt'
+    pv.columns = [f"{c[1]}_{c[0]}" for c in pv.columns]
+    for c in ("BR_Amt", "BP_Amt", "RET_Amt", "BR_Vchs", "BP_Vchs", "RET_Vchs"):
+        if c not in pv.columns:
+            pv[c] = 0
+    pv["Net"] = pv["BR_Amt"] - pv["BP_Amt"]
+    return pv.reset_index()
+
+
+def _monthly_pivot(df: pd.DataFrame, today: date) -> pd.DataFrame:
+    """Per month: totals, vouchers, avg/day for BR & BP, plus return rate."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["Mon"] = df["D"].dt.strftime("%Y-%m")
+    g = df.groupby(["Mon", "Cat"]).agg(Amt=("Amt", "sum"),
+                                       Vchs=("Vchs", "sum")).reset_index()
+    pv = g.pivot_table(index="Mon", columns="Cat",
+                       values=["Amt", "Vchs"], fill_value=0).sort_index()
+    pv.columns = [f"{c[1]}_{c[0]}" for c in pv.columns]
+    for c in ("BR_Amt", "BP_Amt", "RET_Amt", "BR_Vchs", "BP_Vchs", "RET_Vchs"):
+        if c not in pv.columns:
+            pv[c] = 0
+
+    def _days_for(mon: str) -> int:
+        y, m = map(int, mon.split("-"))
+        if y == today.year and m == today.month:
+            return today.day
+        # last day of month
+        if m == 12:
+            return 31
+        return (date(y, m + 1, 1) - date(y, m, 1)).days
+
+    pv["Days"]       = pv.index.map(_days_for)
+    pv["BR_AvgDay"]  = pv["BR_Amt"]  / pv["Days"]
+    pv["BP_AvgDay"]  = pv["BP_Amt"]  / pv["Days"]
+    pv["RET_AvgDay"] = pv["RET_Amt"] / pv["Days"]
+    pv["Net"]        = pv["BR_Amt"]  - pv["BP_Amt"]
+    pv["RetRate"]    = pv.apply(
+        lambda r: (r["RET_Amt"] / r["BR_Amt"] * 100.0)
+                  if r["BR_Amt"] > 0 else 0.0, axis=1)
+    return pv.reset_index()
+
+
+def _section_bank_daily(today: date) -> None:
+    st.subheader("🏦 Bank receipts, payments & cheque returns")
+    st.caption(
+        "Bank Receipts (TT 2/15/17) and Bank Payments (TT 1/14/16) plus "
+        "Returned Cheques (TT 12 — the ERP's dedicated 'Return Cheques' "
+        "voucher type, which counts bounced instruments). Cash receipts / "
+        "payments excluded. Avg/day = total ÷ days elapsed in the month."
+    )
+
+    df = _load_bank_daily(days_back=400)
+    if df.empty:
+        st.info("No bank-voucher activity in the window."); return
+
+    monthly = _monthly_pivot(df, today)
+    cur_mon = today.strftime("%Y-%m")
+    cur     = monthly[monthly["Mon"] == cur_mon]
+    prior   = monthly[monthly["Mon"] != cur_mon].tail(3)
+    prior_br_avg = float(prior["BR_AvgDay"].mean()) if not prior.empty else 0.0
+    prior_bp_avg = float(prior["BP_AvgDay"].mean()) if not prior.empty else 0.0
+    cur_br_avg   = float(cur["BR_AvgDay"].iloc[0]) if not cur.empty else 0.0
+    cur_bp_avg   = float(cur["BP_AvgDay"].iloc[0]) if not cur.empty else 0.0
+    cur_ret_n    = int(cur["RET_Vchs"].iloc[0])    if not cur.empty else 0
+    cur_ret_amt  = float(cur["RET_Amt"].iloc[0])   if not cur.empty else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Avg daily collection (this mo)", _cr(cur_br_avg),
+              delta=(_cr(cur_br_avg - prior_br_avg)
+                     + " vs L3M avg") if prior_br_avg else None)
+    c2.metric("Avg daily payment (this mo)", _cr(cur_bp_avg),
+              delta=(_cr(cur_bp_avg - prior_bp_avg)
+                     + " vs L3M avg") if prior_bp_avg else None,
+              delta_color="inverse")
+    c3.metric("Cheque returns (this mo)", f"{cur_ret_n} instruments",
+              delta=_cr(cur_ret_amt), delta_color="inverse")
+    return_rate_cur = (cur_ret_amt / float(cur["BR_Amt"].iloc[0]) * 100.0
+                       if not cur.empty and float(cur["BR_Amt"].iloc[0]) > 0
+                       else 0.0)
+    c4.metric("Return rate (₹ this mo)", f"{return_rate_cur:.2f}%",
+              help="Returned cheque ₹ as a % of bank receipts ₹ this month.")
+
+    # ── Monthly comparison ──
+    st.markdown("##### Monthly comparison")
+    show = monthly[["Mon", "BR_Amt", "BR_AvgDay", "BR_Vchs",
+                    "BP_Amt", "BP_AvgDay", "BP_Vchs",
+                    "RET_Amt", "RET_Vchs", "RetRate", "Net"]].rename(columns={
+        "Mon": "Month",
+        "BR_Amt": "Receipts ₹", "BR_AvgDay": "Receipts ₹/day",
+        "BR_Vchs": "Receipts #",
+        "BP_Amt": "Payments ₹", "BP_AvgDay": "Payments ₹/day",
+        "BP_Vchs": "Payments #",
+        "RET_Amt": "Returns ₹", "RET_Vchs": "Returns #",
+        "RetRate": "Return rate %", "Net": "Net ₹"})
+    money_cols = ["Receipts ₹", "Receipts ₹/day", "Payments ₹",
+                  "Payments ₹/day", "Returns ₹", "Net ₹"]
+    st.dataframe(
+        show.style.format(
+            {c: _cr for c in money_cols} | {
+                "Return rate %": "{:.2f}%",
+                "Receipts #": "{:,.0f}", "Payments #": "{:,.0f}",
+                "Returns #": "{:,.0f}"}),
+        use_container_width=True, hide_index=True)
+
+    # ── Daily detail (last 60 days) ──
+    st.markdown("##### Daily detail (last 60 days)")
+    daily = _daily_pivot(df).tail(60)
+    dshow = daily[["D", "BR_Amt", "BR_Vchs", "BP_Amt", "BP_Vchs",
+                   "RET_Amt", "RET_Vchs", "Net"]].rename(columns={
+        "D": "Date",
+        "BR_Amt": "Receipts ₹", "BR_Vchs": "Receipts #",
+        "BP_Amt": "Payments ₹", "BP_Vchs": "Payments #",
+        "RET_Amt": "Returns ₹", "RET_Vchs": "Returns #",
+        "Net": "Net ₹"})
+    dshow["Date"] = dshow["Date"].dt.strftime("%Y-%m-%d")
+    st.dataframe(
+        dshow.style.format(
+            {c: _cr for c in ("Receipts ₹", "Payments ₹", "Returns ₹", "Net ₹")}
+            | {"Receipts #": "{:,.0f}", "Payments #": "{:,.0f}",
+               "Returns #": "{:,.0f}"}),
+        use_container_width=True, hide_index=True, height=480)
+    st.download_button(
+        "⬇️ Download daily bank movements",
+        _daily_pivot(df).to_csv(index=False).encode("utf-8-sig"),
+        file_name="bank_daily.csv", mime="text/csv", key="bnk_daily_dl")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 def render() -> None:
     st.title("💰 Cash Flow & Working Capital")
     st.caption(
         "Where the money is: stock bought/sold/held per principal, what we "
-        "owe vs what we're owed, money flowing to the companies, and the big "
-        "monthly cash movements."
+        "owe vs what we're owed, money flowing to the companies, the big "
+        "monthly cash movements, and a daily bank-movement view."
     )
     today = date.today()
+
+    sub = st.radio(
+        "View", ["📊 Overview", "🏦 Bank — Daily"],
+        horizontal=True, key="cf_sub_nav", label_visibility="collapsed")
     st.divider()
 
-    safe_section("Working capital", _section_working_capital, today)
-    st.divider()
-    safe_section("Stock & trading", _section_trading, today)
-    st.divider()
-    safe_section("Money to companies", _section_money_to_companies, today)
-    st.divider()
-    safe_section("Cash movement", _section_cash_movement, today)
+    if sub.endswith("Overview"):
+        safe_section("Working capital", _section_working_capital, today)
+        st.divider()
+        safe_section("Stock & trading", _section_trading, today)
+        st.divider()
+        safe_section("Money to companies", _section_money_to_companies, today)
+        st.divider()
+        safe_section("Cash movement", _section_cash_movement, today)
+    else:
+        safe_section("Bank — Daily", _section_bank_daily, today)
