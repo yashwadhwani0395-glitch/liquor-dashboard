@@ -47,6 +47,28 @@ IMPORT_TYPES:   tuple[int, ...] = (22, 54)               # imports proper
 DAMAN_TYPES:    tuple[int, ...] = (42,)                  # Daman / cross-state
 SALES_TYPES:    tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
 
+# ── Brindco transition (Jun-2026) ───────────────────────────────────────────
+# The 6 Diageo brands moving to Brindco. Each entry: (code, display name,
+# BrandName LIKE patterns, annual target in cases). Patterns roll up every
+# variant (NEW / Hipster / 6-pack re-codes) under the same consumer brand.
+BRINDCO_PRESET: list[dict] = [
+    {"code": "CAOL",  "name": "Caol Ila 12 YO",
+     "patterns": ["CAOL"],                        "target": 75},
+    {"code": "CIRV",  "name": "Cîroc Vodka",
+     "patterns": ["CIROC"],                       "target": 200},
+    {"code": "DALW",  "name": "Dalwhinnie 15 YO",
+     "patterns": ["DALWHINNIE", "DAL WHINNIE"],   "target": 75},
+    {"code": "GORD",  "name": "Gordon's London Dry",
+     "patterns": ["GORDON"],                      "target": 2000},
+    {"code": "J&B",   "name": "J & B Rare",
+     "patterns": ["J & B", "J&B"],                "target": 4000},
+    {"code": "TA10S", "name": "Talisker 10 YO",
+     "patterns": ["TALISKER"],                    "target": 500},
+]
+# "Below this we treat the month as a stock-out, not real demand" — per the
+# owner's rule (a 0.17-case month is a dribble, not market signal).
+_STOCKOUT_THRESHOLD_CS: float = 1.0
+
 
 def _month_first(d: date, months_offset: int = 0) -> date:
     m = d.month - 1 + months_offset
@@ -910,6 +932,251 @@ def _section_indent_planner(stock_df: pd.DataFrame, as_of: date,
         key="inv_indent_dl")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Annual-target phasing — feeds an annual case target through a brand family's
+# historical seasonality (stock-out-adjusted) to suggest a monthly indent.
+# Designed for the Brindco transition (Jun-2026) but generic to any preset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_family_monthly(months_back: int = 13) -> pd.DataFrame:
+    """Per (BrandName, yyyy-MM) cases sold over the last N months.
+    Family roll-up happens in pandas (one query covers all families).
+    Spirits don't have kegs so the plain bottles/case math is fine."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    df = run_query(f"""
+        SELECT b.BrandName,
+               FORMAT(h.VoucherDate, 'yyyy-MM') AS Mon,
+               CAST(SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
+                        / NULLIF(im.BottlesPerCase, 0)) AS float) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph}) AND h.Cancelled = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY b.BrandName, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """)
+    if df.empty:
+        return df
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    return df
+
+
+def _family_match(brandname: str, patterns: list[str]) -> bool:
+    bn = (brandname or "").upper()
+    return any(p.upper() in bn for p in patterns)
+
+
+def _month_iter(start: date, n: int) -> list[str]:
+    """Return n consecutive 'yyyy-MM' strings starting at `start`."""
+    out, y, m = [], start.year, start.month
+    for _ in range(n):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            m = 1; y += 1
+    return out
+
+
+def _previous_month(yyyymm: str) -> str:
+    y, m = map(int, yyyymm.split("-"))
+    m -= 1
+    if m == 0:
+        m = 12; y -= 1
+    return f"{y:04d}-{m:02d}"
+
+
+def _section_target_phasing(stock_df: pd.DataFrame, as_of: date) -> None:
+    st.subheader("🎯 Annual target phasing — Brindco transition (Jun-2026)")
+    st.caption(
+        "Brindco takes over these 6 Diageo brands from June. The annual "
+        "case target gets split across 12 months using each brand's own "
+        "historical seasonality — but **months with <1 case sold are treated "
+        "as stock-out** (not zero demand) and replaced with the brand's "
+        "active-month average. Month-1 indent is reduced by current stock."
+    )
+
+    # Family targets — editable per row
+    init = pd.DataFrame([
+        {"Code": p["code"], "Brand": p["name"],
+         "Annual target (cs)": int(p["target"])}
+        for p in BRINDCO_PRESET
+    ])
+    edited = st.data_editor(
+        init, key="brindco_targets", use_container_width=True, hide_index=True,
+        column_config={"Code": st.column_config.Column(disabled=True),
+                       "Brand": st.column_config.Column(disabled=True),
+                       "Annual target (cs)":
+                           st.column_config.NumberColumn(min_value=0, step=10)},
+        num_rows="fixed",
+    )
+    targets = {row["Code"]: float(row["Annual target (cs)"])
+               for _, row in edited.iterrows()}
+
+    monthly = _load_family_monthly(13)
+    if monthly.empty:
+        st.warning("No sales data available for the look-back window.")
+        return
+
+    # Family aggregation
+    fam_codes  = [p["code"] for p in BRINDCO_PRESET]
+    fam_meta   = {p["code"]: p for p in BRINDCO_PRESET}
+    monthly["Code"] = monthly["BrandName"].map(
+        lambda bn: next((c for c in fam_codes
+                         if _family_match(bn, fam_meta[c]["patterns"])), None))
+    fam = monthly.dropna(subset=["Code"])
+    fam = fam.groupby(["Code", "Mon"], as_index=False)["Cases"].sum()
+
+    # Stock per family from current stock_df
+    stock_per_fam = {}
+    if not stock_df.empty and "BrandName" in stock_df.columns:
+        for c in fam_codes:
+            mask = stock_df["BrandName"].apply(
+                lambda bn: _family_match(bn, fam_meta[c]["patterns"]))
+            stock_per_fam[c] = float(stock_df.loc[mask, "ClosingCases"].sum())
+    else:
+        stock_per_fam = {c: 0.0 for c in fam_codes}
+
+    # L12M window = the 12 calendar months ending in the previous full month.
+    # (today = May-2026 → L12M = May-2025 … Apr-2026.)
+    cur_mon  = f"{as_of.year:04d}-{as_of.month:02d}"
+    prev_mon = _previous_month(cur_mon)
+    l12_months = []
+    pm = prev_mon
+    for _ in range(12):
+        l12_months.append(pm); pm = _previous_month(pm)
+    l12_months = list(reversed(l12_months))
+    l3_months  = l12_months[-3:]
+
+    summary_rows = []
+    for c in fam_codes:
+        f = fam[fam["Code"] == c].set_index("Mon")["Cases"]
+        l12 = [float(f.get(m, 0.0)) for m in l12_months]
+        l3  = [float(f.get(m, 0.0)) for m in l3_months]
+        l12_active = sum(1 for v in l12 if v >= _STOCKOUT_THRESHOLD_CS)
+        l3_active  = sum(1 for v in l3  if v >= _STOCKOUT_THRESHOLD_CS)
+        l12_total  = sum(l12); l3_total = sum(l3)
+        l12_naive  = l12_total / 12.0
+        l12_adj    = l12_total / l12_active if l12_active else 0.0
+        l3_naive   = l3_total  / 3.0
+        l3_adj     = l3_total  / l3_active  if l3_active  else 0.0
+        target     = targets.get(c, 0.0)
+        target_mo  = target / 12.0
+        # Headroom: ratio of target to the adjusted (real-demand) run rate
+        headroom = (target_mo / l12_adj) if l12_adj > 0 else float("inf")
+        summary_rows.append({
+            "Code": c, "Brand": fam_meta[c]["name"],
+            "Annual target":     target,
+            "Target/mo":         target_mo,
+            "L12M total":        l12_total,
+            "L12M avg (naive)":  l12_naive,
+            "L12M avg (adj)":    l12_adj,
+            "L3M avg (naive)":   l3_naive,
+            "L3M avg (adj)":     l3_adj,
+            "Active mo (L12M)":  f"{l12_active}/12",
+            "Stock now":         stock_per_fam.get(c, 0.0),
+            "Target × adj":      headroom,
+        })
+    summary = pd.DataFrame(summary_rows)
+
+    def _flag_headroom(v):
+        try:
+            if v == float("inf"):
+                return "color:#dc2626;font-weight:700"   # no demand history
+            if v > 1.5:
+                return "color:#dc2626;font-weight:700"   # very ambitious
+            if v > 1.0:
+                return "color:#b45309;font-weight:600"   # ambitious
+            return "color:#16a34a;font-weight:600"
+        except Exception:
+            return ""
+
+    st.markdown("##### Summary — target vs your real history")
+    money_cols = ["Annual target", "Target/mo", "L12M total",
+                  "L12M avg (naive)", "L12M avg (adj)",
+                  "L3M avg (naive)", "L3M avg (adj)", "Stock now"]
+    st.dataframe(
+        summary.style
+               .format({c: "{:,.1f}" for c in money_cols}
+                       | {"Target × adj": lambda v:
+                          ("∞" if v == float("inf") else f"{v:,.2f}×")})
+               .map(_flag_headroom, subset=["Target × adj"]),
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Target × adj": st.column_config.Column(
+                "Target ÷ adj-avg",
+                help=("Target monthly ÷ stock-out-adjusted L12M run-rate. "
+                      ">1.5× = very ambitious; ∞ = no demand history.")),
+        })
+
+    # ── Phasing matrix ──
+    # 12 forward months from next month.
+    start_y = as_of.year + (1 if as_of.month == 12 else 0)
+    start_m = 1 if as_of.month == 12 else as_of.month + 1
+    forward = _month_iter(date(start_y, start_m, 1), 12)
+
+    phasing_rows = []
+    for c in fam_codes:
+        f = fam[fam["Code"] == c].set_index("Mon")["Cases"]
+        # Build weights for each forward month from same-month-last-year
+        adj_avg = next((r["L12M avg (adj)"] for r in summary_rows
+                        if r["Code"] == c), 0.0)
+        active_l12 = sum(1 for m in l12_months
+                         if float(f.get(m, 0.0)) >= _STOCKOUT_THRESHOLD_CS)
+        flat_fallback = active_l12 < 4    # too little history to seasonally weight
+
+        weights = []
+        for fm in forward:
+            # Same calendar month last year: "2026-06" → "2025-06"
+            same_last_year = f"{int(fm[:4])-1:04d}-{fm[5:]}"
+            hist = float(f.get(same_last_year, 0.0))
+            if flat_fallback:
+                w = 1.0
+            elif hist >= _STOCKOUT_THRESHOLD_CS:
+                w = hist
+            else:
+                w = adj_avg          # placeholder for a historical stock-out
+            weights.append(w)
+        wsum = sum(weights) or 1.0
+        target = targets.get(c, 0.0)
+        plan = [round(target * w / wsum, 1) for w in weights]
+        # Reduce month-1 by current stock (floor 0)
+        plan[0] = round(max(0.0, plan[0] - stock_per_fam.get(c, 0.0)), 1)
+
+        row = {"Code": c, "Brand": fam_meta[c]["name"]}
+        for m, v in zip(forward, plan):
+            row[m] = v
+        row["TOTAL"] = round(sum(plan), 1)
+        if flat_fallback:
+            row["Brand"] = row["Brand"] + " ⚠️ flat split (sparse history)"
+        phasing_rows.append(row)
+
+    phasing = pd.DataFrame(phasing_rows)
+    st.markdown("##### Monthly indent plan — 12 months from next month")
+    st.caption(
+        "Each cell = recommended cases to indent. Month-1 already deducts your "
+        "current stock. Brands flagged ⚠️ have <4 active months in L12M, so a "
+        "flat 1/12 split is used instead of seasonality."
+    )
+    fmt = {c: "{:,.1f}" for c in forward + ["TOTAL"]}
+    st.dataframe(
+        phasing.style.format(fmt),
+        use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download indent plan",
+        phasing.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"brindco_indent_{as_of.isoformat()}.csv",
+        mime="text/csv", key="brindco_dl")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1005,3 +1272,6 @@ def render() -> None:
     safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
     st.divider()
     safe_section("Indent planner",  _section_indent_planner,  stock_df, as_of_date, keg_aware)
+    st.divider()
+    safe_section("Target phasing (Brindco)", _section_target_phasing,
+                 stock_df, as_of_date)
