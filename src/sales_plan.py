@@ -2257,12 +2257,33 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
     (keg-aware, FY-dedup, free goods included) brand-segment view as the
     Segment Analysis tab. Shows the principal 'not as a whole': for each
     segment, this-month achievement plus the L3M / L6M / LYSM / L3M-MTD
-    trend so the planner sees momentum, not just the running total."""
+    trend so the planner sees momentum, not just the running total.
+
+    Honours the picked op_month: when a past month is selected the table
+    shows that month's FULL figures (cutoff = last day of that month) and
+    compares to the prior 3 months at the same cutoff, so the comparison
+    stays apples-to-apples."""
     from datetime import date as _date
+    import calendar as _cal
     from src.segments import (_load_brand_monthly, _segment_table,
                               _load_brand_channel_monthly, _segment_table_channels)
 
-    today = _date.today()
+    real_today = _date.today()
+    op_y, op_m = int(op_month[:4]), int(op_month[5:])
+    if (op_y, op_m) == (real_today.year, real_today.month):
+        # Live current month — MTD up to today.
+        today = real_today
+    else:
+        # A different month was picked — anchor the cutoff to the LAST day of
+        # that month so "Current-MTD" reflects the full picked month and the
+        # L3M-MTD baseline is computed at the same cutoff for each prior month.
+        last_dom = _cal.monthrange(op_y, op_m)[1]
+        today = _date(op_y, op_m, last_dom)
+
+    # When viewing an older month, the default 15-month look-back may not
+    # cover the L6M / LYSM windows relative to it. Bump dynamically.
+    months_offset = (real_today.year - op_y) * 12 + (real_today.month - op_m)
+    history_months = max(15, 14 + max(0, months_offset))
 
     def _delta_color(v):
         try:
@@ -2297,16 +2318,23 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
         )
 
     st.markdown("**Segment-wise sales — momentum vs targets**")
-    st.caption(
-        "Current-MTD = month-to-date this month · L3M-MTD = same-day-of-month "
-        "average over the last 3 months · Δ% flags which segments are "
-        "accelerating (green) or slipping (red)."
-    )
+    if today == real_today:
+        st.caption(
+            "Current-MTD = month-to-date this month · L3M-MTD = same-day-of-month "
+            "average over the last 3 months · Δ% flags which segments are "
+            "accelerating (green) or slipping (red)."
+        )
+    else:
+        st.caption(
+            f"Showing **{today.strftime('%b %Y')}** (cutoff: full month). "
+            "Current-MTD = full picked month · L3M-MTD = same average of the "
+            "3 months before the picked month · Δ% = momentum vs that baseline."
+        )
 
     # Spirits (USL / Diageo) — split by channel class because MOP+Retail and
     # POP report to different managers. Two tables.
     if cid in ("C00025", "C00040"):
-        raw_bc = _load_brand_channel_monthly(cid, today.day)
+        raw_bc = _load_brand_channel_monthly(cid, today.day, months_back=history_months)
         if not raw_bc.empty:
             tbl_a = _segment_table_channels(cid, raw_bc, {"MOP", "Retail"}, today)
             # Everything that isn't MOP/Retail (POP, One Day, plus any
@@ -2321,7 +2349,7 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
         else:
             st.caption("Channel split unavailable — showing combined only.")
         # 3rd table — combined across ALL channels (light, proven query).
-        raw = _load_brand_monthly(cid, today.day)
+        raw = _load_brand_monthly(cid, today.day, months_back=history_months)
         _render(_segment_table(cid, raw, today) if not raw.empty else None,
                 "Combined — all channels", "combined")
         return
@@ -2330,7 +2358,7 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
     # PCMC Institution. Each table shows UBL's segments (Super Premium HUMSA /
     # Mainstream / Economy) so the planner sees segment momentum per channel.
     if cid == "C00039":
-        raw_bc = _load_brand_channel_monthly(cid, today.day)
+        raw_bc = _load_brand_channel_monthly(cid, today.day, months_back=history_months)
         if not raw_bc.empty:
             ubl_channels = [
                 ("KW Beer",          {"KW Beer"},          "kw_beer"),
@@ -2346,12 +2374,12 @@ def _section_segment_breakdown(cid: str, op_month: str) -> None:
                     st.markdown("")
         else:
             st.caption("Channel split unavailable — showing combined only.")
-        raw = _load_brand_monthly(cid, today.day)
+        raw = _load_brand_monthly(cid, today.day, months_back=history_months)
         _render(_segment_table(cid, raw, today) if not raw.empty else None,
                 "Combined — all channels", "combined")
         return
 
-    raw = _load_brand_monthly(cid, today.day)
+    raw = _load_brand_monthly(cid, today.day, months_back=history_months)
     if raw.empty:
         st.caption("No segment data for this principal.")
         return
