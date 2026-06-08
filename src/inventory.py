@@ -1031,6 +1031,138 @@ def _load_principal_brand_history(company_id: str,
     return df
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_principal_received_mtd(company_id: str,
+                                 as_of: date) -> pd.DataFrame:
+    """Cases RECEIVED (purchase vouchers) per (ItemID, BrandName) from
+    the 1st of the as_of month up to as_of. Used in the Build planner so
+    "balance to order" reflects only what's still pending from the
+    company after subtracting what's already arrived this month."""
+    type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
+    start = as_of.replace(day=1)
+    df = run_query(f"""
+        SELECT im.ItemID,
+               ISNULL(im.ItemDescription, im.ItemID) AS ItemDescription,
+               b.BrandName,
+               CAST(SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
+                        / NULLIF(im.BottlesPerCase, 0)) AS float) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph}) AND h.Cancelled = 'N'
+          AND b.CompanyID = ?
+          AND h.VoucherDate >= ? AND h.VoucherDate <= ?
+        GROUP BY im.ItemID, im.ItemDescription, b.BrandName
+    """, (company_id, start.isoformat(), as_of.isoformat()))
+    if not df.empty:
+        df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_principal_sku_history(company_id: str,
+                                months_back: int = 13) -> pd.DataFrame:
+    """Per (ItemID, ItemDescription, BrandName, yyyy-MM) cases for ONE
+    principal — SKU-level granularity for the SKU-drill in Build mode."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    df = run_query(f"""
+        SELECT im.ItemID,
+               ISNULL(im.ItemDescription, im.ItemID) AS ItemDescription,
+               b.BrandName,
+               FORMAT(h.VoucherDate, 'yyyy-MM') AS Mon,
+               CAST(SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
+                        / NULLIF(im.BottlesPerCase, 0)) AS float) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph}) AND h.Cancelled = 'N'
+          AND b.CompanyID = ?
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY im.ItemID, im.ItemDescription, b.BrandName,
+                 FORMAT(h.VoucherDate, 'yyyy-MM')
+    """, (company_id,))
+    if not df.empty:
+        df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    return df
+
+
+def _sku_summary(cid: str, today: date,
+                 stock_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-SKU L3M total / L3M avg/mo (stock-out adjusted) / LYSM / Stock,
+    for a principal. One row per ItemID with sales OR stock in the principal."""
+    hist = _load_principal_sku_history(cid, 13)
+
+    # L3M / LYSM months (same logic as _brand_summary)
+    prev_y, prev_m = today.year, today.month - 1
+    if prev_m == 0:
+        prev_m = 12; prev_y -= 1
+    l3_months, y, m = [], prev_y, prev_m
+    for _ in range(3):
+        l3_months.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0: m = 12; y -= 1
+    lysm_mon = f"{today.year-1:04d}-{today.month:02d}"
+
+    # Per (ItemID, BrandName, ItemDescription) aggregates
+    if not hist.empty:
+        by = (hist
+              .assign(IsL3M=hist["Mon"].isin(l3_months),
+                      IsLYSM=hist["Mon"] == lysm_mon,
+                      L3MAct=(hist["Mon"].isin(l3_months)
+                              & (hist["Cases"] >= 1.0)).astype(int))
+              .groupby(["ItemID", "ItemDescription", "BrandName"], as_index=False)
+              .agg(L3M_total=("Cases", lambda s: s[hist.loc[s.index, "Mon"].isin(l3_months)].sum()),
+                   LYSM=("Cases", lambda s: s[hist.loc[s.index, "Mon"] == lysm_mon].sum()),
+                   L3M_active=("L3MAct", "sum")))
+    else:
+        by = pd.DataFrame(columns=["ItemID", "ItemDescription",
+                                   "BrandName", "L3M_total", "LYSM",
+                                   "L3M_active"])
+
+    # Stock per ItemID (filter to this principal's brands)
+    if not stock_df.empty and "ItemID" in stock_df.columns:
+        # Find which BrandNames belong to this principal — using master
+        master = _load_principal_brand_master(cid)
+        principal_brands = set(master["BrandName"]) if not master.empty else set()
+        s = stock_df[stock_df["BrandName"].isin(principal_brands)]
+        stock_per_item = s.groupby(
+            ["ItemID", "ItemDescription", "BrandName"]
+        )["ClosingCases"].sum().reset_index().rename(
+            columns={"ClosingCases": "Stock"})
+        out = by.merge(stock_per_item,
+                       on=["ItemID", "ItemDescription", "BrandName"],
+                       how="outer")
+    else:
+        out = by.copy()
+        out["Stock"] = 0.0
+
+    for c in ("L3M_total", "LYSM", "L3M_active", "Stock"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+        else:
+            out[c] = 0.0
+    out["L3M_avg_adj"] = out.apply(
+        lambda r: (r["L3M_total"] / r["L3M_active"]) if r["L3M_active"] > 0 else 0.0,
+        axis=1)
+    return out
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _load_principal_brand_master(company_id: str) -> pd.DataFrame:
     df = run_query("""
@@ -1261,10 +1393,12 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
     st.markdown("##### 📝 Build our primary plan — total target → per-brand split")
     st.caption(
         "Enter the total cases you've been given (or want to commit to). "
-        "We'll allocate it across brands using your real sales history, with "
-        "an option to reduce each brand's indent by current stock on hand."
+        "We allocate it across brands using your real sales history, then "
+        "show **Received MTD** (cases already arrived this month) so the "
+        "**Indent** column reflects only the balance still pending from the "
+        "company."
     )
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
         total = st.number_input(
             "Total target (cases)", min_value=0.0, value=0.0, step=100.0,
@@ -1275,11 +1409,22 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
             ["L3M share", "LYSM share", "Blend (50/50)"],
             horizontal=False, key=f"pp_build_method_{cid}")
     with c3:
+        granularity = st.radio(
+            "Granularity",
+            ["Brand-level", "SKU-level"],
+            horizontal=False, key=f"pp_build_gran_{cid}",
+            help="Brand-level allocates the total across brands. "
+                 "SKU-level then breaks each brand's share across its SKUs "
+                 "by their own L3M share inside the brand.")
+    with c4:
         stock_aware = st.checkbox(
             "Reduce indent by current stock", value=True,
             key=f"pp_build_stockaware_{cid}",
-            help="If your warehouse has X cases of a brand, indent only "
-                 "(allocated − X). Avoids double-stocking.")
+            help="ON  → Indent = max(0, Allocated − Stock). Avoids "
+                 "double-stocking; Stock already includes anything "
+                 "received this month.\n"
+                 "OFF → Indent = max(0, Allocated − Received MTD). "
+                 "Just the balance still pending from the company.")
 
     if total <= 0:
         st.info("Enter a total target to see the suggested per-brand split.")
@@ -1316,11 +1461,28 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         summary["Share %"]   = (share * 100.0).round(2)
         summary["Allocated"] = (share * total).round(1)
 
-    summary["Indent"] = (summary["Allocated"] - summary["Stock"]).clip(lower=0).round(1) \
-                       if stock_aware else summary["Allocated"]
+    # Received MTD (already arrived this month) — per brand
+    rec_mtd = _load_principal_received_mtd(cid, today)
+    if not rec_mtd.empty:
+        rec_brand = rec_mtd.groupby("BrandName")["Cases"].sum().to_dict()
+    else:
+        rec_brand = {}
+    summary["Received MTD"] = summary["BrandName"].map(rec_brand).fillna(0.0)
+
+    # Indent / balance:
+    #   stock-aware ON  → max(0, Allocated − Stock)  (Stock includes Received,
+    #                     so this avoids double-counting)
+    #   stock-aware OFF → max(0, Allocated − Received MTD)  (just the
+    #                     balance still pending from the company)
+    if stock_aware:
+        summary["Indent"] = (summary["Allocated"] - summary["Stock"]) \
+                            .clip(lower=0).round(1)
+    else:
+        summary["Indent"] = (summary["Allocated"] - summary["Received MTD"]) \
+                            .clip(lower=0).round(1)
 
     # Show only brands with any historic activity OR an allocation
-    keep = (summary["L3M total"] > 0) | (summary["LYSM"] > 0) | (summary["Stock"] > 0) | (summary["Allocated"] > 0)
+    keep = (summary["L3M total"] > 0) | (summary["LYSM"] > 0) | (summary["Stock"] > 0) | (summary["Allocated"] > 0) | (summary["Received MTD"] > 0)
     out = summary[keep].sort_values("Allocated", ascending=False).copy()
 
     # Headline
@@ -1330,7 +1492,7 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
     c3.metric("Stock offset", f"{(out['Allocated'].sum() - out['Indent'].sum()):,.0f} cs")
 
     disp = out[["BrandName", "L3M avg/mo (adj)", "LYSM", "Share %",
-                "Allocated", "Stock", "Indent"]].rename(columns={
+                "Allocated", "Stock", "Received MTD", "Indent"]].rename(columns={
         "BrandName": "Brand", "L3M avg/mo (adj)": "L3M/mo (adj)"})
 
     def _style_indent(v):
@@ -1342,7 +1504,8 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
 
     st.dataframe(
         disp.style.format({c: "{:,.1f}" for c in
-                          ["L3M/mo (adj)", "LYSM", "Allocated", "Stock", "Indent"]}
+                          ["L3M/mo (adj)", "LYSM", "Allocated", "Stock",
+                           "Received MTD", "Indent"]}
                           | {"Share %": "{:.2f}%"})
             .map(_style_indent, subset=["Indent"]),
         use_container_width=True, hide_index=True, height=520)
@@ -1351,6 +1514,88 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         disp.to_csv(index=False).encode("utf-8-sig"),
         file_name=f"primary_plan_build_{cid}_{today.isoformat()}.csv",
         mime="text/csv", key=f"pp_build_dl_{cid}")
+
+    # ── SKU-level drill (optional) ─────────────────────────────────────
+    if granularity != "SKU-level":
+        return
+    st.markdown("---")
+    st.markdown("##### SKU-level breakdown")
+    st.caption(
+        "Each brand's allocation, split across its SKUs by the SKU's L3M "
+        "share inside the brand. Brands with no L3M history use a flat "
+        "split across their SKUs. Stock is per-SKU; indent = max(0, "
+        "allocated − stock) when 'reduce by stock' is on."
+    )
+    sku = _sku_summary(cid, today, stock_df)
+    if sku.empty:
+        st.info("No SKU history available for this principal.")
+        return
+
+    # Map brand → allocated cases
+    brand_alloc = dict(zip(out["BrandName"], out["Allocated"]))
+    sku = sku[sku["BrandName"].isin(brand_alloc.keys())].copy()
+    if sku.empty:
+        st.info("No SKUs to allocate (no brand received a positive allocation).")
+        return
+
+    # SKU share within brand → SKU allocation
+    sku["BrandAlloc"]  = sku["BrandName"].map(brand_alloc).fillna(0.0)
+    sku["BrandL3M"]    = sku.groupby("BrandName")["L3M_total"].transform("sum")
+    sku["SkuPerBrand"] = sku.groupby("BrandName")["ItemID"].transform("count")
+    def _sku_share(row):
+        if row["BrandL3M"] > 0:
+            return row["L3M_total"] / row["BrandL3M"]
+        if row["SkuPerBrand"] > 0:
+            return 1.0 / row["SkuPerBrand"]    # flat fallback
+        return 0.0
+    sku["Share"]    = sku.apply(_sku_share, axis=1)
+    sku["Allocated"] = (sku["BrandAlloc"] * sku["Share"]).round(1)
+
+    # SKU-level Received MTD (same logic as brand: stock-aware uses Stock,
+    # else uses Received MTD as the deduction)
+    rec_sku_df = _load_principal_received_mtd(cid, today)
+    rec_by_item = (dict(zip(rec_sku_df["ItemID"], rec_sku_df["Cases"]))
+                   if not rec_sku_df.empty else {})
+    sku["Received MTD"] = sku["ItemID"].map(rec_by_item).fillna(0.0)
+    if stock_aware:
+        sku["Indent"] = (sku["Allocated"] - sku["Stock"]).clip(lower=0).round(1)
+    else:
+        sku["Indent"] = (sku["Allocated"] - sku["Received MTD"]).clip(lower=0).round(1)
+
+    # Only show SKUs whose brand got an allocation > 0 OR which carry stock
+    keep_sku = (sku["BrandAlloc"] > 0) | (sku["Stock"] > 0)
+    sku = sku[keep_sku].copy()
+    if sku.empty:
+        st.info("No SKUs to display."); return
+
+    sku_disp = (sku[["BrandName", "ItemDescription", "L3M_avg_adj", "LYSM",
+                     "Share", "BrandAlloc", "Allocated", "Stock",
+                     "Received MTD", "Indent"]]
+                .sort_values(["BrandName", "Allocated"], ascending=[True, False])
+                .rename(columns={"BrandName": "Brand", "ItemDescription": "SKU",
+                                 "L3M_avg_adj": "L3M/mo", "Share": "Share in brand",
+                                 "BrandAlloc": "Brand alloc"}))
+
+    # Headline
+    c1, c2, c3 = st.columns(3)
+    c1.metric("SKUs in plan", f"{len(sku_disp):,}")
+    c2.metric("SKU indent total", f"{sku_disp['Indent'].sum():,.0f} cs")
+    c3.metric("Indent rows >0", f"{(sku_disp['Indent']>0).sum():,}")
+
+    st.dataframe(
+        sku_disp.style.format({
+            "L3M/mo": "{:,.2f}", "LYSM": "{:,.1f}",
+            "Brand alloc": "{:,.1f}", "Allocated": "{:,.1f}",
+            "Stock": "{:,.1f}", "Received MTD": "{:,.1f}",
+            "Indent": "{:,.1f}",
+            "Share in brand": "{:.1%}",
+        }).map(_style_indent, subset=["Indent"]),
+        use_container_width=True, hide_index=True, height=620)
+    st.download_button(
+        "⬇️ Download SKU split",
+        sku_disp.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"primary_plan_build_sku_{cid}_{today.isoformat()}.csv",
+        mime="text/csv", key=f"pp_build_sku_dl_{cid}")
 
 
 def _section_primary_plan(stock_df: pd.DataFrame, as_of: date) -> None:
