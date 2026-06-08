@@ -933,6 +933,458 @@ def _section_indent_planner(stock_df: pd.DataFrame, as_of: date,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Primary Plan / Indent — three modes:
+#   1. Analyze company's plan (Excel upload) → per-brand verdict vs stock & L3M
+#   2. Build our plan (manual target) → distribute target across brands
+#   3. Brindco annual transition (preset) → 12-month phasing for 6 brands
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PRINCIPAL_CID_MAP = {
+    "United Spirits":   "C00025",
+    "United Breweries": "C00039",
+    "Diageo":           "C00040",
+    "Brown-Forman":     "C00056",
+}
+
+# Diageo primary-order codes → MsBrandMaster BrandName substring patterns.
+# Curated from the live brand master. Each value is a list of UPPER-cased
+# substrings; a brand matches if ANY appears in its BrandName.
+DIAGEO_CODE_MAP: dict[str, list[str]] = {
+    "BAIL":    ["BAILEYS IRISH"],
+    "BAILCS":  ["BAILEYS SALTED"],
+    "BAILSC":  ["BAILEYS STRAWB"],
+    "CAOL":    ["CAOL"],
+    "CARD":    ["CARDHU"],
+    "CDS":     ["CARDHU DYN", "CARDHU DARK"],
+    "CIRV":    ["CIROC"],
+    "CLYN":    ["CLYNELISH"],
+    "CRAG":    ["CRAGGANMORE"],
+    "DALW":    ["DALWHINNIE"],
+    "DONA":    ["DON JULIO ANEJO"],
+    "DONB":    ["DON JULIO BLANCO"],
+    "DONJ":    ["DON JULIO 1942"],
+    "DORP":    ["DON JULIO REPOSADO"],
+    "GLEN":    ["GLENKINCHIE"],
+    "GODWFS":  ["FRUIT& SPICE", "FRUIT & SPICE"],
+    "GODWRR":  ["RICH & ROUND"],
+    "GORD":    ["GORDON"],
+    "J&B":     ["J & B", "J&B"],
+    "JW18S":   ["JOHNNIE WALKER AGED 18", "JOHNNIE WALKER 18"],
+    "JWB":     ["JOHNNIE WALKER BLUE"],
+    "JWBL":    ["JOHNNIE WALKER BLACK LABEL", "JW. BLACK LABEL"],
+    "JWBLGCC": ["JOHNNIE WALKER BLACK LABEL"],
+    "JWBLLO":  ["LOWLAND ORIGIN"],
+    "JWBLON":  ["BLACK SPEYSIDE ORIGIN"],
+    "JWDB":    ["DOUBLE BLACK"],
+    "JWGL":    ["JOHNNIE WALKER GOLD"],
+    "JWGR":    ["GREEN LABE"],
+    "JWRL":    ["JOHNNIE WALKER RED LABEL"],
+    "JWRRS":   ["RED RYE"],
+    "JWXR":    ["XR21", "JW. & SONS XR"],
+    "KOV":     ["KETEL ONE"],
+    "LAGA":    ["LAGAVULIN"],
+    "OBAN":    ["OBAN"],
+    "ROECOW":  ["ROE & CO"],
+    "SID12S":  ["GLEN DULLAN 12"],
+    "SID15S":  ["GLEN DULLAN 15"],
+    "SID18S":  ["GLEN DULLAN 18"],
+    "SIN12S":  ["FRUITY DECADENCE"],
+    "SMVR":    ["SMIRNOFF TRIPLE DISTILLED"],
+    "TA10S":   ["TALISKER"],
+    "TANQ":    ["TANQUERAY LONDON"],
+    "TANQM":   ["TANQUERAY MALACCA"],
+    "TANQR":   ["TANQUERAY RANGPUR"],
+    "TANT":    ["TANQUERAY TEN"],
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_principal_brand_history(company_id: str,
+                                  months_back: int = 13) -> pd.DataFrame:
+    """Per (BrandName, yyyy-MM) cases sold for ONE principal — last N months.
+    Plain cases (kegs as 1) — appropriate for spirits; UBL still works since
+    BottlesPerCase is set for keg SKUs to '1', giving a per-keg count."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    df = run_query(f"""
+        SELECT b.BrandName,
+               FORMAT(h.VoucherDate, 'yyyy-MM') AS Mon,
+               CAST(SUM(CAST(vi.TotalBottleQty AS decimal(18,4))
+                        / NULLIF(im.BottlesPerCase, 0)) AS float) AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph}) AND h.Cancelled = 'N'
+          AND b.CompanyID = ?
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY b.BrandName, FORMAT(h.VoucherDate, 'yyyy-MM')
+    """, (company_id,))
+    if not df.empty:
+        df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _load_principal_brand_master(company_id: str) -> pd.DataFrame:
+    df = run_query("""
+        SELECT BrandID, BrandName FROM MsBrandMaster WHERE CompanyID = ?
+    """, (company_id,))
+    return df
+
+
+def _brand_summary(cid: str, today: date, stock_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-brand summary for a principal: L3M total, L3M avg/mo (stock-out
+    adjusted with <1 cs threshold), LYSM (full month a year ago), current
+    stock. One row per BrandName in MsBrandMaster for the principal."""
+    hist = _load_principal_brand_history(cid, 13)
+    master = _load_principal_brand_master(cid)
+    if master.empty:
+        return pd.DataFrame()
+
+    # Stock per brand (the principal's brands only)
+    if not stock_df.empty:
+        stk = (stock_df[stock_df["BrandName"].isin(master["BrandName"])]
+               .groupby("BrandName")["ClosingCases"].sum().to_dict())
+    else:
+        stk = {}
+
+    # L3M window = last 3 fully-elapsed months
+    prev_y, prev_m = today.year, today.month - 1
+    if prev_m == 0:
+        prev_m = 12; prev_y -= 1
+    l3_months = []
+    y, m = prev_y, prev_m
+    for _ in range(3):
+        l3_months.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0: m = 12; y -= 1
+    lysm_mon = f"{today.year-1:04d}-{today.month:02d}"
+
+    rows = []
+    by_brand_mon = hist.set_index(["BrandName", "Mon"])["Cases"].to_dict() \
+                   if not hist.empty else {}
+    for bn in master["BrandName"]:
+        l3_vals = [float(by_brand_mon.get((bn, m), 0.0)) for m in l3_months]
+        l3_active = sum(1 for v in l3_vals if v >= 1.0)
+        l3_total = sum(l3_vals)
+        l3_avg_n = l3_total / 3.0
+        l3_avg_a = (l3_total / l3_active) if l3_active else 0.0
+        lysm     = float(by_brand_mon.get((bn, lysm_mon), 0.0))
+        rows.append({
+            "BrandName":   bn,
+            "Stock":       float(stk.get(bn, 0.0)),
+            "L3M total":   l3_total,
+            "L3M avg/mo (naive)": l3_avg_n,
+            "L3M avg/mo (adj)":   l3_avg_a,
+            "LYSM":        lysm,
+            "L3M active mo": l3_active,
+        })
+    return pd.DataFrame(rows)
+
+
+# ── Mode A: Analyze company's primary plan from an uploaded Excel ─────────
+def _verdict(ask: float, stock: float, l3m_avg: float) -> str:
+    if ask <= 0:
+        return "Skip (no ask)"
+    if stock >= ask + l3m_avg:
+        return "Hold — over-stocked"
+    if stock >= ask:
+        return "Cover OK"
+    gap = ask - stock
+    if stock >= l3m_avg or l3m_avg <= 0:
+        return f"Order ~{gap:,.0f} cs"
+    return f"⚠️ Order ~{gap:,.0f} cs (low stock)"
+
+
+def _match_brands(text: str, master_brands: list[str],
+                  code_map: dict[str, list[str]]) -> list[str]:
+    """Match the upload's brand-identifier text to master brand names.
+
+    Priority: 1) lookup in code_map (for Diageo-style cryptic codes),
+              2) case-insensitive substring of the text in master brand names.
+    """
+    t = (text or "").strip().upper()
+    if not t:
+        return []
+    # Code-map first
+    patterns = code_map.get(t) or code_map.get(t.replace(" ", ""))
+    if patterns:
+        return [b for b in master_brands
+                if any(p in b.upper() for p in patterns)]
+    # Fallback: substring match in either direction
+    return [b for b in master_brands
+            if t in b.upper() or b.upper() in t]
+
+
+def _mode_analyze(stock_df: pd.DataFrame, cid: str, today: date) -> None:
+    st.markdown("##### 📥 Analyze company's primary plan — upload Excel")
+    st.caption(
+        "Drop the company's primary-plan Excel. We'll match each brand to "
+        "your master, compare the ask to current stock + L3M average + LYSM, "
+        "and tell you what to order, hold, or skip."
+    )
+    up = st.file_uploader(
+        "Primary-plan file (.xlsx)", type=["xlsx", "xls"],
+        key=f"pp_upload_{cid}")
+    if up is None:
+        st.info("Upload a file to begin.")
+        return
+
+    try:
+        # Read all rows ignoring headers — we'll detect headers below
+        raw = pd.read_excel(up, header=None)
+    except Exception as e:
+        st.error(f"Could not read the file: {e}"); return
+
+    # Auto-detect header row (the first row where >=2 cells are non-null
+    # strings that look like header words)
+    HDR_HINT = {"brand", "sku", "code", "cases", "qty", "quantity",
+                "plan", "primary", "indent", "name"}
+    hdr_row = None
+    for i in range(min(10, len(raw))):
+        cells = [str(c).strip().lower() for c in raw.iloc[i] if pd.notna(c)]
+        if sum(any(h in c for h in HDR_HINT) for c in cells) >= 2:
+            hdr_row = i; break
+    if hdr_row is None:
+        st.warning("Couldn't auto-detect a header row. Treating row 1 as headers.")
+        hdr_row = 0
+    df = raw.iloc[hdr_row + 1:].copy()
+    df.columns = [str(c).strip() if pd.notna(c) else f"col{i}"
+                  for i, c in enumerate(raw.iloc[hdr_row])]
+
+    # Column mapping
+    cols = list(df.columns)
+    def _guess(keys):
+        for c in cols:
+            cl = c.lower()
+            if any(k in cl for k in keys):
+                return c
+        return cols[0] if cols else None
+    brand_default = _guess(["brand", "code", "name"])
+    qty_default   = _guess(["plan", "primary", "case", "qty", "quantity", "indent"])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        brand_col = st.selectbox("Brand code/name column", cols,
+                                 index=cols.index(brand_default) if brand_default in cols else 0,
+                                 key=f"pp_bcol_{cid}")
+    with c2:
+        qty_col   = st.selectbox("Cases / quantity column", cols,
+                                 index=cols.index(qty_default) if qty_default in cols else 0,
+                                 key=f"pp_qcol_{cid}")
+
+    df = df[[brand_col, qty_col]].copy()
+    df.columns = ["BrandKey", "Cases"]
+    df["BrandKey"] = df["BrandKey"].astype(str).str.strip()
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    df = df[df["BrandKey"].str.len() > 0]
+
+    # Aggregate by brand key
+    agg = df.groupby("BrandKey", as_index=False)["Cases"].sum() \
+            .rename(columns={"Cases": "Ask"})
+    if agg.empty:
+        st.info("File parsed but no usable rows found."); return
+
+    # Match each key to master brands
+    summary = _brand_summary(cid, today, stock_df)
+    if summary.empty:
+        st.error("Couldn't load brand master for this principal."); return
+    master_brands = summary["BrandName"].tolist()
+
+    code_map = DIAGEO_CODE_MAP if cid == "C00040" else {}
+
+    rows = []
+    for key, ask in zip(agg["BrandKey"], agg["Ask"]):
+        matched = _match_brands(key, master_brands, code_map)
+        if matched:
+            sub = summary[summary["BrandName"].isin(matched)]
+            stock = float(sub["Stock"].sum())
+            l3m   = float(sub["L3M total"].sum())
+            l3_avg = float(sub["L3M avg/mo (adj)"].sum())
+            lysm  = float(sub["LYSM"].sum())
+            verdict = _verdict(ask, stock, l3_avg)
+            mapped = "; ".join(matched[:3]) + (
+                f" (+{len(matched)-3} more)" if len(matched) > 3 else "")
+        else:
+            stock = l3m = l3_avg = lysm = 0.0
+            verdict = "⚠️ Unmapped — check"
+            mapped = "(none)"
+        rows.append({
+            "Brand key": key, "Mapped brand(s)": mapped, "Ask (cs)": ask,
+            "Stock": stock, "L3M total": l3m, "L3M avg/mo": l3_avg,
+            "LYSM": lysm, "Verdict": verdict,
+        })
+    out = pd.DataFrame(rows).sort_values("Ask (cs)", ascending=False)
+
+    # Headline
+    total_ask = float(out["Ask (cs)"].sum())
+    n_order = int(out["Verdict"].str.startswith(("Order", "⚠️ Order")).sum())
+    n_hold  = int((out["Verdict"] == "Hold — over-stocked").sum())
+    n_cover = int((out["Verdict"] == "Cover OK").sum())
+    n_un    = int((out["Verdict"] == "⚠️ Unmapped — check").sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total ask", f"{total_ask:,.0f} cs")
+    c2.metric("Orders", f"{n_order} brands")
+    c3.metric("Hold", f"{n_hold} brands")
+    c4.metric("Unmapped", f"{n_un} brands")
+
+    def _flag(v):
+        s = str(v)
+        if "⚠️" in s:        return "color:#dc2626;font-weight:700"
+        if "Hold" in s:      return "color:#16a34a;font-weight:600"
+        if "Cover OK" in s:  return "color:#16a34a;font-weight:600"
+        if "Order" in s:     return "color:#b45309;font-weight:600"
+        return ""
+
+    st.dataframe(
+        out.style.format({c: "{:,.1f}" for c in
+                         ["Ask (cs)", "Stock", "L3M total", "L3M avg/mo", "LYSM"]})
+           .map(_flag, subset=["Verdict"]),
+        use_container_width=True, hide_index=True, height=480)
+    st.download_button(
+        "⬇️ Download annotated plan",
+        out.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"primary_plan_analysis_{cid}_{today.isoformat()}.csv",
+        mime="text/csv", key=f"pp_dl_{cid}")
+
+
+# ── Mode B: Build OUR plan from a total target ─────────────────────────────
+def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
+                principal_name: str) -> None:
+    st.markdown("##### 📝 Build our primary plan — total target → per-brand split")
+    st.caption(
+        "Enter the total cases you've been given (or want to commit to). "
+        "We'll allocate it across brands using your real sales history, with "
+        "an option to reduce each brand's indent by current stock on hand."
+    )
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        total = st.number_input(
+            "Total target (cases)", min_value=0.0, value=0.0, step=100.0,
+            key=f"pp_build_total_{cid}")
+    with c2:
+        method = st.radio(
+            "Distribution basis",
+            ["L3M share", "LYSM share", "Blend (50/50)"],
+            horizontal=False, key=f"pp_build_method_{cid}")
+    with c3:
+        stock_aware = st.checkbox(
+            "Reduce indent by current stock", value=True,
+            key=f"pp_build_stockaware_{cid}",
+            help="If your warehouse has X cases of a brand, indent only "
+                 "(allocated − X). Avoids double-stocking.")
+
+    if total <= 0:
+        st.info("Enter a total target to see the suggested per-brand split.")
+        return
+
+    summary = _brand_summary(cid, today, stock_df)
+    if summary.empty:
+        st.error("Couldn't load brand data."); return
+
+    # Weights
+    w_l3m  = summary["L3M total"].clip(lower=0)
+    w_lysm = summary["LYSM"].clip(lower=0)
+    if method == "L3M share":
+        w = w_l3m
+    elif method == "LYSM share":
+        w = w_lysm
+    else:
+        # 50/50 blend on share, then apply to total
+        s_l3m  = w_l3m.sum()
+        s_lysm = w_lysm.sum()
+        share_l3m  = (w_l3m  / s_l3m)  if s_l3m  > 0 else pd.Series(0, index=summary.index)
+        share_lysm = (w_lysm / s_lysm) if s_lysm > 0 else pd.Series(0, index=summary.index)
+        share = (share_l3m + share_lysm) / 2.0
+        # Renormalise (handles brands with only one source)
+        if share.sum() > 0:
+            share = share / share.sum()
+        summary["Share %"] = (share * 100.0).round(2)
+        summary["Allocated"] = (share * total).round(1)
+        w = None
+
+    if w is not None:
+        s = w.sum()
+        share = (w / s) if s > 0 else pd.Series(0, index=summary.index)
+        summary["Share %"]   = (share * 100.0).round(2)
+        summary["Allocated"] = (share * total).round(1)
+
+    summary["Indent"] = (summary["Allocated"] - summary["Stock"]).clip(lower=0).round(1) \
+                       if stock_aware else summary["Allocated"]
+
+    # Show only brands with any historic activity OR an allocation
+    keep = (summary["L3M total"] > 0) | (summary["LYSM"] > 0) | (summary["Stock"] > 0) | (summary["Allocated"] > 0)
+    out = summary[keep].sort_values("Allocated", ascending=False).copy()
+
+    # Headline
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Allocated total", f"{out['Allocated'].sum():,.0f} cs")
+    c2.metric("Indent total (after stock)", f"{out['Indent'].sum():,.0f} cs")
+    c3.metric("Stock offset", f"{(out['Allocated'].sum() - out['Indent'].sum()):,.0f} cs")
+
+    disp = out[["BrandName", "L3M avg/mo (adj)", "LYSM", "Share %",
+                "Allocated", "Stock", "Indent"]].rename(columns={
+        "BrandName": "Brand", "L3M avg/mo (adj)": "L3M/mo (adj)"})
+
+    def _style_indent(v):
+        try:
+            return ("color:#dc2626;font-weight:700" if v > 0
+                    else "color:#16a34a")
+        except Exception:
+            return ""
+
+    st.dataframe(
+        disp.style.format({c: "{:,.1f}" for c in
+                          ["L3M/mo (adj)", "LYSM", "Allocated", "Stock", "Indent"]}
+                          | {"Share %": "{:.2f}%"})
+            .map(_style_indent, subset=["Indent"]),
+        use_container_width=True, hide_index=True, height=520)
+    st.download_button(
+        "⬇️ Download brand split",
+        disp.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"primary_plan_build_{cid}_{today.isoformat()}.csv",
+        mime="text/csv", key=f"pp_build_dl_{cid}")
+
+
+def _section_primary_plan(stock_df: pd.DataFrame, as_of: date) -> None:
+    st.subheader("📦 Primary Plan / Indent")
+    st.caption(
+        "One place for every primary-order workflow: analyse a plan the "
+        "company sent you, build a plan to send back, or phase Brindco's "
+        "annual transition across 12 months."
+    )
+
+    mode = st.radio(
+        "Mode",
+        ["📥 Analyze company plan (upload Excel)",
+         "📝 Build our plan (manual target)",
+         "🎯 Brindco annual transition"],
+        horizontal=False, key="pp_mode")
+
+    if mode.startswith("🎯"):
+        _section_target_phasing(stock_df, as_of)
+        return
+
+    principal_name = st.selectbox(
+        "Principal", list(_PRINCIPAL_CID_MAP.keys()),
+        index=1,    # United Breweries default
+        key="pp_principal")
+    cid = _PRINCIPAL_CID_MAP[principal_name]
+
+    if mode.startswith("📥"):
+        _mode_analyze(stock_df, cid, as_of)
+    else:
+        _mode_build(stock_df, cid, as_of, principal_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Annual-target phasing — feeds an annual case target through a brand family's
 # historical seasonality (stock-out-adjusted) to suggest a monthly indent.
 # Designed for the Brindco transition (Jun-2026) but generic to any preset.
@@ -1183,7 +1635,11 @@ def _section_target_phasing(stock_df: pd.DataFrame, as_of: date) -> None:
 
 def render() -> None:
     st.title("Inventory")
-    st.caption("Stock levels, slow movers, and out-of-stock alerts")
+
+    sub = st.radio(
+        "View",
+        ["📊 Stock Analytics", "📦 Primary Plan / Indent"],
+        horizontal=True, key="inv_sub_nav", label_visibility="collapsed")
     st.divider()
 
     today    = date.today()
@@ -1256,22 +1712,23 @@ def render() -> None:
         st.info(f"Showing historical stock as of {as_of_date.strftime('%d %b %Y')} "
                 f"(rolled back from live).")
 
-    safe_section("KPIs",            _section_kpis,            stock_df)
-    st.divider()
-    safe_section("Stock reconciliation", _section_reconciliation,
-                 stock_df, keg_aware)
-    st.divider()
-    safe_section("By principal",    _section_by_principal,    stock_df)
-    st.divider()
-    safe_section("Top items",       _section_top_items,       view_df, origin_df)
-    st.divider()
-    safe_section("Slow movers",     _section_slow_movers,     stock_df, vel_30)
-    st.divider()
-    safe_section("Out of stock",    _section_out_of_stock,    stock_df, vel_30, vel_90)
-    st.divider()
-    safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
-    st.divider()
-    safe_section("Indent planner",  _section_indent_planner,  stock_df, as_of_date, keg_aware)
-    st.divider()
-    safe_section("Target phasing (Brindco)", _section_target_phasing,
-                 stock_df, as_of_date)
+    if sub.endswith("Stock Analytics"):
+        safe_section("KPIs",            _section_kpis,            stock_df)
+        st.divider()
+        safe_section("Stock reconciliation", _section_reconciliation,
+                     stock_df, keg_aware)
+        st.divider()
+        safe_section("By principal",    _section_by_principal,    stock_df)
+        st.divider()
+        safe_section("Top items",       _section_top_items,       view_df, origin_df)
+        st.divider()
+        safe_section("Slow movers",     _section_slow_movers,     stock_df, vel_30)
+        st.divider()
+        safe_section("Out of stock",    _section_out_of_stock,    stock_df, vel_30, vel_90)
+        st.divider()
+        safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
+        st.divider()
+        safe_section("Indent planner",  _section_indent_planner,  stock_df, as_of_date, keg_aware)
+    else:
+        safe_section("Primary Plan / Indent",
+                     _section_primary_plan, stock_df, as_of_date)
