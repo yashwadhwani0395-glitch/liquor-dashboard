@@ -1513,13 +1513,14 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
                 principal_name: str) -> None:
     st.markdown("##### 📝 Build our primary plan — total target → per-brand split")
     st.caption(
-        "Enter the total cases you've been given (or want to commit to). "
-        "We allocate it across brands using your real sales history, then "
-        "show **Received MTD** (cases already arrived this month) so the "
-        "**Indent** column reflects only the balance still pending from the "
-        "company."
+        "Enter the total cases you're planning to order. We allocate it "
+        "across brands using your real sales history. The **planned indent "
+        "is over and above current stock** — Stock is shown for context "
+        "only and is NOT subtracted from the indent. **Indent = Allocated − "
+        "Received MTD**, so it reflects the balance of the planned order "
+        "that still has to come from the company."
     )
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         total = st.number_input(
             "Total target (cases)", min_value=0.0, value=0.0, step=100.0,
@@ -1537,15 +1538,6 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
             help="Brand-level allocates the total across brands. "
                  "SKU-level then breaks each brand's share across its SKUs "
                  "by their own L3M share inside the brand.")
-    with c4:
-        stock_aware = st.checkbox(
-            "Reduce indent by current stock", value=True,
-            key=f"pp_build_stockaware_{cid}",
-            help="ON  → Indent = max(0, Allocated − Stock). Avoids "
-                 "double-stocking; Stock already includes anything "
-                 "received this month.\n"
-                 "OFF → Indent = max(0, Allocated − Received MTD). "
-                 "Just the balance still pending from the company.")
 
     if total <= 0:
         st.info("Enter a total target to see the suggested per-brand split.")
@@ -1590,17 +1582,12 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         rec_brand = {}
     summary["Received MTD"] = summary["BrandName"].map(rec_brand).fillna(0.0)
 
-    # Indent / balance:
-    #   stock-aware ON  → max(0, Allocated − Stock)  (Stock includes Received,
-    #                     so this avoids double-counting)
-    #   stock-aware OFF → max(0, Allocated − Received MTD)  (just the
-    #                     balance still pending from the company)
-    if stock_aware:
-        summary["Indent"] = (summary["Allocated"] - summary["Stock"]) \
-                            .clip(lower=0).round(1)
-    else:
-        summary["Indent"] = (summary["Allocated"] - summary["Received MTD"]) \
-                            .clip(lower=0).round(1)
+    # Indent = balance of the planned order still pending from the company.
+    # The plan is OVER AND ABOVE current stock, so Stock is NOT subtracted.
+    # Received MTD is subtracted because those cases are already part of
+    # this month's deliveries against the plan.
+    summary["Indent"] = (summary["Allocated"] - summary["Received MTD"]) \
+                        .clip(lower=0).round(1)
 
     # Show only brands with any historic activity OR an allocation
     keep = (summary["L3M total"] > 0) | (summary["LYSM"] > 0) | (summary["Stock"] > 0) | (summary["Allocated"] > 0) | (summary["Received MTD"] > 0)
@@ -1644,8 +1631,9 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
     st.caption(
         "Each brand's allocation, split across its SKUs by the SKU's L3M "
         "share inside the brand. Brands with no L3M history use a flat "
-        "split across their SKUs. Stock is per-SKU; indent = max(0, "
-        "allocated − stock) when 'reduce by stock' is on."
+        "split across their SKUs. Stock and Received MTD are matched "
+        "per-ItemID. **Indent = Allocated − Received MTD** — over and "
+        "above current stock."
     )
 
     consolidate = st.checkbox(
@@ -1702,10 +1690,10 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
     sku["Share"]    = sku.apply(_sku_share, axis=1)
     sku["Allocated"] = (sku["BrandAlloc"] * sku["Share"]).round(1)
 
-    if stock_aware:
-        sku["Indent"] = (sku["Allocated"] - sku["Stock"]).clip(lower=0).round(1)
-    else:
-        sku["Indent"] = (sku["Allocated"] - sku["Received MTD"]).clip(lower=0).round(1)
+    # Indent = balance still to come from the company (planned − already
+    # received this month). Stock is NOT subtracted — the planned indent is
+    # over and above current stock.
+    sku["Indent"] = (sku["Allocated"] - sku["Received MTD"]).clip(lower=0).round(1)
 
     # Only show SKUs whose brand got an allocation > 0 OR which carry stock
     keep_sku = (sku["BrandAlloc"] > 0) | (sku["Stock"] > 0)
