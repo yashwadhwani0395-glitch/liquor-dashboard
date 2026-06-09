@@ -15,6 +15,7 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -1067,6 +1068,126 @@ def _load_principal_received_mtd(company_id: str,
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_principal_item_meta(company_id: str) -> pd.DataFrame:
+    """Per-ItemID metadata for the principal: BottlesPerCase + MrpCaseRate +
+    LastPurchase date. Drives the MRP-recode consolidation in Build mode —
+    we need MrpCaseRate to pick the 'current' (highest-MRP) item in each
+    consolidated group, and LastPurchase as a tie-breaker."""
+    type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
+    df = run_query(f"""
+        SELECT im.ItemID,
+               ISNULL(im.ItemDescription, im.ItemID)        AS ItemDescription,
+               b.BrandName,
+               im.BottlesPerCase,
+               CAST(ISNULL(im.MrpCaseRate, 0) AS float)     AS MrpCaseRate,
+               MAX(CASE WHEN h.TransTypeID IN ({type_ph})
+                          AND h.Cancelled = 'N'
+                        THEN h.VoucherDate END)             AS LastPurchase
+        FROM MsItemMaster im
+        JOIN MsBrandMaster b ON b.BrandID = im.BrandID
+        LEFT JOIN TrVocItem vi ON vi.ItemID = im.ItemID
+        LEFT JOIN TrVocHead h
+            ON  h.TransTypeID  = vi.TransTypeID
+            AND h.VoucherNo    = vi.VoucherNo
+            AND h.FinancialYear = vi.FinancialYear
+        WHERE b.CompanyID = ? AND im.ItemID LIKE 'I%'
+        GROUP BY im.ItemID, im.ItemDescription, b.BrandName,
+                 im.BottlesPerCase, im.MrpCaseRate
+    """, (company_id,))
+    if not df.empty:
+        df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce") \
+                                  .fillna(0).astype(int)
+        df["MrpCaseRate"]   = pd.to_numeric(df["MrpCaseRate"], errors="coerce") \
+                                  .fillna(0.0)
+        df["LastPurchase"]  = pd.to_datetime(df["LastPurchase"], errors="coerce")
+    return df
+
+
+# Regexes for the SKU-base-key extraction (MRP-recode consolidation).
+#   _MRP_RE   strips trailing "-NNN" or "-NNN X" (MRP + optional version letter)
+#   _PAREN_RE strips trailing "(K)", "(Hipster)", "(6)" variant markers
+_MRP_RE   = re.compile(r"\s*-\s*\d{2,4}\s*[A-Z]?\s*$", re.IGNORECASE)
+_PAREN_RE = re.compile(r"\s*\([^\)]+\)\s*$")
+
+
+def _normalize_sku_key(desc: str) -> str:
+    """Return a base key by stripping the trailing MRP token + parenthesised
+    variant marker. Re-codes that differ ONLY in MRP collapse to the same
+    key. Daman variants ('-D119' style) survive — the regex requires the
+    digits to come right after the dash, so '-D119' is not stripped."""
+    if not isinstance(desc, str):
+        return ""
+    s = re.sub(r"\s+", " ", desc.upper().strip())
+    s = _PAREN_RE.sub("", s)
+    s = _MRP_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Trim trailing dash if the MRP was stripped without a leading separator
+    s = re.sub(r"\s*-\s*$", "", s).strip()
+    return s
+
+
+def _consolidate_recodes(sku_df: pd.DataFrame,
+                        item_meta: pd.DataFrame) -> pd.DataFrame:
+    """Roll up MRP-recoded SKUs: items sharing the same base description +
+    BottlesPerCase collapse into the CURRENT one (highest MrpCaseRate, then
+    most-recent purchase, then highest ItemID). L3M / LYSM / Stock /
+    Received MTD are SUMMED across the group and assigned to the current
+    item; non-current items are dropped from the output."""
+    if sku_df.empty:
+        return sku_df
+
+    meta = item_meta[["ItemID", "BottlesPerCase", "MrpCaseRate", "LastPurchase"]]
+    df = sku_df.merge(meta, on="ItemID", how="left")
+    df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce") \
+                              .fillna(0).astype(int)
+    df["MrpCaseRate"]    = pd.to_numeric(df["MrpCaseRate"], errors="coerce") \
+                              .fillna(0.0)
+    df["LastPurchase"]   = pd.to_datetime(df["LastPurchase"], errors="coerce")
+
+    df["_base"]  = df["ItemDescription"].apply(_normalize_sku_key)
+    df["_group"] = df["_base"] + "||" + df["BottlesPerCase"].astype(str)
+    # Pick the 'current' item per group: highest MRP, then latest purchase,
+    # then highest ItemID (newest assigned code).
+    df["_lp"] = df["LastPurchase"].fillna(pd.Timestamp("1900-01-01"))
+    df = df.sort_values(
+        ["_group", "MrpCaseRate", "_lp", "ItemID"],
+        ascending=[True, False, False, False])
+    df["_current"] = ~df["_group"].duplicated(keep="first")
+
+    # Aggregate stats per group
+    sum_cols = ["L3M_total", "LYSM", "Stock", "Received MTD", "L3M_active"]
+    agg_cols = [c for c in sum_cols if c in df.columns]
+    agg = df.groupby("_group")[agg_cols].sum()
+    # Cap L3M_active at 3 (months in window) — variants may overlap.
+    if "L3M_active" in agg.columns:
+        agg["L3M_active"] = agg["L3M_active"].clip(upper=3)
+    rollup_n = df.groupby("_group").size()
+
+    # Replace stats on the current row; drop others
+    out = df[df["_current"]].copy()
+    for c in agg_cols:
+        out[c] = out["_group"].map(agg[c])
+    out["_rollup_n"] = out["_group"].map(rollup_n)
+    if "L3M_active" in out.columns and "L3M_total" in out.columns:
+        out["L3M_avg_adj"] = out.apply(
+            lambda r: (r["L3M_total"] / r["L3M_active"])
+                      if r["L3M_active"] > 0 else 0.0,
+            axis=1)
+
+    # Annotate the description so the user sees how many variants rolled up
+    def _annotate(r):
+        n = int(r.get("_rollup_n", 1))
+        if n > 1:
+            return f"{r['ItemDescription']}  (rolled up {n} MRP variants)"
+        return r["ItemDescription"]
+    out["ItemDescription"] = out.apply(_annotate, axis=1)
+
+    drop_cols = ["_base", "_group", "_lp", "_current", "_rollup_n",
+                 "BottlesPerCase", "MrpCaseRate", "LastPurchase"]
+    return out.drop(columns=[c for c in drop_cols if c in out.columns])
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _load_principal_sku_history(company_id: str,
                                 months_back: int = 13) -> pd.DataFrame:
@@ -1526,10 +1647,40 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         "split across their SKUs. Stock is per-SKU; indent = max(0, "
         "allocated − stock) when 'reduce by stock' is on."
     )
+
+    consolidate = st.checkbox(
+        "Consolidate MRP re-codes (KF Strong 195+200 → 200 with combined history)",
+        value=True, key=f"pp_consolidate_{cid}",
+        help="When MRP changes, the ERP issues a new ItemID. The old "
+             "ItemID still has L3M / LYSM sales but no more stock will "
+             "arrive of it.\n"
+             "ON  → roll up all MRP variants of the same physical SKU into "
+             "the current item (highest MRP, latest purchase). Description "
+             "shows '(rolled up N MRP variants)'.\n"
+             "OFF → show every ItemID separately (raw view).")
+
     sku = _sku_summary(cid, today, stock_df)
     if sku.empty:
         st.info("No SKU history available for this principal.")
         return
+
+    # Per-SKU Received MTD — load before consolidation so the rollup includes it
+    rec_sku_df = _load_principal_received_mtd(cid, today)
+    rec_by_item = (dict(zip(rec_sku_df["ItemID"], rec_sku_df["Cases"]))
+                   if not rec_sku_df.empty else {})
+    sku["Received MTD"] = sku["ItemID"].map(rec_by_item).fillna(0.0)
+
+    # MRP-recode consolidation (BEFORE allocation, so shares use the
+    # combined L3M of all variants)
+    if consolidate:
+        meta = _load_principal_item_meta(cid)
+        before_n = len(sku)
+        sku = _consolidate_recodes(sku, meta)
+        after_n = len(sku)
+        if before_n != after_n:
+            st.caption(
+                f"🔁 Consolidated {before_n - after_n} MRP re-coded SKUs "
+                f"into their current variants ({before_n} → {after_n} rows).")
 
     # Map brand → allocated cases
     brand_alloc = dict(zip(out["BrandName"], out["Allocated"]))
@@ -1538,7 +1689,7 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         st.info("No SKUs to allocate (no brand received a positive allocation).")
         return
 
-    # SKU share within brand → SKU allocation
+    # SKU share within brand → SKU allocation (using post-consolidation L3M)
     sku["BrandAlloc"]  = sku["BrandName"].map(brand_alloc).fillna(0.0)
     sku["BrandL3M"]    = sku.groupby("BrandName")["L3M_total"].transform("sum")
     sku["SkuPerBrand"] = sku.groupby("BrandName")["ItemID"].transform("count")
@@ -1551,12 +1702,6 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
     sku["Share"]    = sku.apply(_sku_share, axis=1)
     sku["Allocated"] = (sku["BrandAlloc"] * sku["Share"]).round(1)
 
-    # SKU-level Received MTD (same logic as brand: stock-aware uses Stock,
-    # else uses Received MTD as the deduction)
-    rec_sku_df = _load_principal_received_mtd(cid, today)
-    rec_by_item = (dict(zip(rec_sku_df["ItemID"], rec_sku_df["Cases"]))
-                   if not rec_sku_df.empty else {})
-    sku["Received MTD"] = sku["ItemID"].map(rec_by_item).fillna(0.0)
     if stock_aware:
         sku["Indent"] = (sku["Allocated"] - sku["Stock"]).clip(lower=0).round(1)
     else:
