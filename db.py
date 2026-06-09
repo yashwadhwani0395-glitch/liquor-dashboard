@@ -117,8 +117,12 @@ _CONN_ERROR_HINTS = (
     "adaptive server", "broken pipe", "timed out",
 )
 
-_MAX_RETRIES   = 3
-_RETRY_BACKOFF = 0.5  # seconds; doubles each retry
+# Retries: 5 attempts with backoff 1.5s, 3s, 6s, 12s (~22s total). The earlier
+# 3-attempt / 0.5s base was too short — Streamlit Cloud logs showed the
+# generic "(0, b'Unknown error')" drops needing more time for the SQL server
+# to recover before the next attempt would succeed.
+_MAX_RETRIES   = 5
+_RETRY_BACKOFF = 1.5  # seconds; doubles each retry
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -201,8 +205,15 @@ def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
                     file=sys.stderr,
                 )
                 time.sleep(wait)
-                # Reconnect on retry — the prior connection may be in a
-                # rolled-back state after a deadlock.
+                # Explicitly close the dead connection BEFORE clearing the
+                # cache and reconnecting — otherwise the underlying TCP
+                # socket can sit half-open and the next attempt inherits the
+                # broken state. .close() is safe to call on already-dead
+                # connections (it just no-ops).
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 get_connection.clear()
                 conn = get_connection()
                 if conn is None:
