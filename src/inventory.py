@@ -1153,11 +1153,13 @@ def _consolidate_recodes(sku_df: pd.DataFrame,
 
     df["_base"]  = df["ItemDescription"].apply(_normalize_sku_key)
     df["_group"] = df["_base"] + "||" + df["BottlesPerCase"].astype(str)
-    # Pick the 'current' item per group: highest MRP, then latest purchase,
-    # then highest ItemID (newest assigned code).
+    # Pick the 'current' item per group: MOST RECENT PURCHASE first (the
+    # variant we're actually buying NOW — handles MRP cuts correctly, e.g.
+    # McDowell No1 NIP 220 → 210). Ties broken by highest MRP, then
+    # highest ItemID (newest assigned code).
     df["_lp"] = df["LastPurchase"].fillna(pd.Timestamp("1900-01-01"))
     df = df.sort_values(
-        ["_group", "MrpCaseRate", "_lp", "ItemID"],
+        ["_group", "_lp", "MrpCaseRate", "ItemID"],
         ascending=[True, False, False, False])
     df["_current"] = ~df["_group"].duplicated(keep="first")
 
@@ -1774,9 +1776,16 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
 def _load_brand_catalog_master() -> pd.DataFrame:
     """Per-ItemID master data driving the Catalog: BottlesPerCase, MRP per
     case + bottle, AUTHORITATIVE Sales Rate (from MsItemRates — the latest
-    entry per ItemID), LiquorSize. Valuation/landed rates are deliberately
-    NOT pulled — they're our internal cost, not for the customer sheet."""
-    df = run_query("""
+    entry per ItemID), LiquorSize, and LastPurchase (date of the most
+    recent purchase voucher, last 24 months). LastPurchase drives the
+    MRP-recode consolidation so we pick the variant we're actually buying
+    NOW — handles MRP cuts (McDowell No1 NIP 220 → 210) as well as MRP
+    increases.
+
+    Valuation/landed rates are deliberately NOT pulled — they're our
+    internal cost, not for the customer sheet."""
+    type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
+    df = run_query(f"""
         SELECT
             im.ItemID,
             ISNULL(im.ItemDescription, im.ItemID)        AS ItemDescription,
@@ -1787,7 +1796,18 @@ def _load_brand_catalog_master() -> pd.DataFrame:
             CAST(ISNULL(r.SaleBottleRate, 0)       AS float) AS SaleBottle,
             ISNULL(im.LiquorSize, '')                    AS LiquorSize,
             b.BrandName,
-            b.CompanyID
+            b.CompanyID,
+            (SELECT MAX(h.VoucherDate)
+                FROM TrVocItem vi
+                JOIN TrVocHead h
+                    ON  h.TransTypeID  = vi.TransTypeID
+                    AND h.VoucherNo    = vi.VoucherNo
+                    AND h.FinancialYear = vi.FinancialYear
+                WHERE vi.ItemID = im.ItemID
+                  AND h.TransTypeID IN ({type_ph})
+                  AND h.Cancelled = 'N'
+                  AND h.VoucherDate >= DATEADD(MONTH, -24, GETDATE())
+            ) AS LastPurchase
         FROM MsItemMaster im
         JOIN MsBrandMaster b ON b.BrandID = im.BrandID
         LEFT JOIN (
@@ -1805,6 +1825,7 @@ def _load_brand_catalog_master() -> pd.DataFrame:
     if not df.empty:
         df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce") \
                                    .fillna(0).astype(int)
+        df["LastPurchase"]   = pd.to_datetime(df["LastPurchase"], errors="coerce")
     return df
 
 
@@ -1827,16 +1848,26 @@ def _load_recently_active_items(months_back: int = 6) -> set[str]:
 
 def _consolidate_catalog_recodes(cat: pd.DataFrame) -> pd.DataFrame:
     """Keep only the CURRENT MRP variant per physical SKU. Groups by
-    (normalised base description, BottlesPerCase) and picks the highest
-    MrpCase. Reuses _normalize_sku_key from the Primary Plan logic."""
+    (normalised base description, BottlesPerCase). 'Current' = the variant
+    we're actually buying NOW, identified as the most-recent LastPurchase;
+    ties broken by highest MrpCase, then highest ItemID.
+
+    Crucially this handles MRP CUTS (McDowell No1 NIP 220 → 210) correctly
+    — the 210 wins because it's the one being purchased, even though 220
+    is the higher MRP. Where no purchase data exists (e.g. brand-new SKU
+    with no in-window purchases yet), MrpCase becomes the primary key."""
     if cat.empty:
         return cat
     df = cat.copy()
     df["_base"]  = df["ItemDescription"].apply(_normalize_sku_key)
     df["_group"] = df["_base"] + "||" + df["BottlesPerCase"].astype(str)
-    df = df.sort_values(["_group", "MrpCase"], ascending=[True, False])
+    # Sentinel so NaN LastPurchase sorts to the bottom, not the top
+    df["_lp"] = df["LastPurchase"].fillna(pd.Timestamp("1900-01-01"))
+    df = df.sort_values(
+        ["_group", "_lp", "MrpCase", "ItemID"],
+        ascending=[True, False, False, False])
     df = df[~df["_group"].duplicated(keep="first")]
-    return df.drop(columns=["_base", "_group"])
+    return df.drop(columns=["_base", "_group", "_lp"])
 
 
 def _format_pack(row: pd.Series) -> str:
