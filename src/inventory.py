@@ -1761,6 +1761,320 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         mime="text/csv", key=f"pp_build_sku_dl_{cid}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Brand Catalog — auto-updated rate sheet for sharing externally
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Sales rate (outlet's purchase rate) is stored authoritatively on
+# MsItemRates.SaleCaseRate / SaleBottleRate. The table is dated (ApplyDate)
+# and can carry multiple historical entries per ItemID, so we always pick
+# the LATEST row (max id_key) per item.
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_brand_catalog_master() -> pd.DataFrame:
+    """Per-ItemID master data driving the Catalog: BottlesPerCase, MRP per
+    case + bottle, AUTHORITATIVE Sales Rate (from MsItemRates — the latest
+    entry per ItemID), LiquorSize. Valuation/landed rates are deliberately
+    NOT pulled — they're our internal cost, not for the customer sheet."""
+    df = run_query("""
+        SELECT
+            im.ItemID,
+            ISNULL(im.ItemDescription, im.ItemID)        AS ItemDescription,
+            im.BottlesPerCase,
+            CAST(ISNULL(im.MrpCaseRate, 0)         AS float) AS MrpCase,
+            CAST(ISNULL(im.MrpBottRate, 0)         AS float) AS MrpBottle,
+            CAST(ISNULL(r.SaleCaseRate, 0)         AS float) AS SaleCase,
+            CAST(ISNULL(r.SaleBottleRate, 0)       AS float) AS SaleBottle,
+            ISNULL(im.LiquorSize, '')                    AS LiquorSize,
+            b.BrandName,
+            b.CompanyID
+        FROM MsItemMaster im
+        JOIN MsBrandMaster b ON b.BrandID = im.BrandID
+        LEFT JOIN (
+            SELECT ItemID, SaleCaseRate, SaleBottleRate FROM (
+                SELECT ItemID, SaleCaseRate, SaleBottleRate,
+                       ROW_NUMBER() OVER
+                           (PARTITION BY ItemID
+                            ORDER BY ApplyDate DESC, id_key DESC) AS rn
+                FROM MsItemRates
+            ) x WHERE rn = 1
+        ) r ON r.ItemID = im.ItemID
+        WHERE im.ItemID LIKE 'I%'
+          AND b.CompanyID IN ('C00025','C00039','C00040','C00056')
+    """)
+    if not df.empty:
+        df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce") \
+                                   .fillna(0).astype(int)
+    return df
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_recently_active_items(months_back: int = 6) -> set[str]:
+    """ItemIDs that appeared on any voucher (sales or purchase) in the last
+    N months. Combined with current stock, defines 'active' for the catalog."""
+    df = run_query(f"""
+        SELECT DISTINCT vi.ItemID
+        FROM TrVocItem vi
+        JOIN TrVocHead h
+            ON  h.TransTypeID = vi.TransTypeID
+            AND h.VoucherNo   = vi.VoucherNo
+            AND h.FinancialYear = vi.FinancialYear
+        WHERE h.Cancelled = 'N' AND vi.ItemID LIKE 'I%'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+    """)
+    return set(df["ItemID"]) if not df.empty else set()
+
+
+def _consolidate_catalog_recodes(cat: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the CURRENT MRP variant per physical SKU. Groups by
+    (normalised base description, BottlesPerCase) and picks the highest
+    MrpCase. Reuses _normalize_sku_key from the Primary Plan logic."""
+    if cat.empty:
+        return cat
+    df = cat.copy()
+    df["_base"]  = df["ItemDescription"].apply(_normalize_sku_key)
+    df["_group"] = df["_base"] + "||" + df["BottlesPerCase"].astype(str)
+    df = df.sort_values(["_group", "MrpCase"], ascending=[True, False])
+    df = df[~df["_group"].duplicated(keep="first")]
+    return df.drop(columns=["_base", "_group"])
+
+
+def _format_pack(row: pd.Series) -> str:
+    """'12 × 650 ML' style pack label."""
+    size = str(row.get("LiquorSize", "") or "").strip()
+    bpc  = int(row.get("BottlesPerCase", 0) or 0)
+    if bpc <= 0 and not size:
+        return ""
+    if bpc <= 0:
+        return size
+    if not size:
+        return f"{bpc} × ?"
+    # Normalise '650 ML' / '650ML' / '650 ml' → '650 ML'
+    s = size.upper().replace("MILILITER", "ML").replace("MILLILITER", "ML")
+    s = re.sub(r"\s+", " ", s).strip()
+    return f"{bpc} × {s}"
+
+
+def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
+    """Print-ready landscape Excel: one sheet per principal, brand-grouped."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from io import BytesIO
+    from datetime import date as _date
+
+    wb = Workbook()
+    if "Sheet" in wb.sheetnames:
+        wb.remove(wb["Sheet"])
+
+    thin = Side(border_style="thin", color="AAAAAA")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill(start_color="1B4F72", end_color="1B4F72", fill_type="solid")
+    brand_fill  = PatternFill(start_color="E8A838", end_color="E8A838", fill_type="solid")
+
+    today_str = _date.today().strftime("%d %b %Y")
+
+    for principal, prin_df in cat.groupby("Principal"):
+        ws = wb.create_sheet(principal[:31])
+        # Top title bar
+        ws.merge_cells("A1:E1")
+        ws["A1"] = "Kranti Wines Pvt. Ltd."
+        ws["A1"].font = Font(name="Arial", size=16, bold=True, color="FFFFFF")
+        ws["A1"].fill = header_fill
+        ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 28
+        ws.merge_cells("A2:E2")
+        ws["A2"] = f"{principal} — Current MRP & Landing Rates (as of {today_str})"
+        ws["A2"].font = Font(name="Arial", size=12, italic=True, color="1B4F72")
+        ws["A2"].alignment = Alignment(horizontal="center")
+        ws.row_dimensions[2].height = 22
+
+        # Column headers
+        hdr = ["SKU", "Pack", "Bottles / Case",
+               "MRP / Case (₹)", "MRP / Bottle (₹)",
+               "Sales Rate / Case (₹)", "Sales Rate / Bottle (₹)"]
+        ncols = len(hdr)
+        # Re-merge the title row to span all columns
+        end_col = get_column_letter(ncols)
+        ws.unmerge_cells("A1:E1"); ws.merge_cells(f"A1:{end_col}1")
+        ws.unmerge_cells("A2:E2"); ws.merge_cells(f"A2:{end_col}2")
+        for ci, h in enumerate(hdr, 1):
+            c = ws.cell(row=4, column=ci, value=h)
+            c.font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+            c.fill = header_fill
+            c.alignment = Alignment(horizontal="center", vertical="center",
+                                    wrap_text=True)
+            c.border = border
+        ws.row_dimensions[4].height = 32
+
+        r = 5
+        for brand, brand_df in prin_df.groupby("BrandName"):
+            # Brand band
+            ws.merge_cells(start_row=r, start_column=1,
+                           end_row=r, end_column=ncols)
+            bc = ws.cell(row=r, column=1, value=brand)
+            bc.font = Font(name="Arial", size=11, bold=True, color="1B1B1B")
+            bc.fill = brand_fill
+            bc.alignment = Alignment(horizontal="left", vertical="center",
+                                     indent=1)
+            bc.border = border
+            r += 1
+            for _, row in brand_df.sort_values("MrpCase", ascending=False) \
+                                  .iterrows():
+                vals = [
+                    row.get("ItemDescription", ""),
+                    _format_pack(row),
+                    int(row.get("BottlesPerCase", 0) or 0),
+                    float(row.get("MrpCase",    0) or 0),
+                    float(row.get("MrpBottle",  0) or 0),
+                    float(row.get("SaleCase",   0) or 0),
+                    float(row.get("SaleBottle", 0) or 0),
+                ]
+                for ci, v in enumerate(vals, 1):
+                    c = ws.cell(row=r, column=ci, value=v)
+                    c.font = Font(name="Arial", size=10)
+                    c.border = border
+                    if ci == 3:
+                        c.number_format = "#,##0"
+                        c.alignment = Alignment(horizontal="center")
+                    elif ci >= 4:
+                        c.number_format = "#,##0"
+                        c.alignment = Alignment(horizontal="right")
+                r += 1
+
+        # Column widths
+        widths = [40, 16, 11, 16, 16, 18, 18]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A5"
+        # Print setup — landscape, fit-to-page
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.print_options.horizontalCentered = True
+        ws.page_margins.left = 0.3
+        ws.page_margins.right = 0.3
+        ws.page_margins.top = 0.5
+        ws.page_margins.bottom = 0.5
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
+    st.subheader("📋 Brand Catalog — auto-updated rate sheet")
+    st.caption(
+        "Every active SKU per principal/brand with current MRP and landing "
+        "rate. **Updates automatically** when MRPs change in the ERP — no "
+        "more manual maintenance. Download the Excel and Print → Save as PDF "
+        "(landscape, fit-to-page) to share with customers asking which "
+        "brands you distribute."
+    )
+
+    # Filter row
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        principal_filter = st.selectbox(
+            "Principal",
+            ["All", "United Breweries", "United Spirits", "Diageo", "Brown-Forman"],
+            key="cat_principal_filter")
+    with c2:
+        st.caption(
+            "Active = had purchases/sales in the last 6 months OR carries "
+            "current stock. MRP variants are consolidated to the highest "
+            "(current) one, so re-codes like KFS 195 + 200 show once.")
+
+    try:
+        cat = _load_brand_catalog_master()
+        active = _load_recently_active_items(6)
+    except Exception as exc:
+        st.error(
+            "⚠️ Could not load the catalog — the SQL Server may have dropped "
+            "the connection. Click 🔄 Refresh at the top-right and try again.\n\n"
+            f"_Technical: `{type(exc).__name__}: {str(exc)[:200]}`_")
+        return
+
+    if cat.empty:
+        st.info("No catalog data returned."); return
+
+    # Active = (had recent voucher activity) OR (carries stock now)
+    in_stock = (set(stock_df["ItemID"]) if not stock_df.empty
+                and "ItemID" in stock_df.columns else set())
+    cat = cat[cat["ItemID"].isin(active | in_stock)].copy()
+    if cat.empty:
+        st.info("No active SKUs in the window."); return
+
+    # Consolidate MRP re-codes — keep only the highest-MRP variant per SKU
+    before = len(cat)
+    cat = _consolidate_catalog_recodes(cat)
+    after = len(cat)
+
+    # Principal name + filter
+    cat["Principal"] = cat["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
+    if principal_filter != "All":
+        cat = cat[cat["Principal"] == principal_filter]
+    if cat.empty:
+        st.info(f"No active SKUs for {principal_filter}."); return
+
+    # KPIs
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Principals", cat["Principal"].nunique())
+    k2.metric("Brands",     cat["BrandName"].nunique())
+    k3.metric("SKUs",       len(cat),
+              help=f"Consolidated from {before} raw items "
+                   f"(de-duplicated {before-after} MRP re-codes).")
+
+    # Download
+    try:
+        xlsx_bytes = _build_catalog_xlsx(cat)
+        st.download_button(
+            "⬇️ Download rate sheet (Excel — print-ready, landscape)",
+            xlsx_bytes,
+            file_name=f"KW_Rates_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="cat_xlsx_dl")
+    except Exception as exc:
+        st.warning(f"Excel generation failed: {exc}")
+
+    st.divider()
+
+    # On-screen display: per principal → per brand
+    for prin in sorted(cat["Principal"].unique()):
+        prin_df = cat[cat["Principal"] == prin]
+        st.markdown(f"### {prin}  ·  {len(prin_df)} SKUs across "
+                    f"{prin_df['BrandName'].nunique()} brands")
+        for brand in sorted(prin_df["BrandName"].unique()):
+            brand_df = prin_df[prin_df["BrandName"] == brand]
+            with st.expander(f"**{brand}**  ·  {len(brand_df)} SKU"
+                             f"{'s' if len(brand_df) != 1 else ''}",
+                             expanded=False):
+                disp = brand_df.copy()
+                disp["Pack"] = disp.apply(_format_pack, axis=1)
+                show = (disp[["ItemDescription", "Pack", "BottlesPerCase",
+                              "MrpCase", "MrpBottle",
+                              "SaleCase", "SaleBottle"]]
+                        .rename(columns={
+                            "ItemDescription":  "SKU",
+                            "BottlesPerCase":   "Bottles / Case",
+                            "MrpCase":          "MRP / Case (₹)",
+                            "MrpBottle":        "MRP / Bottle (₹)",
+                            "SaleCase":         "Sales Rate / Case (₹)",
+                            "SaleBottle":       "Sales Rate / Bottle (₹)"})
+                        .sort_values("MRP / Case (₹)", ascending=False))
+                st.dataframe(
+                    show.style.format({
+                        "Bottles / Case":           "{:,.0f}",
+                        "MRP / Case (₹)":           "₹{:,.0f}",
+                        "MRP / Bottle (₹)":         "₹{:,.0f}",
+                        "Sales Rate / Case (₹)":    "₹{:,.0f}",
+                        "Sales Rate / Bottle (₹)":  "₹{:,.0f}",
+                    }),
+                    use_container_width=True, hide_index=True)
+
+
 def _section_primary_plan(stock_df: pd.DataFrame, as_of: date) -> None:
     st.subheader("📦 Primary Plan / Indent")
     st.caption(
@@ -2046,7 +2360,7 @@ def render() -> None:
 
     sub = st.radio(
         "View",
-        ["📊 Stock Analytics", "📦 Primary Plan / Indent"],
+        ["📊 Stock Analytics", "📦 Primary Plan / Indent", "📋 Brand Catalog"],
         horizontal=True, key="inv_sub_nav", label_visibility="collapsed")
     st.divider()
 
@@ -2150,6 +2464,8 @@ def render() -> None:
         safe_section("Days of cover",   _section_days_of_cover,   stock_df, vel_30)
         st.divider()
         safe_section("Indent planner",  _section_indent_planner,  stock_df, as_of_date, keg_aware)
-    else:
+    elif sub.endswith("Primary Plan / Indent"):
         safe_section("Primary Plan / Indent",
                      _section_primary_plan, stock_df, as_of_date)
+    else:
+        safe_section("Brand Catalog", _section_brand_catalog, stock_df)
