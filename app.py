@@ -139,6 +139,29 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
     )
 
 
+# ── Pre-import every page renderer ONCE at app startup ──────────────────────
+# Lazy imports inside elif branches (the previous pattern) triggered
+# `KeyError: 'src.<module>'` on Streamlit Cloud whenever the app was
+# re-deployed mid-session: Python 3.14's import machinery sees a partial
+# sys.modules cache after the hot-reload and the lazy import fails.
+# Top-level imports run once at cold start, so the cache is always
+# consistent. Each module is small at import time (heavy work is gated by
+# @st.cache_data on call), so memory cost is negligible.
+from src.purchase     import render as render_purchase
+from src.inventory    import render as render_inventory
+from src.sales_plan   import render as render_sales_plan
+from src.sales        import render as render_sales
+from src.segments     import render as render_segments
+from src.salesman     import render as render_salesman
+from src.distribution import render as render_distribution
+from src.principal    import render as render_principal
+from src.operations   import render as render_operations
+from src.discounts    import render as render_discounts
+from src.expenses     import render as render_expenses
+from src.debtors      import render as render_debtors
+from src.cashflow     import render as render_cashflow
+from src.balance_sheet import render as render_balance_sheet
+
 _PAGES = ["Overview", "Purchase", "Sales", "Discounts",
           "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
 page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
@@ -156,10 +179,8 @@ elif page == "Purchase":
     sub = st.radio("View", ["📦 Purchase Overview", "🏭 Inventory"],
                    horizontal=True, key="pur_nav", label_visibility="collapsed")
     if sub.endswith("Purchase Overview"):
-        from src.purchase import render as render_purchase
         render_purchase()
     else:
-        from src.inventory import render as render_inventory
         render_inventory()
 
 elif page == "Sales":
@@ -169,43 +190,31 @@ elif page == "Sales":
     sub = st.radio("View", _SALES, horizontal=True, key="sales_nav",
                    label_visibility="collapsed")
     if sub == "Sales Plan":
-        from src.sales_plan import render as render_sales_plan
         render_sales_plan()
     elif sub == "Sales Overview":
-        from src.sales import render as render_sales
         render_sales()
     elif sub == "Segment Analysis":
-        from src.segments import render as render_segments
         render_segments()
     elif sub == "Team Performance":
-        from src.salesman import render as render_salesman
         render_salesman()
     elif sub == "Distribution":
-        from src.distribution import render as render_distribution
         render_distribution()
     elif sub == "Meeting Pack":
-        from src.principal import render as render_principal
         render_principal()
     else:
-        from src.operations import render as render_operations
         render_operations()
 
 elif page == "Discounts":
-    from src.discounts import render as render_discounts
     render_discounts()
 
 elif page == "Expenses":
-    from src.expenses import render as render_expenses
     render_expenses()
 
 elif page == "Debtors Ageing":
-    from src.debtors import render as render_debtors
     render_debtors()
 
 elif page == "Cash Flow":
-    from src.cashflow import render as render_cashflow
     render_cashflow()
 
 elif page == "Balance Sheet":
-    from src.balance_sheet import render as render_balance_sheet
     render_balance_sheet()
