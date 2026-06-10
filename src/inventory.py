@@ -1119,9 +1119,12 @@ def _load_principal_item_meta(company_id: str) -> pd.DataFrame:
 # optional trailing letter ("-145 N" = NEW marker) which we want to strip;
 # the spaced form must NOT consume a trailing letter because that would
 # incorrectly eat pack sizes like "650M" or "750ML".
-_MRP_DASH  = re.compile(r"\s*-\s*\d{2,5}(?:\s+[A-Z])?\s*$", re.IGNORECASE)
-_MRP_SPACE = re.compile(r"\s+\d{3,5}\s*$")
-_PAREN_RE  = re.compile(r"\s*\([^\)]+\)\s*$")
+_MRP_DASH    = re.compile(r"\s*-\s*\d{2,5}(?:\s+[A-Z])?\s*$", re.IGNORECASE)
+_MRP_SPACE   = re.compile(r"\s+\d{3,5}\s*$")
+_PAREN_RE    = re.compile(r"\s*\([^\)]+\)\s*$")
+# Trailing "NEW" / "-NEW" — added when the ERP re-codes a SKU. Strip so
+# old + new MRP variants land in the same base key.
+_NEW_SUFFIX  = re.compile(r"\s*[-\s]\s*NEW\s*$", re.IGNORECASE)
 
 
 def _normalize_sku_key(desc: str) -> str:
@@ -1145,10 +1148,31 @@ def _normalize_sku_key(desc: str) -> str:
         s = _MRP_DASH.sub("", s)
         s = _MRP_SPACE.sub("", s)
         s = _PAREN_RE.sub("", s)
+        s = _NEW_SUFFIX.sub("", s)
         s = re.sub(r"\s*-\s*$", "", s).strip()
         if s == prev:
             break
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _normalize_brand_display(brand_name: str) -> str:
+    """Clean display name for the catalog: strips '(12)' / '(Hipster)' /
+    '-NEW' / ' NEW' so 'TANQUERAY LONDON GIN(12)' and 'TANQUERAY LONDON
+    GIN-NEW' collapse to a single 'Tanqueray London Gin' card."""
+    if not isinstance(brand_name, str):
+        return ""
+    s = brand_name.strip()
+    s = _PAREN_RE.sub("", s)
+    s = _NEW_SUFFIX.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Title-case for nicer display (keep all-caps tokens like "JW" intact
+    # by only title-casing words that have at least one lower-case letter
+    # or are longer than 3 characters).
+    def _cap(w):
+        if len(w) <= 3 and w.isupper():
+            return w
+        return w[:1].upper() + w[1:].lower()
+    return " ".join(_cap(w) for w in s.split())
 
 
 def _consolidate_recodes(sku_df: pd.DataFrame,
@@ -1912,9 +1936,12 @@ def _catalog_category(cid: str, brand_name: str, mrp_bottle: float) -> str:
             return "2. Mid Prestige (McDowell's No 1)"
         return "9. Other"
     if cid == "C00040":     # Diageo
-        return ("1. Premium (MRP > ₹3,500)"
+        if "SMIRNOFF" in b:
+            return "1. Smirnoff (India-made / BII)"
+        # Everything else is BIO (Bottled-In-Origin / imported)
+        return ("2. BIO Premium (MRP > ₹3,500)"
                 if (mrp_bottle or 0) > 3500
-                else "2. Standard (MRP ≤ ₹3,500)")
+                else "3. BIO Standard (MRP ≤ ₹3,500)")
     if cid == "C00056":     # Brown-Forman
         return "1. Premium"
     return "9. Other"
@@ -1979,8 +2006,8 @@ def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
         ws["A2"].alignment = Alignment(horizontal="center")
         ws.row_dimensions[2].height = 22
 
-        # Column headers
-        hdr = ["SKU", "Pack", "Bottles / Case",
+        # Column headers — no separate SKU column; Brand + Pack identifies.
+        hdr = ["Brand", "Pack", "Bottles / Case",
                "MRP / Case (₹)", "MRP / Bottle (₹)",
                "Sales Rate / Case (₹)", "Sales Rate / Bottle (₹)"]
         ncols = len(hdr)
@@ -2012,22 +2039,16 @@ def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
             cc.border = border
             ws.row_dimensions[r].height = 22
             r += 1
-            for brand, brand_df in cat_df.groupby("BrandName"):
-                # Brand band — soft amber
-                ws.merge_cells(start_row=r, start_column=1,
-                               end_row=r, end_column=ncols)
-                bc = ws.cell(row=r, column=1, value=brand)
-                bc.font = Font(name="Arial", size=11, bold=True,
-                               color="1B1B1B")
-                bc.fill = brand_fill
-                bc.alignment = Alignment(horizontal="left", vertical="center",
-                                         indent=2)
-                bc.border = border
-                r += 1
-                for _, row in brand_df.sort_values("MrpCase", ascending=False) \
-                                      .iterrows():
+            for brand, brand_df in cat_df.groupby("BrandDisplay"):
+                # Vertically merge the Brand cell across all of this brand's
+                # pack rows so the brand name shows ONCE per group, packs
+                # listed underneath — same shape as the manual KW Rates sheet.
+                pack_rows = brand_df.sort_values("MrpCase", ascending=False)
+                first_r = r
+                for _, row in pack_rows.iterrows():
                     vals = [
-                        row.get("ItemDescription", ""),
+                        brand,    # Brand name (only the first row's cell is visible
+                                  # after the vertical merge below)
                         _format_pack(row),
                         int(row.get("BottlesPerCase", 0) or 0),
                         float(row.get("MrpCase",    0) or 0),
@@ -2039,16 +2060,31 @@ def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
                         c = ws.cell(row=r, column=ci, value=v)
                         c.font = Font(name="Arial", size=10)
                         c.border = border
-                        if ci == 3:
+                        if ci == 1:
+                            c.fill = brand_fill
+                            c.font = Font(name="Arial", size=10, bold=True)
+                            c.alignment = Alignment(horizontal="left",
+                                                    vertical="center",
+                                                    indent=1, wrap_text=True)
+                        elif ci == 3:
                             c.number_format = "#,##0"
                             c.alignment = Alignment(horizontal="center")
                         elif ci >= 4:
                             c.number_format = "#,##0"
                             c.alignment = Alignment(horizontal="right")
                     r += 1
+                # Merge Brand cell vertically across this brand's packs
+                if r - first_r > 1:
+                    ws.merge_cells(start_row=first_r, end_row=r - 1,
+                                   start_column=1, end_column=1)
+                    # Re-apply alignment to the merged top-left cell
+                    bc = ws.cell(row=first_r, column=1)
+                    bc.alignment = Alignment(horizontal="left",
+                                             vertical="center",
+                                             indent=1, wrap_text=True)
 
-        # Column widths
-        widths = [40, 16, 11, 16, 16, 18, 18]
+        # Column widths — no SKU column anymore
+        widths = [32, 18, 11, 16, 16, 18, 18]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "A5"
@@ -2119,6 +2155,8 @@ def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
 
     # Principal name + filter
     cat["Principal"] = cat["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
+    # Brand display: collapse "Tanqueray London Gin(12)" + "...-NEW" → one
+    cat["BrandDisplay"] = cat["BrandName"].apply(_normalize_brand_display)
     # Category classifier (owner-defined groupings — see _catalog_category)
     cat["Category"] = cat.apply(
         lambda r: _catalog_category(r["CompanyID"], r["BrandName"],
@@ -2151,29 +2189,28 @@ def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
 
     st.divider()
 
-    # On-screen display: per principal → per category → per brand
+    # On-screen display: per principal → per category → per brand (display)
     for prin in sorted(cat["Principal"].unique()):
         prin_df = cat[cat["Principal"] == prin]
-        st.markdown(f"### {prin}  ·  {len(prin_df)} SKUs across "
-                    f"{prin_df['BrandName'].nunique()} brands")
+        n_brands = prin_df["BrandDisplay"].nunique()
+        st.markdown(f"### {prin}  ·  {len(prin_df)} SKUs · {n_brands} brands")
         for category in sorted(prin_df["Category"].unique()):
             cat_df = prin_df[prin_df["Category"] == category]
             st.markdown(f"##### {_strip_category_prefix(category)}  "
                         f"<span style='color:#888;font-weight:normal'>"
                         f"· {len(cat_df)} SKUs</span>",
                         unsafe_allow_html=True)
-            for brand in sorted(cat_df["BrandName"].unique()):
-                brand_df = cat_df[cat_df["BrandName"] == brand]
-                with st.expander(f"**{brand}**  ·  {len(brand_df)} SKU"
+            for brand in sorted(cat_df["BrandDisplay"].unique()):
+                brand_df = cat_df[cat_df["BrandDisplay"] == brand]
+                with st.expander(f"**{brand}**  ·  {len(brand_df)} pack"
                                  f"{'s' if len(brand_df) != 1 else ''}",
                                  expanded=False):
                     disp = brand_df.copy()
                     disp["Pack"] = disp.apply(_format_pack, axis=1)
-                    show = (disp[["ItemDescription", "Pack", "BottlesPerCase",
+                    show = (disp[["Pack", "BottlesPerCase",
                                   "MrpCase", "MrpBottle",
                                   "SaleCase", "SaleBottle"]]
                             .rename(columns={
-                                "ItemDescription":  "SKU",
                                 "BottlesPerCase":   "Bottles / Case",
                                 "MrpCase":          "MRP / Case (₹)",
                                 "MrpBottle":        "MRP / Bottle (₹)",
