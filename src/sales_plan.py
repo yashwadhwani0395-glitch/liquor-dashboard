@@ -2448,9 +2448,24 @@ def render() -> None:
 
     # Outlet history for this principal — 13 months back so we have
     # 12 prior months + current for L12M / same-month-LY / best month.
-    hist = _load_outlet_history(cid,
-                                _month_bounds(op_month_date)[1],
-                                months_back=13)
+    # Wrap in an error boundary so a transient DB drop (despite run_query's
+    # retries) shows a clean panel instead of a raw pymssql traceback.
+    try:
+        hist = _load_outlet_history(cid,
+                                    _month_bounds(op_month_date)[1],
+                                    months_back=13)
+    except Exception as exc:
+        st.error(
+            "⚠️ **The database connection dropped while loading outlet "
+            "history.**\n\n"
+            "This is usually transient. Click **🔄 Refresh** at the "
+            "top-right (or hit Ctrl+Shift+R) to retry. If it keeps "
+            "happening the SQL Server may be under stress — try again "
+            "in a minute.\n\n"
+            f"_Technical details: `{type(exc).__name__}: "
+            f"{str(exc)[:200]}`_"
+        )
+        st.stop()
 
     # Smart-target tuning config (with persistence)
     tgt_cfg = load_target_config()

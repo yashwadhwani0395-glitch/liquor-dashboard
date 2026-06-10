@@ -2059,12 +2059,25 @@ def render() -> None:
         st.caption("⚠️ No S&S baseline found — showing MsItemBatchOpening "
                    "(may not match the ERP Stock & Sale report).")
 
-    # Reconciliation period (defaults to FY start through as_of)
-    with st.spinner("Loading stock + movement data…"):
-        stock_df    = _build_stock_df(as_of_date)
-        origin_df   = _load_item_origin()
-        vel_30      = _load_sales_velocity(as_of_date, days_back=30, keg_aware=keg_aware)
-        vel_90      = _load_sales_velocity(as_of_date, days_back=90, keg_aware=keg_aware)
+    # Reconciliation period (defaults to FY start through as_of).
+    # Wrap the heavy loaders in an error boundary so a transient DB drop
+    # (rare after the run_query retry tuning) shows a clean message + retry
+    # hint instead of a raw pymssql traceback.
+    try:
+        with st.spinner("Loading stock + movement data…"):
+            stock_df    = _build_stock_df(as_of_date)
+            origin_df   = _load_item_origin()
+            vel_30      = _load_sales_velocity(as_of_date, days_back=30, keg_aware=keg_aware)
+            vel_90      = _load_sales_velocity(as_of_date, days_back=90, keg_aware=keg_aware)
+    except Exception as exc:
+        st.error(
+            "⚠️ **The database connection dropped while loading stock data.**\n\n"
+            "This is usually transient. Click **🔄 Refresh** at the top-right "
+            "of the page (or hit Ctrl+Shift+R) to retry. If it keeps happening, "
+            "the SQL Server may be under stress — try again in a minute.\n\n"
+            f"_Technical details: `{type(exc).__name__}: {str(exc)[:200]}`_"
+        )
+        st.stop()
 
     if stock_df.empty:
         st.error("No stock data returned."); return
