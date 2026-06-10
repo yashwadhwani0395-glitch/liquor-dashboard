@@ -28,6 +28,23 @@ PARTY_TARGETS_FILE       = _DATA_DIR / "party_targets.json"        # manual per-
 SALESMAN_OVERRIDES_FILE  = _DATA_DIR / "salesman_overrides.json"   # manual salesman case targets
 TARGET_CONFIG_FILE       = _DATA_DIR / "target_config.json"        # smart-target params
 BRAND_TARGETS_FILE       = _DATA_DIR / "brand_targets.json"        # principal × month × {brand: cases}
+PRIMARY_PLAN_FILE        = _DATA_DIR / "primary_plan.json"         # principal × month × {total + method}
+
+
+def load_primary_plan(company_id: str, month_str: str) -> dict | None:
+    """Return {'total': float, 'method': str, 'updated_at': str} or None."""
+    return _read_json(PRIMARY_PLAN_FILE).get(f"{company_id}__{month_str}")
+
+
+def save_primary_plan(company_id: str, month_str: str,
+                      total: float, method: str = "") -> None:
+    data = _read_json(PRIMARY_PLAN_FILE)
+    data[f"{company_id}__{month_str}"] = {
+        "total":      float(total),
+        "method":     method,
+        "updated_at": date.today().isoformat(),
+    }
+    _write_json(PRIMARY_PLAN_FILE, data)
 
 
 def load_targets() -> dict[str, dict[str, Any]]:

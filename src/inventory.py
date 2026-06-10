@@ -1073,27 +1073,33 @@ def _load_principal_item_meta(company_id: str) -> pd.DataFrame:
     """Per-ItemID metadata for the principal: BottlesPerCase + MrpCaseRate +
     LastPurchase date. Drives the MRP-recode consolidation in Build mode —
     we need MrpCaseRate to pick the 'current' (highest-MRP) item in each
-    consolidated group, and LastPurchase as a tie-breaker."""
+    consolidated group, and LastPurchase as a tie-breaker.
+
+    Performance: LastPurchase is computed via a correlated subquery scoped
+    to the last 24 months. The earlier all-history LEFT JOIN to TrVocItem
+    + TrVocHead was pulling tens of millions of rows for principals with
+    deep history and could time out on Streamlit Cloud."""
     type_ph = ",".join(str(t) for t in PURCHASE_TYPES)
     df = run_query(f"""
         SELECT im.ItemID,
-               ISNULL(im.ItemDescription, im.ItemID)        AS ItemDescription,
+               ISNULL(im.ItemDescription, im.ItemID)    AS ItemDescription,
                b.BrandName,
                im.BottlesPerCase,
-               CAST(ISNULL(im.MrpCaseRate, 0) AS float)     AS MrpCaseRate,
-               MAX(CASE WHEN h.TransTypeID IN ({type_ph})
-                          AND h.Cancelled = 'N'
-                        THEN h.VoucherDate END)             AS LastPurchase
+               CAST(ISNULL(im.MrpCaseRate, 0) AS float) AS MrpCaseRate,
+               (SELECT MAX(h.VoucherDate)
+                  FROM TrVocItem vi
+                  JOIN TrVocHead h
+                    ON  h.TransTypeID  = vi.TransTypeID
+                    AND h.VoucherNo    = vi.VoucherNo
+                    AND h.FinancialYear = vi.FinancialYear
+                 WHERE vi.ItemID = im.ItemID
+                   AND h.TransTypeID IN ({type_ph})
+                   AND h.Cancelled = 'N'
+                   AND h.VoucherDate >= DATEADD(MONTH, -24, GETDATE())
+               ) AS LastPurchase
         FROM MsItemMaster im
         JOIN MsBrandMaster b ON b.BrandID = im.BrandID
-        LEFT JOIN TrVocItem vi ON vi.ItemID = im.ItemID
-        LEFT JOIN TrVocHead h
-            ON  h.TransTypeID  = vi.TransTypeID
-            AND h.VoucherNo    = vi.VoucherNo
-            AND h.FinancialYear = vi.FinancialYear
         WHERE b.CompanyID = ? AND im.ItemID LIKE 'I%'
-        GROUP BY im.ItemID, im.ItemDescription, b.BrandName,
-                 im.BottlesPerCase, im.MrpCaseRate
     """, (company_id,))
     if not df.empty:
         df["BottlesPerCase"] = pd.to_numeric(df["BottlesPerCase"], errors="coerce") \
@@ -1511,6 +1517,7 @@ def _mode_analyze(stock_df: pd.DataFrame, cid: str, today: date) -> None:
 # ── Mode B: Build OUR plan from a total target ─────────────────────────────
 def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
                 principal_name: str) -> None:
+    from src.targets import load_primary_plan, save_primary_plan
     st.markdown("##### 📝 Build our primary plan — total target → per-brand split")
     st.caption(
         "Enter the total cases you're planning to order. We allocate it "
@@ -1520,11 +1527,26 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
         "Received MTD**, so it reflects the balance of the planned order "
         "that still has to come from the company."
     )
+
+    # Persist the total per (principal, month) so it survives reloads.
+    month_str = f"{today.year:04d}-{today.month:02d}"
+    saved = load_primary_plan(cid, month_str)
+    default_total = float(saved["total"]) if saved else 0.0
+
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         total = st.number_input(
-            "Total target (cases)", min_value=0.0, value=0.0, step=100.0,
-            key=f"pp_build_total_{cid}")
+            "Total target (cases)", min_value=0.0, value=default_total,
+            step=100.0, key=f"pp_build_total_{cid}_{month_str}")
+        # Save when the value changes
+        if total > 0 and abs(total - default_total) > 0.001:
+            save_primary_plan(cid, month_str, total)
+            st.caption(f"💾 Saved {total:,.0f} cs for {principal_name} "
+                       f"({month_str}). Persists across reloads until you "
+                       f"change it.")
+        elif saved:
+            st.caption(f"💾 Loaded saved target of {default_total:,.0f} cs "
+                       f"(set on {saved.get('updated_at','?')}).")
     with c2:
         method = st.radio(
             "Distribution basis",
@@ -1647,28 +1669,36 @@ def _mode_build(stock_df: pd.DataFrame, cid: str, today: date,
              "shows '(rolled up N MRP variants)'.\n"
              "OFF → show every ItemID separately (raw view).")
 
-    sku = _sku_summary(cid, today, stock_df)
-    if sku.empty:
-        st.info("No SKU history available for this principal.")
+    try:
+        sku = _sku_summary(cid, today, stock_df)
+        if sku.empty:
+            st.info("No SKU history available for this principal.")
+            return
+
+        # Per-SKU Received MTD — load before consolidation so the rollup includes it
+        rec_sku_df = _load_principal_received_mtd(cid, today)
+        rec_by_item = (dict(zip(rec_sku_df["ItemID"], rec_sku_df["Cases"]))
+                       if not rec_sku_df.empty else {})
+        sku["Received MTD"] = sku["ItemID"].map(rec_by_item).fillna(0.0)
+
+        # MRP-recode consolidation (BEFORE allocation, so shares use the
+        # combined L3M of all variants)
+        if consolidate:
+            meta = _load_principal_item_meta(cid)
+            before_n = len(sku)
+            sku = _consolidate_recodes(sku, meta)
+            after_n = len(sku)
+            if before_n != after_n:
+                st.caption(
+                    f"🔁 Consolidated {before_n - after_n} MRP re-coded SKUs "
+                    f"into their current variants ({before_n} → {after_n} rows).")
+    except Exception as exc:
+        st.error(
+            "⚠️ **Could not load SKU breakdown** — the SQL Server likely "
+            "dropped the connection. Click 🔄 Refresh at the top-right (or "
+            "Ctrl+Shift+R) to retry.\n\n"
+            f"_Technical: `{type(exc).__name__}: {str(exc)[:200]}`_")
         return
-
-    # Per-SKU Received MTD — load before consolidation so the rollup includes it
-    rec_sku_df = _load_principal_received_mtd(cid, today)
-    rec_by_item = (dict(zip(rec_sku_df["ItemID"], rec_sku_df["Cases"]))
-                   if not rec_sku_df.empty else {})
-    sku["Received MTD"] = sku["ItemID"].map(rec_by_item).fillna(0.0)
-
-    # MRP-recode consolidation (BEFORE allocation, so shares use the
-    # combined L3M of all variants)
-    if consolidate:
-        meta = _load_principal_item_meta(cid)
-        before_n = len(sku)
-        sku = _consolidate_recodes(sku, meta)
-        after_n = len(sku)
-        if before_n != after_n:
-            st.caption(
-                f"🔁 Consolidated {before_n - after_n} MRP re-coded SKUs "
-                f"into their current variants ({before_n} → {after_n} rows).")
 
     # Map brand → allocated cases
     brand_alloc = dict(zip(out["BrandName"], out["Allocated"]))
