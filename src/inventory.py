@@ -1111,26 +1111,44 @@ def _load_principal_item_meta(company_id: str) -> pd.DataFrame:
 
 
 # Regexes for the SKU-base-key extraction (MRP-recode consolidation).
-#   _MRP_RE   strips trailing "-NNN" or "-NNN X" (MRP + optional version letter)
-#   _PAREN_RE strips trailing "(K)", "(Hipster)", "(6)" variant markers
-_MRP_RE   = re.compile(r"\s*-\s*\d{2,4}\s*[A-Z]?\s*$", re.IGNORECASE)
-_PAREN_RE = re.compile(r"\s*\([^\)]+\)\s*$")
+#   _MRP_DASH  strips "-NNN" / "-NNN X" (dash-separated MRP + optional 'N' tag)
+#   _MRP_SPACE strips " NNN" (space-separated MRP, e.g. "QT (12) 5150")
+#   _PAREN_RE  strips trailing "(K)", "(Hipster)", "(12)" variant markers
+#
+# The two MRP regexes are intentionally split: the dashed form allows an
+# optional trailing letter ("-145 N" = NEW marker) which we want to strip;
+# the spaced form must NOT consume a trailing letter because that would
+# incorrectly eat pack sizes like "650M" or "750ML".
+_MRP_DASH  = re.compile(r"\s*-\s*\d{2,5}(?:\s+[A-Z])?\s*$", re.IGNORECASE)
+_MRP_SPACE = re.compile(r"\s+\d{3,5}\s*$")
+_PAREN_RE  = re.compile(r"\s*\([^\)]+\)\s*$")
 
 
 def _normalize_sku_key(desc: str) -> str:
     """Return a base key by stripping the trailing MRP token + parenthesised
     variant marker. Re-codes that differ ONLY in MRP collapse to the same
-    key. Daman variants ('-D119' style) survive — the regex requires the
-    digits to come right after the dash, so '-D119' is not stripped."""
+    key.
+
+    Loops up to 3 times because some descriptions interleave the MRP and a
+    paren, e.g. "CIROC VODKA QT (12)-4860" → strip "-4860" → "CIROC VODKA
+    QT (12)" → strip "(12)" → "CIROC VODKA QT".
+
+    Daman variants ("-D119" style) survive — the dash regex requires DIGITS
+    immediately after the dash, so "-D119" is not stripped. Pack sizes
+    like "650ML" / "750M" survive — the space-separated MRP regex only
+    matches trailing digits with no following letter."""
     if not isinstance(desc, str):
         return ""
     s = re.sub(r"\s+", " ", desc.upper().strip())
-    s = _PAREN_RE.sub("", s)
-    s = _MRP_RE.sub("", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    # Trim trailing dash if the MRP was stripped without a leading separator
-    s = re.sub(r"\s*-\s*$", "", s).strip()
-    return s
+    for _ in range(3):
+        prev = s
+        s = _MRP_DASH.sub("", s)
+        s = _MRP_SPACE.sub("", s)
+        s = _PAREN_RE.sub("", s)
+        s = re.sub(r"\s*-\s*$", "", s).strip()
+        if s == prev:
+            break
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _consolidate_recodes(sku_df: pd.DataFrame,
@@ -1870,6 +1888,43 @@ def _consolidate_catalog_recodes(cat: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_base", "_group", "_lp"])
 
 
+# ── Category classifier for the catalog ─────────────────────────────────
+# Owner-defined order: numeric prefix sorts the bands in the right sequence,
+# and the prefix is stripped before display so the user sees clean names.
+def _catalog_category(cid: str, brand_name: str, mrp_bottle: float) -> str:
+    b = (brand_name or "").upper()
+    if cid == "C00039":     # United Breweries
+        if "CANNON" in b or "LONDON PIL" in b:
+            return "1. Economy"
+        if "ULTRA MAX" in b:
+            return "5. Ultra Max"
+        if "ULTRA" in b:
+            return "4. Ultra"
+        if "HEINEKEN" in b or "AMSTEL" in b:
+            return "3. Premium (Heineken / Amstel)"
+        if "KING FISHER" in b or "KINGFISHER" in b:
+            return "2. Mainstream"
+        return "9. Other"
+    if cid == "C00025":     # United Spirits
+        if "SIGNATURE" in b or "ANTIQUITY" in b:
+            return "1. Upper Prestige"
+        if "MCDOWELL" in b:
+            return "2. Mid Prestige (McDowell's No 1)"
+        return "9. Other"
+    if cid == "C00040":     # Diageo
+        return ("1. Premium (MRP > ₹3,500)"
+                if (mrp_bottle or 0) > 3500
+                else "2. Standard (MRP ≤ ₹3,500)")
+    if cid == "C00056":     # Brown-Forman
+        return "1. Premium"
+    return "9. Other"
+
+
+def _strip_category_prefix(cat: str) -> str:
+    """'1. Economy' → 'Economy' — drops the sort-prefix for display."""
+    return re.sub(r"^\d+\.\s*", "", cat or "")
+
+
 def _format_pack(row: pd.Series) -> str:
     """'12 × 650 ML' style pack label."""
     size = str(row.get("LiquorSize", "") or "").strip()
@@ -1900,8 +1955,12 @@ def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
 
     thin = Side(border_style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_fill = PatternFill(start_color="1B4F72", end_color="1B4F72", fill_type="solid")
-    brand_fill  = PatternFill(start_color="E8A838", end_color="E8A838", fill_type="solid")
+    header_fill   = PatternFill(start_color="1B4F72", end_color="1B4F72",
+                                fill_type="solid")
+    category_fill = PatternFill(start_color="1B4F72", end_color="1B4F72",
+                                fill_type="solid")   # navy band for categories
+    brand_fill    = PatternFill(start_color="FAE6BA", end_color="FAE6BA",
+                                fill_type="solid")   # soft amber for brands
 
     today_str = _date.today().strftime("%d %b %Y")
 
@@ -1939,39 +1998,54 @@ def _build_catalog_xlsx(cat: pd.DataFrame) -> bytes:
         ws.row_dimensions[4].height = 32
 
         r = 5
-        for brand, brand_df in prin_df.groupby("BrandName"):
-            # Brand band
+        for category in sorted(prin_df["Category"].unique()):
+            cat_df = prin_df[prin_df["Category"] == category]
+            # Category band — full-width navy header
             ws.merge_cells(start_row=r, start_column=1,
                            end_row=r, end_column=ncols)
-            bc = ws.cell(row=r, column=1, value=brand)
-            bc.font = Font(name="Arial", size=11, bold=True, color="1B1B1B")
-            bc.fill = brand_fill
-            bc.alignment = Alignment(horizontal="left", vertical="center",
+            cc = ws.cell(row=r, column=1,
+                         value=_strip_category_prefix(category))
+            cc.font = Font(name="Arial", size=12, bold=True, color="FFFFFF")
+            cc.fill = category_fill
+            cc.alignment = Alignment(horizontal="left", vertical="center",
                                      indent=1)
-            bc.border = border
+            cc.border = border
+            ws.row_dimensions[r].height = 22
             r += 1
-            for _, row in brand_df.sort_values("MrpCase", ascending=False) \
-                                  .iterrows():
-                vals = [
-                    row.get("ItemDescription", ""),
-                    _format_pack(row),
-                    int(row.get("BottlesPerCase", 0) or 0),
-                    float(row.get("MrpCase",    0) or 0),
-                    float(row.get("MrpBottle",  0) or 0),
-                    float(row.get("SaleCase",   0) or 0),
-                    float(row.get("SaleBottle", 0) or 0),
-                ]
-                for ci, v in enumerate(vals, 1):
-                    c = ws.cell(row=r, column=ci, value=v)
-                    c.font = Font(name="Arial", size=10)
-                    c.border = border
-                    if ci == 3:
-                        c.number_format = "#,##0"
-                        c.alignment = Alignment(horizontal="center")
-                    elif ci >= 4:
-                        c.number_format = "#,##0"
-                        c.alignment = Alignment(horizontal="right")
+            for brand, brand_df in cat_df.groupby("BrandName"):
+                # Brand band — soft amber
+                ws.merge_cells(start_row=r, start_column=1,
+                               end_row=r, end_column=ncols)
+                bc = ws.cell(row=r, column=1, value=brand)
+                bc.font = Font(name="Arial", size=11, bold=True,
+                               color="1B1B1B")
+                bc.fill = brand_fill
+                bc.alignment = Alignment(horizontal="left", vertical="center",
+                                         indent=2)
+                bc.border = border
                 r += 1
+                for _, row in brand_df.sort_values("MrpCase", ascending=False) \
+                                      .iterrows():
+                    vals = [
+                        row.get("ItemDescription", ""),
+                        _format_pack(row),
+                        int(row.get("BottlesPerCase", 0) or 0),
+                        float(row.get("MrpCase",    0) or 0),
+                        float(row.get("MrpBottle",  0) or 0),
+                        float(row.get("SaleCase",   0) or 0),
+                        float(row.get("SaleBottle", 0) or 0),
+                    ]
+                    for ci, v in enumerate(vals, 1):
+                        c = ws.cell(row=r, column=ci, value=v)
+                        c.font = Font(name="Arial", size=10)
+                        c.border = border
+                        if ci == 3:
+                            c.number_format = "#,##0"
+                            c.alignment = Alignment(horizontal="center")
+                        elif ci >= 4:
+                            c.number_format = "#,##0"
+                            c.alignment = Alignment(horizontal="right")
+                    r += 1
 
         # Column widths
         widths = [40, 16, 11, 16, 16, 18, 18]
@@ -2045,6 +2119,11 @@ def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
 
     # Principal name + filter
     cat["Principal"] = cat["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
+    # Category classifier (owner-defined groupings — see _catalog_category)
+    cat["Category"] = cat.apply(
+        lambda r: _catalog_category(r["CompanyID"], r["BrandName"],
+                                    r.get("MrpBottle", 0) or 0),
+        axis=1)
     if principal_filter != "All":
         cat = cat[cat["Principal"] == principal_filter]
     if cat.empty:
@@ -2072,38 +2151,44 @@ def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
 
     st.divider()
 
-    # On-screen display: per principal → per brand
+    # On-screen display: per principal → per category → per brand
     for prin in sorted(cat["Principal"].unique()):
         prin_df = cat[cat["Principal"] == prin]
         st.markdown(f"### {prin}  ·  {len(prin_df)} SKUs across "
                     f"{prin_df['BrandName'].nunique()} brands")
-        for brand in sorted(prin_df["BrandName"].unique()):
-            brand_df = prin_df[prin_df["BrandName"] == brand]
-            with st.expander(f"**{brand}**  ·  {len(brand_df)} SKU"
-                             f"{'s' if len(brand_df) != 1 else ''}",
-                             expanded=False):
-                disp = brand_df.copy()
-                disp["Pack"] = disp.apply(_format_pack, axis=1)
-                show = (disp[["ItemDescription", "Pack", "BottlesPerCase",
-                              "MrpCase", "MrpBottle",
-                              "SaleCase", "SaleBottle"]]
-                        .rename(columns={
-                            "ItemDescription":  "SKU",
-                            "BottlesPerCase":   "Bottles / Case",
-                            "MrpCase":          "MRP / Case (₹)",
-                            "MrpBottle":        "MRP / Bottle (₹)",
-                            "SaleCase":         "Sales Rate / Case (₹)",
-                            "SaleBottle":       "Sales Rate / Bottle (₹)"})
-                        .sort_values("MRP / Case (₹)", ascending=False))
-                st.dataframe(
-                    show.style.format({
-                        "Bottles / Case":           "{:,.0f}",
-                        "MRP / Case (₹)":           "₹{:,.0f}",
-                        "MRP / Bottle (₹)":         "₹{:,.0f}",
-                        "Sales Rate / Case (₹)":    "₹{:,.0f}",
-                        "Sales Rate / Bottle (₹)":  "₹{:,.0f}",
-                    }),
-                    use_container_width=True, hide_index=True)
+        for category in sorted(prin_df["Category"].unique()):
+            cat_df = prin_df[prin_df["Category"] == category]
+            st.markdown(f"##### {_strip_category_prefix(category)}  "
+                        f"<span style='color:#888;font-weight:normal'>"
+                        f"· {len(cat_df)} SKUs</span>",
+                        unsafe_allow_html=True)
+            for brand in sorted(cat_df["BrandName"].unique()):
+                brand_df = cat_df[cat_df["BrandName"] == brand]
+                with st.expander(f"**{brand}**  ·  {len(brand_df)} SKU"
+                                 f"{'s' if len(brand_df) != 1 else ''}",
+                                 expanded=False):
+                    disp = brand_df.copy()
+                    disp["Pack"] = disp.apply(_format_pack, axis=1)
+                    show = (disp[["ItemDescription", "Pack", "BottlesPerCase",
+                                  "MrpCase", "MrpBottle",
+                                  "SaleCase", "SaleBottle"]]
+                            .rename(columns={
+                                "ItemDescription":  "SKU",
+                                "BottlesPerCase":   "Bottles / Case",
+                                "MrpCase":          "MRP / Case (₹)",
+                                "MrpBottle":        "MRP / Bottle (₹)",
+                                "SaleCase":         "Sales Rate / Case (₹)",
+                                "SaleBottle":       "Sales Rate / Bottle (₹)"})
+                            .sort_values("MRP / Case (₹)", ascending=False))
+                    st.dataframe(
+                        show.style.format({
+                            "Bottles / Case":           "{:,.0f}",
+                            "MRP / Case (₹)":           "₹{:,.0f}",
+                            "MRP / Bottle (₹)":         "₹{:,.0f}",
+                            "Sales Rate / Case (₹)":    "₹{:,.0f}",
+                            "Sales Rate / Bottle (₹)":  "₹{:,.0f}",
+                        }),
+                        use_container_width=True, hide_index=True)
 
 
 def _section_primary_plan(stock_df: pd.DataFrame, as_of: date) -> None:
@@ -2452,7 +2537,8 @@ def render() -> None:
             "the SQL Server may be under stress — try again in a minute.\n\n"
             f"_Technical details: `{type(exc).__name__}: {str(exc)[:200]}`_"
         )
-        st.stop()
+        return    # exit render() cleanly — st.stop() would be belt-and-braces
+                  # but in tests it's a no-op which leaks past unbound locals.
 
     if stock_df.empty:
         st.error("No stock data returned."); return

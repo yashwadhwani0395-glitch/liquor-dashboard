@@ -2465,7 +2465,8 @@ def render() -> None:
             f"_Technical details: `{type(exc).__name__}: "
             f"{str(exc)[:200]}`_"
         )
-        st.stop()
+        return    # exit render() cleanly so downstream code doesn't read
+                  # an unbound `hist`
 
     # Smart-target tuning config (with persistence)
     tgt_cfg = load_target_config()
