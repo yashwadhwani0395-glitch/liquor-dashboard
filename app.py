@@ -161,8 +161,9 @@ from src.expenses     import render as render_expenses
 from src.debtors      import render as render_debtors
 from src.cashflow     import render as render_cashflow
 from src.balance_sheet import render as render_balance_sheet
+from src.nrm          import render as render_nrm
 
-_PAGES = ["Overview", "Purchase", "Sales", "Discounts",
+_PAGES = ["Overview", "Purchase", "Sales", "NRM", "Discounts",
           "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
 page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
                 label_visibility="collapsed")
@@ -203,6 +204,9 @@ elif page == "Sales":
         render_principal()
     else:
         render_operations()
+
+elif page == "NRM":
+    render_nrm()
 
 elif page == "Discounts":
     render_discounts()
