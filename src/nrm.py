@@ -164,9 +164,14 @@ def _read_sheet_auto_header(upload_bytes: bytes, sheet_name: str,
 
 
 def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
-    """Parse the raw .xlsb into the NRM grid + OVERALL SUMMARY + Brand
-    Mapping. Auto-detects header rows so we don't break when Diageo's
-    template version shifts a row."""
+    """Parse the raw .xlsb into the NRM grid + OVERALL SUMMARY + DB WISE
+    SUMMARY + Brand Mapping. Auto-detects header rows so we don't break
+    when Diageo's template version shifts a row.
+
+    DB WISE SUMMARY is the AUTHORITATIVE source for per-distributor brand
+    targets — OVERALL SUMMARY shows the manager's total across ALL their
+    distributors (which inflates Kranti's target ~6x), see comment on
+    _brand_targets_from_db_wise."""
     try:
         nrm  = _read_sheet_auto_header(
             upload_bytes, "NRM",
@@ -174,6 +179,12 @@ def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
         smry = _read_sheet_auto_header(
             upload_bytes, "OVERALL SUMMARY",
             ["MOR TGT", "BRAND"])
+        try:
+            db_wise = _read_sheet_auto_header(
+                upload_bytes, "DB WISE SUMMARY",
+                ["DISTRIBUTOR", "BRAND", "MOR TGT"])
+        except ValueError:
+            db_wise = pd.DataFrame()
         try:
             bmap = _read_sheet_auto_header(
                 upload_bytes, "Brand Mapping",
@@ -184,7 +195,7 @@ def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
         st.error(f"Failed to parse .xlsb file: "
                  f"`{type(exc).__name__}: {exc}`")
         return {}
-    return {"NRM": nrm, "SUMMARY": smry, "BRAND_MAP": bmap}
+    return {"NRM": nrm, "SUMMARY": smry, "DB_WISE": db_wise, "BRAND_MAP": bmap}
 
 
 # ── Smart allocation ─────────────────────────────────────────────────────────
@@ -239,6 +250,40 @@ def _suggest_tl_plan_1(nrm: pd.DataFrame,
 
 
 # ── Brand target extraction ────────────────────────────────────────────────
+
+def _brand_targets_from_db_wise(db_wise: pd.DataFrame,
+                                distributor: str = "KRANTI") -> dict[str, float]:
+    """Per-distributor brand targets from the DB WISE SUMMARY sheet.
+
+    AUTHORITATIVE source — unlike OVERALL SUMMARY (which sums each manager's
+    TOTAL across every distributor they cover and inflates Kranti's
+    target ~6x), DB WISE SUMMARY is one row per
+    (Distributor x Manager x Channel x Brand). Filtering to our distributor
+    name and summing across channels gives the brand's actual target for us.
+
+    Verified on Jun-26 file: gives 17,806 cs total target vs the manager's
+    actual worked TL Plan-1 of 19,344 (~92% match — the small remaining gap
+    is brands the company didn't itemise in DB WISE SUMMARY that the manager
+    pushes on his own)."""
+    if db_wise.empty:
+        return {}
+    cols = {str(c).strip().upper(): c for c in db_wise.columns}
+    dist_col  = cols.get("DISTRIBUTOR")
+    brand_col = cols.get("BRAND")
+    tgt_col   = cols.get("MOR TGT")
+    if not (dist_col and brand_col and tgt_col):
+        return {}
+    df = db_wise.copy()
+    df[dist_col]  = df[dist_col].astype(str).str.upper()
+    df = df[df[dist_col].str.contains(distributor.upper(), na=False)]
+    if df.empty:
+        return {}
+    df[brand_col] = df[brand_col].astype(str).str.strip()
+    df[tgt_col]   = pd.to_numeric(df[tgt_col], errors="coerce").fillna(0.0)
+    grouped = df.groupby(brand_col)[tgt_col].sum()
+    return {k: float(v) for k, v in grouped.items()
+            if v > 0 and k not in ("", "nan", "None")}
+
 
 def _brand_targets_from_summary(summary: pd.DataFrame) -> dict[str, float]:
     """Map BRAND → MOR TGT (cases) from the OVERALL SUMMARY sheet, summed
@@ -308,12 +353,23 @@ def render() -> None:
                 .str.contains("KRANTI", na=False)
         ].copy()
 
-    # Brand targets
-    brand_targets = _brand_targets_from_summary(summary)
+    # Brand targets — prefer DB WISE SUMMARY (per-distributor accurate);
+    # fall back to OVERALL SUMMARY only if the DB WISE sheet is missing.
+    brand_targets = _brand_targets_from_db_wise(
+        sheets.get("DB_WISE", pd.DataFrame()), distributor="KRANTI")
+    target_source = "DB WISE SUMMARY (Kranti rows)"
     if not brand_targets:
-        st.warning("Couldn't read brand-level MOR TGT from the OVERALL "
-                   "SUMMARY sheet — the auto-allocator can't constrain "
-                   "without it. Manager will need to enter TL Plan-1 manually.")
+        brand_targets = _brand_targets_from_summary(summary)
+        target_source = "OVERALL SUMMARY (fallback — may over-allocate)"
+    if not brand_targets:
+        st.warning("Couldn't read brand-level MOR TGT from either DB WISE "
+                   "SUMMARY or OVERALL SUMMARY — the auto-allocator can't "
+                   "constrain without it. Manager will need to enter TL "
+                   "Plan-1 manually.")
+    else:
+        st.caption(f"📊 Brand targets sourced from: **{target_source}** · "
+                   f"{len(brand_targets)} brands · "
+                   f"total = {sum(brand_targets.values()):,.0f} cs")
 
     # Compute suggested TL Plan-1
     nrm_raw["Suggested TL-1"] = _suggest_tl_plan_1(nrm_raw, brand_targets)
