@@ -2157,10 +2157,16 @@ def _section_brand_catalog(stock_df: pd.DataFrame) -> None:
     cat["Principal"] = cat["CompanyID"].map(_PRINCIPAL_NAMES).fillna("Other")
     # Brand display: collapse "Tanqueray London Gin(12)" + "...-NEW" → one
     cat["BrandDisplay"] = cat["BrandName"].apply(_normalize_brand_display)
+    # Anchor MRP for category classification = the brand's MAX MRP-per-bottle
+    # across all packs. That's effectively the full bottle (QRT/750ml), so
+    # Black Label 750ml, 375ml and 200ml all land in the same category as
+    # the QRT — exactly the owner's rule.
+    cat["AnchorMrpBottle"] = (
+        cat.groupby("BrandDisplay")["MrpBottle"].transform("max"))
     # Category classifier (owner-defined groupings — see _catalog_category)
     cat["Category"] = cat.apply(
         lambda r: _catalog_category(r["CompanyID"], r["BrandName"],
-                                    r.get("MrpBottle", 0) or 0),
+                                    r["AnchorMrpBottle"]),
         axis=1)
     if principal_filter != "All":
         cat = cat[cat["Principal"] == principal_filter]
