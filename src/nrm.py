@@ -543,6 +543,43 @@ def render() -> None:
             key="nrm_dl_final")
 
 
+def _strip_pivot_caches(upload_bytes: bytes) -> bytes:
+    """Strip pivot cache + pivot table parts from an .xlsx so openpyxl can
+    load it. openpyxl has a strict descriptor on
+    `openpyxl.pivot.cache.CalculatedItem.formula` that rejects None, and
+    Excel-saved files (especially ones converted from .xlsb) often contain
+    pivot caches with None formulas → load_workbook raises TypeError.
+
+    Pivot caches are auxiliary metadata — removing them does not affect any
+    visible cell value, style, conditional format, formula, chart or column
+    width. The downloaded file looks identical to Excel users."""
+    import zipfile, re
+    src = zipfile.ZipFile(BytesIO(upload_bytes), "r")
+    out = BytesIO()
+    dst = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    for info in src.infolist():
+        name = info.filename
+        if (name.startswith("xl/pivotCache/")
+                or name.startswith("xl/pivotTables/")):
+            continue
+        data = src.read(name)
+        if name == "[Content_Types].xml":
+            text = data.decode("utf-8", errors="ignore")
+            text = re.sub(
+                r'<Override[^/>]*PartName="[^"]*(pivotCache|pivotTable)[^"]*"[^/>]*/>',
+                "", text)
+            data = text.encode("utf-8")
+        elif name.endswith(".rels"):
+            text = data.decode("utf-8", errors="ignore")
+            text = re.sub(
+                r'<Relationship[^/>]*Type="[^"]*(pivotCache|pivotTable)[^"]*"[^/>]*/>',
+                "", text)
+            data = text.encode("utf-8")
+        dst.writestr(name, data)
+    dst.close(); src.close()
+    return out.getvalue()
+
+
 def _build_filled_xlsx_preserve(upload_bytes: bytes,
                                 nrm_with_edits: pd.DataFrame) -> bytes:
     """Format-preserving writer for .xlsx uploads.
@@ -564,7 +601,17 @@ def _build_filled_xlsx_preserve(upload_bytes: bytes,
         # Nothing to write — just hand the original bytes back unchanged.
         return upload_bytes
 
-    wb = load_workbook(BytesIO(upload_bytes))
+    # openpyxl can choke on Excel-generated pivot caches. Strip them on
+    # the specific TypeError and retry — pivot caches are auxiliary
+    # metadata; their removal doesn't touch any visible cell, style or
+    # formula.
+    try:
+        wb = load_workbook(BytesIO(upload_bytes))
+    except TypeError as exc:
+        if "CalculatedItem" in str(exc) or "pivot" in str(exc).lower():
+            wb = load_workbook(BytesIO(_strip_pivot_caches(upload_bytes)))
+        else:
+            raise
     if "NRM" not in wb.sheetnames:
         return upload_bytes
     ws = wb["NRM"]
