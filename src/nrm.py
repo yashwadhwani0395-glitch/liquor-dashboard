@@ -135,18 +135,54 @@ def _load_party_brand_monthly(months_back: int = 14) -> pd.DataFrame:
 
 # ── File parsing ─────────────────────────────────────────────────────────────
 
+def _read_sheet_auto_header(upload_bytes: bytes, sheet_name: str,
+                            marker_words: list[str],
+                            max_scan: int = 10) -> pd.DataFrame:
+    """Read an .xlsb sheet without trusting a hardcoded header-row index.
+    Scans the first `max_scan` rows and uses the first one containing ALL
+    of `marker_words` (case-insensitive) as the column-header row.
+
+    The raw file's headers shift between rows 1 / 2 / 3 depending on the
+    sheet, the .xlsb tooling version, and whether the cloud's pyxlsb skips
+    blank rows or not. Auto-detection is robust to all of that."""
+    bio = BytesIO(upload_bytes)
+    df  = pd.read_excel(bio, sheet_name=sheet_name, engine="pyxlsb", header=None)
+    markers_up = [m.upper() for m in marker_words]
+    for ri in range(min(max_scan, len(df))):
+        row_str = " | ".join(
+            str(v) for v in df.iloc[ri].tolist() if pd.notna(v)
+        ).upper()
+        if all(m in row_str for m in markers_up):
+            new_cols = df.iloc[ri].fillna("").astype(str).tolist()
+            body = df.iloc[ri + 1:].copy()
+            body.columns = new_cols
+            return body.reset_index(drop=True)
+    raise ValueError(
+        f"Could not find a header row in sheet {sheet_name!r} containing "
+        f"all of {marker_words!r}."
+    )
+
+
 def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
     """Parse the raw .xlsb into the NRM grid + OVERALL SUMMARY + Brand
-    Mapping. Returns dict of dataframes keyed by sheet name."""
-    bio = BytesIO(upload_bytes)
+    Mapping. Auto-detects header rows so we don't break when Diageo's
+    template version shifts a row."""
     try:
-        nrm    = pd.read_excel(bio, sheet_name="NRM",             engine="pyxlsb", header=1)
-        bio.seek(0)
-        smry   = pd.read_excel(bio, sheet_name="OVERALL SUMMARY",  engine="pyxlsb", header=2)
-        bio.seek(0)
-        bmap   = pd.read_excel(bio, sheet_name="Brand Mapping",    engine="pyxlsb", header=1)
+        nrm  = _read_sheet_auto_header(
+            upload_bytes, "NRM",
+            ["BRAND", "PARTY", "CUSTOMERID"])
+        smry = _read_sheet_auto_header(
+            upload_bytes, "OVERALL SUMMARY",
+            ["MOR TGT", "BRAND"])
+        try:
+            bmap = _read_sheet_auto_header(
+                upload_bytes, "Brand Mapping",
+                ["BRANDALIAS", "NRM BRAND"])
+        except ValueError:
+            bmap = pd.DataFrame()
     except Exception as exc:
-        st.error(f"Failed to parse .xlsb file: {type(exc).__name__}: {exc}")
+        st.error(f"Failed to parse .xlsb file: "
+                 f"`{type(exc).__name__}: {exc}`")
         return {}
     return {"NRM": nrm, "SUMMARY": smry, "BRAND_MAP": bmap}
 
@@ -206,14 +242,22 @@ def _suggest_tl_plan_1(nrm: pd.DataFrame,
 
 def _brand_targets_from_summary(summary: pd.DataFrame) -> dict[str, float]:
     """Map BRAND → MOR TGT (cases) from the OVERALL SUMMARY sheet, summed
-    across managers when a brand appears under more than one."""
-    if summary.empty or "BRAND" not in summary.columns:
+    across managers when a brand appears under more than one. Defensive
+    against whitespace / case variations in the column names."""
+    if summary.empty:
+        return {}
+    # Find the BRAND and MOR TGT columns regardless of leading/trailing spaces
+    cols = {str(c).strip().upper(): c for c in summary.columns}
+    brand_col = cols.get("BRAND")
+    tgt_col   = cols.get("MOR TGT")
+    if brand_col is None or tgt_col is None:
         return {}
     s = summary.copy()
-    s["BRAND"] = s["BRAND"].astype(str).str.strip()
-    s["MOR TGT"] = pd.to_numeric(s["MOR TGT"], errors="coerce").fillna(0.0)
-    grouped = s.groupby("BRAND")["MOR TGT"].sum()
-    return {k: float(v) for k, v in grouped.items() if v > 0}
+    s[brand_col] = s[brand_col].astype(str).str.strip()
+    s[tgt_col]   = pd.to_numeric(s[tgt_col], errors="coerce").fillna(0.0)
+    grouped = s.groupby(brand_col)[tgt_col].sum()
+    return {k: float(v) for k, v in grouped.items()
+            if v > 0 and k not in ("", "nan", "None")}
 
 
 # ── Exception-party marker ──────────────────────────────────────────────────
