@@ -202,27 +202,51 @@ def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
 
 def _suggest_tl_plan_1(nrm: pd.DataFrame,
                        brand_targets: dict[str, float]) -> pd.Series:
-    """Per row, compute a suggested TL Plan-1. Two-step:
+    """Per row, compute a suggested TL Plan-1.
+
+    Logic v2 (after comparing against the manager's hand-worked file):
       1. raw = max(L3M, LM) if brand is growing else (L3M + LM)/2,
          capped at 1.5 × LM so we never wildly over-commit.
-      2. rebalance per brand so the brand's total TL Plan-1 = MOR TGT
-         exactly.  Rows with no history get 0 (manager fills manually)."""
+      2. If Diageo's BTG (Bottom To Grow) signal is POSITIVE, use it as a
+         floor — the manager treats BTG as a non-negotiable growth ask, so
+         we mirror that.
+      3. Drop sliver rows where L3M + LM < 1 cs (no real signal — the
+         manager skips these too).
+      4. Rebalance per brand so the brand's total TL Plan-1 = MOR TGT.
+
+    Real-world overrides we DON'T try to predict (manager's external
+    knowledge): outlets shut for renovation (Rajshree Wines Kothrud),
+    just-restarted outlets with momentum (Lucky Wines), strategic pushes
+    on key accounts beyond what data suggests. Manager applies these in
+    the editable grid — should be 20-50 rows of overrides, not 2,000."""
     l3m   = pd.to_numeric(nrm.get(" Average L3M", 0), errors="coerce").fillna(0.0)
     lm    = pd.to_numeric(nrm.get("LM",            0), errors="coerce").fillna(0.0)
     lysm  = pd.to_numeric(nrm.get("LYSM",          0), errors="coerce").fillna(0.0)
     plan_gr = pd.to_numeric(nrm.get("Plan Gr %",   0), errors="coerce").fillna(0.0)
+    btg     = pd.to_numeric(nrm.get("BTG",         0), errors="coerce").fillna(0.0)
 
-    # Step 1 — raw per-row signal
+    # Step 1 — raw per-row signal, with BTG floor and sliver-row guard
     growth_threshold = 0.05
+    SLIVER_THRESHOLD = 1.0    # drop rows where L3M + LM < this
     raw = []
-    for a, b, g in zip(l3m, lm, plan_gr):
+    for a, b, g, t in zip(l3m, lm, plan_gr, btg):
+        # Skip rows with essentially no signal — manager doesn't fill these
+        if (a + b) < SLIVER_THRESHOLD and t <= 0:
+            raw.append(0.0); continue
+        # Base from L3M / LM blend
         if g > growth_threshold:
             v = max(a, b)
         else:
             v = (a + b) / 2.0
-        # Cap at 1.5 × LM unless LM is 0 (then 1.5 × L3M)
-        cap = 1.5 * (b if b > 0 else a) if (a + b) > 0 else 0
-        raw.append(min(v, cap) if cap > 0 else 0.0)
+        # BTG floor when Diageo signals a positive growth ask
+        if t > 0:
+            v = max(v, float(t))
+        # Cap at 1.5 × LM unless LM is 0 (then 1.5 × L3M); honour BTG if
+        # higher than the cap (it's an explicit growth ask from Diageo)
+        cap = 1.5 * (b if b > 0 else a)
+        if cap <= 0:
+            cap = max(float(t), 0)
+        raw.append(min(v, max(cap, float(t) if t > 0 else 0)))
     raw = pd.Series(raw, index=nrm.index)
 
     # Step 2 — rebalance per brand to hit the MOR TGT exactly
