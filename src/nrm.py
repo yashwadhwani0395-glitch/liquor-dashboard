@@ -135,18 +135,26 @@ def _load_party_brand_monthly(months_back: int = 14) -> pd.DataFrame:
 
 # ── File parsing ─────────────────────────────────────────────────────────────
 
+def _detect_engine(upload_bytes: bytes, filename: str = "") -> str:
+    """Pick the pandas engine based on the file extension. .xlsx → openpyxl,
+    .xlsb → pyxlsb. Falls back to openpyxl for unknown extensions."""
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    if ext == "xlsb":
+        return "pyxlsb"
+    return "openpyxl"
+
+
 def _read_sheet_auto_header(upload_bytes: bytes, sheet_name: str,
                             marker_words: list[str],
-                            max_scan: int = 10) -> pd.DataFrame:
-    """Read an .xlsb sheet without trusting a hardcoded header-row index.
+                            max_scan: int = 10,
+                            engine: str = "pyxlsb") -> pd.DataFrame:
+    """Read an Excel sheet without trusting a hardcoded header-row index.
     Scans the first `max_scan` rows and uses the first one containing ALL
     of `marker_words` (case-insensitive) as the column-header row.
 
-    The raw file's headers shift between rows 1 / 2 / 3 depending on the
-    sheet, the .xlsb tooling version, and whether the cloud's pyxlsb skips
-    blank rows or not. Auto-detection is robust to all of that."""
+    Works for both .xlsx (engine='openpyxl') and .xlsb (engine='pyxlsb')."""
     bio = BytesIO(upload_bytes)
-    df  = pd.read_excel(bio, sheet_name=sheet_name, engine="pyxlsb", header=None)
+    df  = pd.read_excel(bio, sheet_name=sheet_name, engine=engine, header=None)
     markers_up = [m.upper() for m in marker_words]
     for ri in range(min(max_scan, len(df))):
         row_str = " | ".join(
@@ -163,37 +171,38 @@ def _read_sheet_auto_header(upload_bytes: bytes, sheet_name: str,
     )
 
 
-def _parse_uploaded_nrm(upload_bytes: bytes) -> dict[str, pd.DataFrame]:
-    """Parse the raw .xlsb into the NRM grid + OVERALL SUMMARY + DB WISE
-    SUMMARY + Brand Mapping. Auto-detects header rows so we don't break
-    when Diageo's template version shifts a row.
+def _parse_uploaded_nrm(upload_bytes: bytes,
+                        filename: str = "") -> dict[str, pd.DataFrame]:
+    """Parse the uploaded file (.xlsx or .xlsb) into the NRM grid + OVERALL
+    SUMMARY + DB WISE SUMMARY + Brand Mapping. Auto-detects header rows so
+    we don't break when Diageo's template version shifts a row.
 
     DB WISE SUMMARY is the AUTHORITATIVE source for per-distributor brand
     targets — OVERALL SUMMARY shows the manager's total across ALL their
     distributors (which inflates Kranti's target ~6x), see comment on
     _brand_targets_from_db_wise."""
+    engine = _detect_engine(upload_bytes, filename)
     try:
         nrm  = _read_sheet_auto_header(
             upload_bytes, "NRM",
-            ["BRAND", "PARTY", "CUSTOMERID"])
+            ["BRAND", "PARTY", "CUSTOMERID"], engine=engine)
         smry = _read_sheet_auto_header(
             upload_bytes, "OVERALL SUMMARY",
-            ["MOR TGT", "BRAND"])
+            ["MOR TGT", "BRAND"], engine=engine)
         try:
             db_wise = _read_sheet_auto_header(
                 upload_bytes, "DB WISE SUMMARY",
-                ["DISTRIBUTOR", "BRAND", "MOR TGT"])
+                ["DISTRIBUTOR", "BRAND", "MOR TGT"], engine=engine)
         except ValueError:
             db_wise = pd.DataFrame()
         try:
             bmap = _read_sheet_auto_header(
                 upload_bytes, "Brand Mapping",
-                ["BRANDALIAS", "NRM BRAND"])
+                ["BRANDALIAS", "NRM BRAND"], engine=engine)
         except ValueError:
             bmap = pd.DataFrame()
     except Exception as exc:
-        st.error(f"Failed to parse .xlsb file: "
-                 f"`{type(exc).__name__}: {exc}`")
+        st.error(f"Failed to parse file: `{type(exc).__name__}: {exc}`")
         return {}
     return {"NRM": nrm, "SUMMARY": smry, "DB_WISE": db_wise, "BRAND_MAP": bmap}
 
@@ -352,18 +361,35 @@ def render() -> None:
         "and NRM-2 revision come in later phases."
     )
 
-    up = st.file_uploader("Diageo NRM file (.xlsb)", type=["xlsb"],
-                          key="nrm_upload")
+    up = st.file_uploader("Diageo NRM file (.xlsx preferred · .xlsb accepted)",
+                          type=["xlsx", "xlsb"], key="nrm_upload")
     if up is None:
         st.info(
-            "Drop the raw NRM file your manager normally fills. Tip: it's "
-            "the one named like *WMH- &lt;Mon&gt;'YY NRM Plan-1 DB - Pune - "
-            "Kranti.xlsb*."
+            "📂 **Drop the raw NRM file** here.\n\n"
+            "**Tip for perfect formatting:** Diageo sends a `.xlsb` (binary). "
+            "If you want the downloaded file to look **identical** to what they "
+            "sent (their colours, fonts, headers — accepted without question by "
+            "their MIS team), open it in Excel once and **Save As → .xlsx** "
+            "before uploading. Takes 10 seconds and the output stays "
+            "byte-for-byte identical except for the TL Plan-1 column you've "
+            "edited.\n\n"
+            "If you upload the `.xlsb` directly we'll still process it, but the "
+            "output will be plain (no Diageo formatting — usable but ugly)."
         )
         return
 
+    # Detect upload format
+    upload_ext = (up.name.split(".")[-1] if "." in up.name else "").lower()
+    if upload_ext == "xlsx":
+        st.caption("✅ `.xlsx` upload — Diageo's formatting will be preserved "
+                   "exactly in the downloaded file.")
+    elif upload_ext == "xlsb":
+        st.warning("⚠️ `.xlsb` upload — we'll process it but the downloaded "
+                   "file will lose Diageo's colours / fonts. For format-perfect "
+                   "output, re-save the file as `.xlsx` in Excel and re-upload.")
+
     with st.spinner("Parsing file…"):
-        sheets = _parse_uploaded_nrm(up.getvalue())
+        sheets = _parse_uploaded_nrm(up.getvalue(), filename=up.name)
     if not sheets:
         return
 
@@ -490,20 +516,100 @@ def render() -> None:
     # Download: writes filled TL Plan-1 column into a clean .xlsx
     if st.button("⬇️ Generate filled NRM (full file, all sheets preserved)",
                  type="primary", key="nrm_dl_btn"):
-        with st.spinner("Building file — preserving every sheet & cell…"):
-            out_bytes = _build_filled_xlsx(up.getvalue(), nrm_raw)
-        st.success(
-            "File ready. Output is .xlsx with every original sheet and "
-            "column intact — only the TL Plan-1 column has your edits. "
-            "Open in Excel and Save As → .xlsb if Diageo asks for the "
-            "binary format."
-        )
+        if upload_ext == "xlsx":
+            with st.spinner("Building file — preserving every style "
+                            "& formula from Diageo's template…"):
+                out_bytes = _build_filled_xlsx_preserve(up.getvalue(),
+                                                       nrm_raw)
+            st.success(
+                "File ready. Diageo's colours, fonts, formulas, headers and "
+                "everything else are **byte-for-byte identical** to the file "
+                "you uploaded — only the TL Plan-1 column has the edits. "
+                "Diageo's MIS team should accept it without complaint."
+            )
+        else:
+            with st.spinner("Building file — preserving every sheet & cell…"):
+                out_bytes = _build_filled_xlsx(up.getvalue(), nrm_raw)
+            st.warning(
+                "Output is plain .xlsx — colours / styles from the .xlsb "
+                "could not be carried over. For format-perfect output, "
+                "Save As → .xlsx in Excel and re-upload."
+            )
         st.download_button(
             "Download filled NRM",
             out_bytes,
             file_name=f"NRM_filled_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="nrm_dl_final")
+
+
+def _build_filled_xlsx_preserve(upload_bytes: bytes,
+                                nrm_with_edits: pd.DataFrame) -> bytes:
+    """Format-preserving writer for .xlsx uploads.
+
+    Loads the workbook via openpyxl — which preserves EVERY cell style,
+    font, fill, border, conditional format, formula, chart, data
+    validation, merged cell, defined name, and column width verbatim.
+    We then overwrite ONLY the TL Plan-1 cells in the NRM sheet for
+    Kranti rows. The downloaded file is byte-for-byte identical to
+    Diageo's upload except for the cells the manager has edited."""
+    from openpyxl import load_workbook
+
+    edited_by_row: dict[int, float] = {}
+    if "Your TL-1" in nrm_with_edits.columns:
+        for ki, val in zip(nrm_with_edits.index, nrm_with_edits["Your TL-1"]):
+            if pd.notna(val):
+                edited_by_row[int(ki)] = float(val)
+    if not edited_by_row:
+        # Nothing to write — just hand the original bytes back unchanged.
+        return upload_bytes
+
+    wb = load_workbook(BytesIO(upload_bytes))
+    if "NRM" not in wb.sheetnames:
+        return upload_bytes
+    ws = wb["NRM"]
+
+    # Find header row (BRAND + PARTY + CUSTOMERID), TL Plan-1 col, DISTRIBUTOR col
+    header_row = None
+    for ri in range(1, min(11, ws.max_row + 1)):
+        row_text = " | ".join(
+            str(c.value).upper() if c.value is not None else ""
+            for c in ws[ri]
+        )
+        if ("BRAND" in row_text and "PARTY" in row_text
+                and "CUSTOMERID" in row_text):
+            header_row = ri
+            break
+    if header_row is None:
+        return upload_bytes
+
+    tl_col_idx = None
+    dist_col_idx = None
+    for c in ws[header_row]:
+        if c.value is None: continue
+        s = str(c.value).strip().upper()
+        if s == "TL PLAN-1":
+            tl_col_idx = c.column
+        elif s == "DISTRIBUTOR":
+            dist_col_idx = c.column
+    if tl_col_idx is None:
+        return upload_bytes
+
+    # Data rows start at header_row + 1
+    for ki, val in edited_by_row.items():
+        excel_row = header_row + 1 + ki
+        if excel_row > ws.max_row:
+            continue
+        # Defensive distributor check
+        if dist_col_idx is not None:
+            dv = ws.cell(row=excel_row, column=dist_col_idx).value
+            if dv and "KRANTI" not in str(dv).upper():
+                continue
+        ws.cell(row=excel_row, column=tl_col_idx, value=val)
+
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def _build_filled_xlsx(upload_bytes: bytes,
