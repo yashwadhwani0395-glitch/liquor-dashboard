@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 import io
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -667,6 +668,244 @@ def _render_export(salesman_df: pd.DataFrame,
 # MAIN RENDER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# YTD performance (July → June FY for USL / Diageo)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fy_jul_jun_bounds(today: date) -> tuple[date, date, date]:
+    """USL / Diageo financial year starts 1 July.
+    Returns (cur_fy_start, lytd_fy_start, lytd_today)."""
+    if today.month >= 7:
+        cur_fy_start = date(today.year, 7, 1)
+    else:
+        cur_fy_start = date(today.year - 1, 7, 1)
+    lytd_fy_start = date(cur_fy_start.year - 1, 7, 1)
+    try:
+        lytd_today = date(today.year - 1, today.month, today.day)
+    except ValueError:
+        # Feb 29 last year → Feb 28
+        lytd_today = date(today.year - 1, today.month, 28)
+    return cur_fy_start, lytd_fy_start, lytd_today
+
+
+def _normalize_size(s: str) -> str:
+    """'650 ML' / '650ML' / '650' → '650ML' for clean size groupings."""
+    if not isinstance(s, str):
+        return "Other"
+    s = re.sub(r"\s+", "", s.upper().strip())
+    if not s:
+        return "Other"
+    if s.isdigit():
+        return f"{s}ML"
+    return s
+
+
+def _channel_for_principal(cid: str, ac3: str, cls: str) -> str:
+    """Mirror src/segments._channel_for so the YTD channel split matches
+    the Sales Plan & Segment Analysis pages exactly."""
+    ac3 = (ac3 or "").strip()
+    cls = (cls or "").strip()
+    if cid == "C00039":                       # United Breweries — Type III
+        return {
+            "130001": "KW Beer", "130004": "KW Institution",
+            "130006": "KW Institution", "130002": "PCMC Institution",
+            "130007": "Cross Supply",
+        }.get(ac3, "Other")
+    if cid == "C00056" and ac3 == "130004":   # BF KW Institution
+        return "KW Institution"
+    return {                                  # USL / Diageo / BF retail — Class
+        "060021": "MOP", "060004": "POP",
+        "060020": "Retail", "060022": "One Day",
+    }.get(cls, "Other")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_ytd_brand_size_channel(company_id: str,
+                                 months_back: int = 27) -> pd.DataFrame:
+    """Per (BrandName, LiquorSize, ClassID, AcType3ID, yyyy-MM) cases for
+    one principal. 27-month look-back covers current YTD + last YTD with
+    a small buffer. Uses the same MIS-consistent basis as the rest of the
+    dashboard (keg-aware cases, FY-dedup, free goods included)."""
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            b.BrandName,
+            ISNULL(im.LiquorSize, '')        AS LiquorSize,
+            ISNULL(p.ClassID,    '')         AS ClassID,
+            ISNULL(p.AcType3ID,  '')         AS AcType3ID,
+            FORMAT(h.VoucherDate, 'yyyy-MM') AS Mon,
+            SUM({_CASES})                    AS Cases
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID AND vi.VoucherNo = h.VoucherNo
+            AND vi.ItemID LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)+'-'+CAST(YEAR(h.VoucherDate) AS VARCHAR)
+              END
+        JOIN MsItemMaster  im ON im.ItemID  = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID  = im.BrandID
+        JOIN (
+            SELECT TransTypeID, VoucherNo, FinancialYear, PartyID FROM (
+                SELECT TransTypeID, VoucherNo, FinancialYear, PartyID,
+                       ROW_NUMBER() OVER (PARTITION BY TransTypeID, VoucherNo, FinancialYear
+                                          ORDER BY id_key DESC) rn
+                FROM TrVocDetail
+                WHERE PartyID LIKE 'D%' AND DrCrIndicator = 'D'
+            ) x WHERE rn = 1
+        ) d ON d.TransTypeID = h.TransTypeID AND d.VoucherNo = h.VoucherNo
+           AND d.FinancialYear = h.FinancialYear
+        JOIN MsPartyMaster p ON p.PartyID = d.PartyID
+        WHERE b.CompanyID = ?
+          AND h.TransTypeID IN ({type_ph}) AND h.Cancelled = 'N'
+          AND h.VoucherDate >= DATEADD(MONTH, -{months_back}, GETDATE())
+        GROUP BY b.BrandName, im.LiquorSize, p.ClassID, p.AcType3ID,
+                 FORMAT(h.VoucherDate, 'yyyy-MM')
+    """
+    df = run_query(sql, (company_id,))
+    if not df.empty:
+        df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    return df
+
+
+def _growth_color(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if v >= 10:  return "color:#16a34a;font-weight:700"
+    if v >= 0:   return "color:#16a34a;font-weight:600"
+    if v >= -10: return "color:#b45309;font-weight:600"
+    return "color:#dc2626;font-weight:700"
+
+
+def _build_compare_table(ytd_cases: pd.Series,
+                         lytd_cases: pd.Series,
+                         name_col: str) -> pd.DataFrame:
+    """Combine YTD + LYTD series (indexed by the same key) into a single
+    sortable table with Growth % and Delta columns."""
+    tab = (pd.concat([ytd_cases.rename("YTD"), lytd_cases.rename("LYTD")],
+                     axis=1).fillna(0.0))
+    tab["Delta"]   = tab["YTD"] - tab["LYTD"]
+    tab["Growth %"] = tab.apply(
+        lambda r: (r["Delta"] / r["LYTD"] * 100) if r["LYTD"] > 0
+                  else (100.0 if r["YTD"] > 0 else 0.0), axis=1)
+    tab = tab[(tab["YTD"] > 0) | (tab["LYTD"] > 0)]
+    tab = tab.sort_values("YTD", ascending=False).reset_index()
+    if name_col not in tab.columns:
+        tab = tab.rename(columns={tab.columns[0]: name_col})
+    return tab
+
+
+def _render_ytd_performance(principal_master: pd.DataFrame,
+                            cfg: dict, selected_name: str,
+                            today: date) -> None:
+    st.markdown("### 📊 YTD performance — growth vs same period last year")
+    cid = cfg["company_id"]
+    cur_start, lytd_start, lytd_today = _fy_jul_jun_bounds(today)
+    st.caption(
+        f"**FY July → June** (USL / Diageo standard). YTD = "
+        f"**{cur_start.strftime('%d-%b-%Y')}** → **{today.strftime('%d-%b-%Y')}**. "
+        f"LYTD = **{lytd_start.strftime('%d-%b-%Y')}** → "
+        f"**{lytd_today.strftime('%d-%b-%Y')}** for an apples-to-apples comparison."
+    )
+
+    with st.spinner("Loading YTD data…"):
+        raw = _load_ytd_brand_size_channel(cid)
+    if raw.empty:
+        st.info("No YTD data available for this principal.")
+        return
+
+    cur_months  = _months_in_range(cur_start,  today)
+    lytd_months = _months_in_range(lytd_start, lytd_today)
+    raw["Channel"] = raw.apply(
+        lambda r: _channel_for_principal(cid, r["AcType3ID"], r["ClassID"]),
+        axis=1)
+    raw["Size"] = raw["LiquorSize"].apply(_normalize_size)
+
+    ytd_df  = raw[raw["Mon"].isin(cur_months)]
+    lytd_df = raw[raw["Mon"].isin(lytd_months)]
+
+    ytd_total  = float(ytd_df["Cases"].sum())
+    lytd_total = float(lytd_df["Cases"].sum())
+    gr_total   = ((ytd_total - lytd_total) / lytd_total * 100) if lytd_total > 0 else 0.0
+
+    # ── Overall summary ──
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(f"YTD ({cur_start.strftime('%b-%y')} → {today.strftime('%b-%y')})",
+              f"{ytd_total:,.0f} cs")
+    k2.metric(f"LYTD ({lytd_start.strftime('%b-%y')} → {lytd_today.strftime('%b-%y')})",
+              f"{lytd_total:,.0f} cs")
+    k3.metric("Growth %", f"{gr_total:+.1f}%",
+              delta=f"{ytd_total - lytd_total:+,.0f} cs")
+    k4.metric("Months covered", f"{len(cur_months)} / 12")
+
+    # ── Brand-wise table ──
+    st.markdown("##### Brand-wise YTD")
+    brand_tab = _build_compare_table(
+        ytd_df.groupby("BrandName")["Cases"].sum(),
+        lytd_df.groupby("BrandName")["Cases"].sum(),
+        "Brand")
+    st.dataframe(
+        brand_tab.style.format({
+            "YTD": "{:,.0f}", "LYTD": "{:,.0f}",
+            "Delta": "{:+,.0f}", "Growth %": "{:+.1f}%",
+        }).map(_growth_color, subset=["Growth %"]),
+        use_container_width=True, hide_index=True, height=380)
+
+    # ── Channel-wise table ──
+    st.markdown("##### Channel-wise YTD")
+    chan_tab = _build_compare_table(
+        ytd_df.groupby("Channel")["Cases"].sum(),
+        lytd_df.groupby("Channel")["Cases"].sum(),
+        "Channel")
+    st.dataframe(
+        chan_tab.style.format({
+            "YTD": "{:,.0f}", "LYTD": "{:,.0f}",
+            "Delta": "{:+,.0f}", "Growth %": "{:+.1f}%",
+        }).map(_growth_color, subset=["Growth %"]),
+        use_container_width=True, hide_index=True)
+
+    # ── Brand drill-down — size split for a chosen brand ──
+    st.markdown("##### Drill-down — pick a brand → see size split")
+    options = brand_tab["Brand"].tolist()
+    if not options:
+        return
+    pick = st.selectbox(
+        "Brand", options, key=f"ytd_brand_pick_{cid}",
+        help="Pick any brand to see which pack-size is driving its growth "
+             "or degrowth.")
+    bd_ytd  = ytd_df[ytd_df["BrandName"]  == pick]
+    bd_lytd = lytd_df[lytd_df["BrandName"] == pick]
+    size_tab = _build_compare_table(
+        bd_ytd.groupby("Size")["Cases"].sum(),
+        bd_lytd.groupby("Size")["Cases"].sum(),
+        "Size")
+    if size_tab.empty:
+        st.caption(f"No size breakdown available for {pick}.")
+        return
+    st.dataframe(
+        size_tab.style.format({
+            "YTD": "{:,.0f}", "LYTD": "{:,.0f}",
+            "Delta": "{:+,.0f}", "Growth %": "{:+.1f}%",
+        }).map(_growth_color, subset=["Growth %"]),
+        use_container_width=True, hide_index=True)
+    # Also show channel split for the chosen brand
+    chan_b = _build_compare_table(
+        bd_ytd.groupby("Channel")["Cases"].sum(),
+        bd_lytd.groupby("Channel")["Cases"].sum(),
+        "Channel")
+    if not chan_b.empty:
+        st.markdown(f"**Channel split — {pick}**")
+        st.dataframe(
+            chan_b.style.format({
+                "YTD": "{:,.0f}", "LYTD": "{:,.0f}",
+                "Delta": "{:+,.0f}", "Growth %": "{:+.1f}%",
+            }).map(_growth_color, subset=["Growth %"]),
+            use_container_width=True, hide_index=True)
+
+
 def render() -> None:
     st.title("Principal Meeting Pack")
     st.caption("Principal-wise performance for company review meetings")
@@ -774,6 +1013,9 @@ def render() -> None:
     st.divider()
 
     _render_trends(principal_master, months_12, cfg)
+    st.divider()
+
+    _render_ytd_performance(principal_master, cfg, selected, today)
     st.divider()
 
     _render_export(salesman_df, brands_df, outlet_tables, selected)
