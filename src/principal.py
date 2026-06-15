@@ -28,6 +28,7 @@ from src.distribution import (
     _fmt_month,
     _prev_month_str,
 )
+from src.inventory import _normalize_brand_display
 
 # ── Sales transaction type IDs (mirrors distribution.py) ─────────────────────
 SALES_TYPES: tuple[int, ...] = (18, 19, 23, 35, 37, 38, 39, 40, 41, 44, 47, 49, 51, 53)
@@ -823,6 +824,11 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
         lambda r: _channel_for_principal(cid, r["AcType3ID"], r["ClassID"]),
         axis=1)
     raw["Size"] = raw["LiquorSize"].apply(_normalize_size)
+    # Collapse MRP-recoded brand variants — same brand gets new BrandID when
+    # MRP changes (e.g. "JOHNNIE WALKER RED LABEL" + "JOHNNIE WALKER RED
+    # LABEL NEW"). Without this, YTD/LYTD growth math is split across the
+    # variants and the same consumer brand appears twice in the drill-down.
+    raw["BrandDisplay"] = raw["BrandName"].apply(_normalize_brand_display)
 
     ytd_df  = raw[raw["Mon"].isin(cur_months)]
     lytd_df = raw[raw["Mon"].isin(lytd_months)]
@@ -841,11 +847,57 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
               delta=f"{ytd_total - lytd_total:+,.0f} cs")
     k4.metric("Months covered", f"{len(cur_months)} / 12")
 
+    # ── Monthly volume comparison chart ──
+    def _fy_month_order(fy_start: date) -> list[str]:
+        """12 yyyy-MM strings in FY order (Jul..Jun)."""
+        out, y, m = [], fy_start.year, fy_start.month
+        for _ in range(12):
+            out.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m == 13:
+                m = 1; y += 1
+        return out
+    cur_fy_months  = _fy_month_order(cur_start)
+    lytd_fy_months = _fy_month_order(lytd_start)
+    by_mon = raw.groupby("Mon")["Cases"].sum().to_dict()
+    chart_rows = []
+    cur_mon_str = today.strftime("%Y-%m")
+    for i, (cm, lm) in enumerate(zip(cur_fy_months, lytd_fy_months)):
+        label = date(int(cm[:4]), int(cm[5:]), 1).strftime("%b")
+        cur_v = float(by_mon.get(cm, 0))
+        ly_v  = float(by_mon.get(lm, 0))
+        # Future months of the current FY have no data yet — flag so we can
+        # render them dimmer / annotate
+        future = cm > cur_mon_str
+        chart_rows.append({"Month": label, "Period": "Current FY",
+                           "Cases": cur_v, "_future": future})
+        chart_rows.append({"Month": label, "Period": "Last FY",
+                           "Cases": ly_v, "_future": False})
+    chart_df = pd.DataFrame(chart_rows)
+    pcolor = {"Current FY": cfg["color"], "Last FY": "#9CA3AF"}
+    fig = px.bar(chart_df, x="Month", y="Cases", color="Period",
+                 barmode="group", color_discrete_map=pcolor,
+                 text="Cases")
+    fig.update_traces(texttemplate="%{text:,.0f}",
+                      textposition="outside", cliponaxis=False)
+    fig.update_layout(
+        **_LAYOUT, height=340,
+        title=f"Monthly volume — Current FY vs Last FY ({selected_name})",
+        xaxis=dict(**_GRID, categoryorder="array",
+                   categoryarray=[date(int(m[:4]), int(m[5:]), 1).strftime("%b")
+                                  for m in cur_fy_months]),
+        yaxis=dict(**_GRID, title="Cases"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1),
+        bargap=0.25,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
     # ── Brand-wise table ──
     st.markdown("##### Brand-wise YTD")
     brand_tab = _build_compare_table(
-        ytd_df.groupby("BrandName")["Cases"].sum(),
-        lytd_df.groupby("BrandName")["Cases"].sum(),
+        ytd_df.groupby("BrandDisplay")["Cases"].sum(),
+        lytd_df.groupby("BrandDisplay")["Cases"].sum(),
         "Brand")
     st.dataframe(
         brand_tab.style.format({
@@ -876,8 +928,8 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
         "Brand", options, key=f"ytd_brand_pick_{cid}",
         help="Pick any brand to see which pack-size is driving its growth "
              "or degrowth.")
-    bd_ytd  = ytd_df[ytd_df["BrandName"]  == pick]
-    bd_lytd = lytd_df[lytd_df["BrandName"] == pick]
+    bd_ytd  = ytd_df[ytd_df["BrandDisplay"]  == pick]
+    bd_lytd = lytd_df[lytd_df["BrandDisplay"] == pick]
     size_tab = _build_compare_table(
         bd_ytd.groupby("Size")["Cases"].sum(),
         bd_lytd.groupby("Size")["Cases"].sum(),
