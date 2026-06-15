@@ -805,12 +805,6 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
     st.markdown("### 📊 YTD performance — growth vs same period last year")
     cid = cfg["company_id"]
     cur_start, lytd_start, lytd_today = _fy_jul_jun_bounds(today)
-    st.caption(
-        f"**FY July → June** (USL / Diageo standard). YTD = "
-        f"**{cur_start.strftime('%d-%b-%Y')}** → **{today.strftime('%d-%b-%Y')}**. "
-        f"LYTD = **{lytd_start.strftime('%d-%b-%Y')}** → "
-        f"**{lytd_today.strftime('%d-%b-%Y')}** for an apples-to-apples comparison."
-    )
 
     with st.spinner("Loading YTD data…"):
         raw = _load_ytd_brand_size_channel(cid)
@@ -818,8 +812,6 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
         st.info("No YTD data available for this principal.")
         return
 
-    cur_months  = _months_in_range(cur_start,  today)
-    lytd_months = _months_in_range(lytd_start, lytd_today)
     raw["Channel"] = raw.apply(
         lambda r: _channel_for_principal(cid, r["AcType3ID"], r["ClassID"]),
         axis=1)
@@ -830,6 +822,60 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
     # variants and the same consumer brand appears twice in the drill-down.
     raw["BrandDisplay"] = raw["BrandName"].apply(_normalize_brand_display)
 
+    # ── Data-availability clipping ────────────────────────────────────────
+    # Teknik's TrVocItem only retains the current + previous Indian FY
+    # (Apr-Mar). At the start of an Indian FY (April), the prior calendar
+    # year's data drops off. For the Diageo/USL July-Jun FY, this means
+    # July-Mar of "LYTD" may simply not exist in the DB — comparing 12
+    # months of current FY to 3 months of LYTD inflates growth into
+    # nonsense (+200% to +900%).
+    #
+    # Fix: clip BOTH periods to the same calendar-month window using the
+    # earliest data point that falls inside the LYTD window. Comparison
+    # stays apples-to-apples; we just shrink the window honestly.
+    earliest_mon = str(raw["Mon"].min())  # 'YYYY-MM'
+    full_lytd_months = _months_in_range(lytd_start, lytd_today)
+    avail_lytd_months = [m for m in full_lytd_months if m >= earliest_mon]
+    n_avail = len(avail_lytd_months)
+    full_n  = len(full_lytd_months)
+    if n_avail == 0:
+        st.warning(
+            f"No data available for last FY ({lytd_start:%b-%Y} → "
+            f"{lytd_today:%b-%Y}). The ERP only retains the current + "
+            f"previous Indian FY (Apr-Mar), so an apples-to-apples July-June "
+            f"comparison isn't possible right now. YTD section disabled.")
+        return
+    # Mirror the available LYTD window into current FY (same calendar months
+    # one year later) so we compare like-for-like.
+    cur_months  = [f"{int(m[:4])+1:04d}-{m[5:]}" for m in avail_lytd_months]
+    lytd_months = avail_lytd_months
+    # Cap current FY window to actual data window (no future months & no
+    # months past today)
+    cur_today_str = today.strftime("%Y-%m")
+    cur_months = [m for m in cur_months if m <= cur_today_str]
+    lytd_months = lytd_months[:len(cur_months)]
+
+    clip_start = date(int(lytd_months[0][:4]), int(lytd_months[0][5:]), 1)
+    clip_end_l = lytd_today
+    clip_start_c = date(int(cur_months[0][:4]), int(cur_months[0][5:]), 1)
+    clip_end_c = today
+
+    if n_avail < full_n:
+        st.caption(
+            f"⚠️ **Comparison clipped to data available** — Teknik's ERP "
+            f"only retains the current + previous Indian FY, so July-Mar "
+            f"of last FY is unavailable. Showing "
+            f"**{clip_start_c:%d-%b-%Y} → {clip_end_c:%d-%b-%Y}** vs "
+            f"**{clip_start:%d-%b-%Y} → {clip_end_l:%d-%b-%Y}** "
+            f"({len(cur_months)} months instead of 12) for a fair "
+            f"apples-to-apples comparison.")
+    else:
+        st.caption(
+            f"**FY July → June** (USL / Diageo standard). YTD = "
+            f"**{clip_start_c:%d-%b-%Y}** → **{clip_end_c:%d-%b-%Y}**. "
+            f"LYTD = **{clip_start:%d-%b-%Y}** → "
+            f"**{clip_end_l:%d-%b-%Y}** for an apples-to-apples comparison.")
+
     ytd_df  = raw[raw["Mon"].isin(cur_months)]
     lytd_df = raw[raw["Mon"].isin(lytd_months)]
 
@@ -839,40 +885,27 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
 
     # ── Overall summary ──
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric(f"YTD ({cur_start.strftime('%b-%y')} → {today.strftime('%b-%y')})",
+    k1.metric(f"YTD ({clip_start_c.strftime('%b-%y')} → {today.strftime('%b-%y')})",
               f"{ytd_total:,.0f} cs")
-    k2.metric(f"LYTD ({lytd_start.strftime('%b-%y')} → {lytd_today.strftime('%b-%y')})",
+    k2.metric(f"LYTD ({clip_start.strftime('%b-%y')} → {lytd_today.strftime('%b-%y')})",
               f"{lytd_total:,.0f} cs")
     k3.metric("Growth %", f"{gr_total:+.1f}%",
               delta=f"{ytd_total - lytd_total:+,.0f} cs")
-    k4.metric("Months covered", f"{len(cur_months)} / 12")
+    k4.metric("Months covered", f"{len(cur_months)} / {12 if n_avail == full_n else full_n} avail")
 
     # ── Monthly volume comparison chart ──
-    def _fy_month_order(fy_start: date) -> list[str]:
-        """12 yyyy-MM strings in FY order (Jul..Jun)."""
-        out, y, m = [], fy_start.year, fy_start.month
-        for _ in range(12):
-            out.append(f"{y:04d}-{m:02d}")
-            m += 1
-            if m == 13:
-                m = 1; y += 1
-        return out
-    cur_fy_months  = _fy_month_order(cur_start)
-    lytd_fy_months = _fy_month_order(lytd_start)
+    # Render ONLY the months we have data for in both periods (the clipped
+    # window). Drawing the full 12-month FY here would inflate "Current FY"
+    # bars against empty "Last FY" months and recreate the same visual lie
+    # that the totals fix above eliminates.
     by_mon = raw.groupby("Mon")["Cases"].sum().to_dict()
     chart_rows = []
-    cur_mon_str = today.strftime("%Y-%m")
-    for i, (cm, lm) in enumerate(zip(cur_fy_months, lytd_fy_months)):
+    for cm, lm in zip(cur_months, lytd_months):
         label = date(int(cm[:4]), int(cm[5:]), 1).strftime("%b")
         cur_v = float(by_mon.get(cm, 0))
         ly_v  = float(by_mon.get(lm, 0))
-        # Future months of the current FY have no data yet — flag so we can
-        # render them dimmer / annotate
-        future = cm > cur_mon_str
-        chart_rows.append({"Month": label, "Period": "Current FY",
-                           "Cases": cur_v, "_future": future})
-        chart_rows.append({"Month": label, "Period": "Last FY",
-                           "Cases": ly_v, "_future": False})
+        chart_rows.append({"Month": label, "Period": "Current FY", "Cases": cur_v})
+        chart_rows.append({"Month": label, "Period": "Last FY",   "Cases": ly_v})
     chart_df = pd.DataFrame(chart_rows)
     pcolor = {"Current FY": cfg["color"], "Last FY": "#9CA3AF"}
     fig = px.bar(chart_df, x="Month", y="Cases", color="Period",
@@ -885,7 +918,7 @@ def _render_ytd_performance(principal_master: pd.DataFrame,
         title=f"Monthly volume — Current FY vs Last FY ({selected_name})",
         xaxis=dict(**_GRID, categoryorder="array",
                    categoryarray=[date(int(m[:4]), int(m[5:]), 1).strftime("%b")
-                                  for m in cur_fy_months]),
+                                  for m in cur_months]),
         yaxis=dict(**_GRID, title="Cases"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="right", x=1),
