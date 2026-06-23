@@ -1,3 +1,4 @@
+import traceback
 import streamlit as st
 from db import get_connection_status
 
@@ -163,6 +164,31 @@ from src.cashflow     import render as render_cashflow
 from src.balance_sheet import render as render_balance_sheet
 from src.nrm          import render as render_nrm
 
+def safe_render(fn, page_label: str) -> None:
+    """Run a page renderer with an error boundary.
+
+    Without this, a single uncaught exception (a DB drop mid-query, a
+    KeyError on a missing column, anything) takes the WHOLE app down —
+    the user sees a generic Streamlit crash page and has to hard-refresh.
+    With this, the broken tab shows a friendly error + the trace in an
+    expander, and the radio nav still works so the user can flip to a
+    working page.
+    """
+    try:
+        fn()
+    except Exception as exc:
+        st.error(
+            f"**{page_label}** crashed while rendering.\n\n"
+            f"`{type(exc).__name__}: {exc}`\n\n"
+            f"Other tabs still work — switch with the section radio "
+            f"above. Click **🔄 Refresh** in the header to retry; "
+            f"the issue is usually a transient DB drop and clears on "
+            f"the next attempt."
+        )
+        with st.expander("Show technical details (for debugging)"):
+            st.code(traceback.format_exc(), language="python")
+
+
 _PAGES = ["Overview", "Purchase", "Sales", "NRM", "Discounts",
           "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
 page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
@@ -180,9 +206,9 @@ elif page == "Purchase":
     sub = st.radio("View", ["📦 Purchase Overview", "🏭 Inventory"],
                    horizontal=True, key="pur_nav", label_visibility="collapsed")
     if sub.endswith("Purchase Overview"):
-        render_purchase()
+        safe_render(render_purchase, "Purchase Overview")
     else:
-        render_inventory()
+        safe_render(render_inventory, "Inventory")
 
 elif page == "Sales":
     _SALES = ["Sales Plan", "Sales Overview", "Segment Analysis",
@@ -191,34 +217,34 @@ elif page == "Sales":
     sub = st.radio("View", _SALES, horizontal=True, key="sales_nav",
                    label_visibility="collapsed")
     if sub == "Sales Plan":
-        render_sales_plan()
+        safe_render(render_sales_plan, "Sales Plan")
     elif sub == "Sales Overview":
-        render_sales()
+        safe_render(render_sales, "Sales Overview")
     elif sub == "Segment Analysis":
-        render_segments()
+        safe_render(render_segments, "Segment Analysis")
     elif sub == "Team Performance":
-        render_salesman()
+        safe_render(render_salesman, "Team Performance")
     elif sub == "Distribution":
-        render_distribution()
+        safe_render(render_distribution, "Distribution")
     elif sub == "Meeting Pack":
-        render_principal()
+        safe_render(render_principal, "Meeting Pack")
     else:
-        render_operations()
+        safe_render(render_operations, "Operations Rhythm")
 
 elif page == "NRM":
-    render_nrm()
+    safe_render(render_nrm, "NRM Planner")
 
 elif page == "Discounts":
-    render_discounts()
+    safe_render(render_discounts, "Discounts")
 
 elif page == "Expenses":
-    render_expenses()
+    safe_render(render_expenses, "Expenses")
 
 elif page == "Debtors Ageing":
-    render_debtors()
+    safe_render(render_debtors, "Debtors Ageing")
 
 elif page == "Cash Flow":
-    render_cashflow()
+    safe_render(render_cashflow, "Cash Flow")
 
 elif page == "Balance Sheet":
-    render_balance_sheet()
+    safe_render(render_balance_sheet, "Balance Sheet")
