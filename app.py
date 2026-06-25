@@ -1,3 +1,4 @@
+import hmac
 import traceback
 import streamlit as st
 from db import get_connection_status
@@ -8,6 +9,66 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+# ── Auth gate ───────────────────────────────────────────────────────────────
+# Anyone with the public Streamlit Cloud URL would otherwise reach the
+# dashboard. This is a simple username + password gate using credentials
+# stored in st.secrets["auth"]. Credentials live in
+# .streamlit/secrets.toml locally (gitignored) and in the Streamlit Cloud
+# Secrets manager in production. Comparisons use hmac.compare_digest to
+# prevent timing-attack-style probes.
+def _require_login() -> bool:
+    if st.session_state.get("auth_ok"):
+        return True
+
+    def _attempt():
+        u_in = st.session_state.get("auth_user", "")
+        p_in = st.session_state.get("auth_pass", "")
+        try:
+            u_ok = hmac.compare_digest(u_in, st.secrets["auth"]["username"])
+            p_ok = hmac.compare_digest(p_in, st.secrets["auth"]["password"])
+        except (KeyError, FileNotFoundError):
+            st.session_state["auth_error"] = (
+                "Auth not configured. Add an [auth] section with "
+                "username and password to Streamlit secrets.")
+            return
+        if u_ok and p_ok:
+            st.session_state["auth_ok"] = True
+            st.session_state.pop("auth_pass", None)
+            st.session_state.pop("auth_error", None)
+        else:
+            st.session_state["auth_error"] = "Invalid username or password."
+
+    # Centered login card
+    st.markdown("""
+    <style>
+      .block-container { padding-top: 4rem !important; max-width: 420px; }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown(
+        "<div style='text-align:center; margin-bottom:1.5rem'>"
+        "<div style='font-size:1.8rem; font-weight:800; color:#1B4F72; "
+        "letter-spacing:0.06em'>KWPL</div>"
+        "<div style='font-size:0.85rem; color:#888'>Kranti Wines Pvt. Ltd.</div>"
+        "</div>",
+        unsafe_allow_html=True)
+    with st.form("login_form", clear_on_submit=False):
+        st.text_input("Username", key="auth_user", autocomplete="username")
+        st.text_input("Password", key="auth_pass", type="password",
+                      autocomplete="current-password")
+        submitted = st.form_submit_button("Sign in", use_container_width=True)
+    if submitted:
+        _attempt()
+        if st.session_state.get("auth_ok"):
+            st.rerun()
+    if st.session_state.get("auth_error"):
+        st.error(st.session_state["auth_error"])
+    return False
+
+
+if not _require_login():
+    st.stop()
 
 # ── Global CSS ──────────────────────────────────────────────────────────────
 st.markdown("""
@@ -97,7 +158,7 @@ status_html = (
     if status else
     '<span class="kwpl-status-off">● DB Offline</span>'
 )
-_hdr, _btn = st.columns([12, 1])
+_hdr, _btn_refresh, _btn_logout = st.columns([11, 1, 1])
 with _hdr:
     st.markdown(f"""
     <div class="kwpl-header">
@@ -108,7 +169,7 @@ with _hdr:
         {status_html}
     </div>
     """, unsafe_allow_html=True)
-with _btn:
+with _btn_refresh:
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
     if st.button("🔄 Refresh", help="Clear cache & re-query DB",
                  key="hdr_refresh", use_container_width=True):
@@ -116,6 +177,13 @@ with _btn:
         # Also re-probe the connection in case it was stale
         from db import get_connection
         get_connection.clear()
+        st.rerun()
+with _btn_logout:
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    if st.button("🚪 Logout", help="Sign out of the dashboard",
+                 key="hdr_logout", use_container_width=True):
+        st.session_state.pop("auth_ok", None)
+        st.session_state.pop("auth_user", None)
         st.rerun()
 
 # ── Navigation ───────────────────────────────────────────────────────────────
