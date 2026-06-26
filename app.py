@@ -216,6 +216,7 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
 # Top-level imports run once at cold start, so the cache is always
 # consistent. Each module is small at import time (heavy work is gated by
 # @st.cache_data on call), so memory cost is negligible.
+from src.overview     import render as render_overview
 from src.purchase     import render as render_purchase
 from src.inventory    import render as render_inventory
 from src.sales_plan   import render as render_sales_plan
@@ -264,11 +265,7 @@ page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
 st.divider()
 
 if page == "Overview":
-    coming_soon(
-        "Overview Dashboard",
-        "Consolidated KPIs from every module — revenue, margin, debtors, stock value, P&L summary",
-        "📊",
-    )
+    safe_render(render_overview, "Overview")
 
 elif page == "Purchase":
     sub = st.radio("View", ["📦 Purchase Overview", "🏭 Inventory"],
