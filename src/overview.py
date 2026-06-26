@@ -124,15 +124,25 @@ def _render_cash_and_stock() -> None:
             overdue_parties = int(overdue["PartyID"].nunique())
             a, b = st.columns(2)
             a.metric("Total outstanding", format_inr(outstanding))
-            b.metric(">90 day overdue", format_inr(overdue_amt),
-                     delta=f"{overdue_parties} parties",
-                     delta_color="inverse")
+            b.metric(">90 day overdue", format_inr(overdue_amt))
             if outstanding > 0:
                 pct = overdue_amt / outstanding * 100
                 st.caption(
-                    f"**{pct:.1f}%** of outstanding sits in the 90+ "
-                    f"bucket. Open the **Debtors Ageing** tab for the "
-                    f"party-wise breakdown.")
+                    f"**{overdue_parties:,} parties** in the 90+ bucket "
+                    f"(**{pct:.1f}%** of total outstanding). Open the "
+                    f"**Debtors Ageing** tab for the party-wise breakdown.")
+
+        try:
+            lb = _load_last_bill_per_party()
+            ghosted = int((lb["DaysSinceLastBill"] >= 90).sum())
+        except Exception:
+            ghosted = None
+        if ghosted is not None:
+            st.metric("Ghosted outlets",
+                      f"{ghosted:,}",
+                      help="Active parties with no sales bill in the last "
+                           "90 days. Drill into the Debtors Ageing tab → "
+                           "Ghosted section for the list.")
 
     with right:
         st.markdown("### 📦 Stock & operations")
@@ -147,19 +157,11 @@ def _render_cash_and_stock() -> None:
         stock["StockValue"] = stock["ClosingCases"] * stock["ValRateCase"]
         total_val = float(stock["StockValue"].sum())
         oos_count = int((stock["ClosingCases"] <= 0).sum())
-        try:
-            lb = _load_last_bill_per_party()
-            ghosted = int((lb["DaysSinceLastBill"] >= 90).sum())
-        except Exception:
-            ghosted = None
         a, b = st.columns(2)
-        a.metric("Stock value", format_inr(total_val),
-                 delta=f"{len(stock):,} SKUs")
-        b.metric("Out of stock",
-                 f"{oos_count:,} SKUs",
-                 delta=(f"{ghosted:,} ghosted outlets"
-                        if ghosted is not None else None),
-                 delta_color="inverse")
+        a.metric("Stock value", format_inr(total_val))
+        b.metric("Out of stock", f"{oos_count:,} SKUs")
+        st.caption(f"**{len(stock):,} total SKUs** in inventory "
+                   f"(of which **{oos_count:,}** are out of stock).")
         if "Principal" in stock.columns:
             by_p = (stock.groupby("Principal")["StockValue"]
                          .sum().sort_values(ascending=False))
