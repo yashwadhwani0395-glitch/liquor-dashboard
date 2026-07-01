@@ -359,10 +359,20 @@ def _party_month_agg(sm_df: pd.DataFrame, month_str: str) -> pd.DataFrame:
     """Aggregate to (PartyID, PartyName, LicenseTypeID) level for one month."""
     month_df = sm_df[sm_df["BillMonth"] == month_str]
     if month_df.empty:
-        return pd.DataFrame(
-            columns=["PartyID", "PartyName", "LicenseTypeID", "InvoiceCount", "Cases", "Revenue"]
-        )
-    return (
+        # pandas 3.x: pd.DataFrame(columns=[...]) makes every column
+        # `object` dtype. Callers do .nlargest(10, "Revenue") on the
+        # result — .nlargest on an object column raises TypeError.
+        # Build the frame with the right dtypes upfront so an empty
+        # month doesn't crash the whole Distribution render.
+        return pd.DataFrame({
+            "PartyID":       pd.Series(dtype="object"),
+            "PartyName":     pd.Series(dtype="object"),
+            "LicenseTypeID": pd.Series(dtype="object"),
+            "InvoiceCount":  pd.Series(dtype="int64"),
+            "Cases":         pd.Series(dtype="float64"),
+            "Revenue":       pd.Series(dtype="float64"),
+        })
+    agg = (
         month_df
         .groupby(["PartyID", "PartyName", "LicenseTypeID"], as_index=False)
         .agg(
@@ -371,6 +381,11 @@ def _party_month_agg(sm_df: pd.DataFrame, month_str: str) -> pd.DataFrame:
             Revenue=("Revenue", "sum"),
         )
     )
+    # Coerce back to numeric — pandas 3.x sometimes keeps aggregates as
+    # object when any group contained NaN. nlargest() then refuses.
+    for c in ("InvoiceCount", "Cases", "Revenue"):
+        agg[c] = pd.to_numeric(agg[c], errors="coerce").fillna(0.0)
+    return agg
 
 
 def _monthly_metrics(sm_df: pd.DataFrame, months: list[str], uni_ids: frozenset) -> pd.DataFrame:
