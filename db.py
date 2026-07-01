@@ -11,6 +11,7 @@ so callers never need to know which driver is active.
 
 import os
 import sys
+import threading
 import time
 import pymssql
 import pandas as pd
@@ -94,7 +95,11 @@ def get_connection_status() -> bool:
 #        canonical fix is to rerun. Retrying is the documented Microsoft
 #        guidance — see "Handling Deadlocks" in SQL Server docs.
 # 1222 = lock request timeout.
-_RETRYABLE_SQL_ERRORS = (1205, 1222)
+# 3980 = "batch is aborted, another request is running in the same session".
+#        Fires when two threads hit the shared pymssql connection at once.
+#        The lock below should prevent this from firing at all; the retry
+#        below is defence in depth if it slips through.
+_RETRYABLE_SQL_ERRORS = (1205, 1222, 3980)
 
 # DB-Lib (pymssql) CONNECTION-level error codes. These mean the cached
 # connection has gone dead — extremely common on Streamlit Cloud, where the
@@ -123,6 +128,24 @@ _CONN_ERROR_HINTS = (
 # to recover before the next attempt would succeed.
 _MAX_RETRIES   = 5
 _RETRY_BACKOFF = 1.5  # seconds; doubles each retry
+
+# Serialize access to the shared pymssql connection.
+#
+# Why: Streamlit uses tornado threads for websocket sessions; every user
+# tab runs on its own thread. @st.cache_resource returns THE SAME
+# pymssql.Connection object to all of them. pymssql cannot run two
+# cursors concurrently on one connection — the second call gets SQL
+# error 3980 "another request is running in the same session, which
+# makes the session busy". Worse: our retry path then calls
+# conn.close() while a query is still in flight on the OTHER thread,
+# which corrupts FreeTDS's internal buffer state and hits the
+# `conn->in_net_tds == NULL` assertion — a process-level SIGABRT that
+# kills the whole Streamlit worker (no Python exception, no chance for
+# safe_render to catch it, users get a "please wait" spinner forever).
+#
+# The lock makes queries queue instead of colliding. KWPL has 1-5
+# concurrent users at most; the added latency is invisible.
+_QUERY_LOCK = threading.Lock()
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -187,44 +210,51 @@ def run_query(sql: str, params: tuple = ()) -> pd.DataFrame:
     if params:
         sql = sql.replace("?", "%s")
 
+    # The lock must span the ENTIRE retry loop — cursor use AND the
+    # close/reconnect recovery path. If we released the lock between
+    # attempts, another thread could grab the half-broken connection and
+    # trigger the FreeTDS assertion we're trying to avoid. Sleep-during-
+    # backoff also happens under the lock; that's intentional serialization,
+    # not a bug (1-5 users total; latency is invisible).
     last_exc: Exception | None = None
-    for attempt in range(_MAX_RETRIES):
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, params or ())
-                cols = [col[0] for col in cursor.description]
-                rows = cursor.fetchall()
-            return pd.DataFrame.from_records(rows, columns=cols)
-        except Exception as exc:
-            last_exc = exc
-            if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_BACKOFF * (2 ** attempt)
-                print(
-                    f"[db.run_query] transient error (attempt "
-                    f"{attempt+1}/{_MAX_RETRIES}), retrying in {wait}s: {exc}",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-                # Explicitly close the dead connection BEFORE clearing the
-                # cache and reconnecting — otherwise the underlying TCP
-                # socket can sit half-open and the next attempt inherits the
-                # broken state. .close() is safe to call on already-dead
-                # connections (it just no-ops).
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+    with _QUERY_LOCK:
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, params or ())
+                    cols = [col[0] for col in cursor.description]
+                    rows = cursor.fetchall()
+                return pd.DataFrame.from_records(rows, columns=cols)
+            except Exception as exc:
+                last_exc = exc
+                if _is_retryable(exc) and attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF * (2 ** attempt)
+                    print(
+                        f"[db.run_query] transient error (attempt "
+                        f"{attempt+1}/{_MAX_RETRIES}), retrying in {wait}s: {exc}",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                    # Explicitly close the dead connection BEFORE clearing the
+                    # cache and reconnecting — otherwise the underlying TCP
+                    # socket can sit half-open and the next attempt inherits the
+                    # broken state. .close() is safe to call on already-dead
+                    # connections (it just no-ops).
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    get_connection.clear()
+                    conn = get_connection()
+                    if conn is None:
+                        raise RuntimeError(
+                            "Reconnect failed after transient DB error."
+                        ) from exc
+                    continue
+                # Non-retryable, or out of retries — clear connection and raise
+                # so @st.cache_data does NOT cache an empty result.
+                print(f"[db.run_query] {exc}", file=sys.stderr)
                 get_connection.clear()
-                conn = get_connection()
-                if conn is None:
-                    raise RuntimeError(
-                        "Reconnect failed after transient DB error."
-                    ) from exc
-                continue
-            # Non-retryable, or out of retries — clear connection and raise
-            # so @st.cache_data does NOT cache an empty result.
-            print(f"[db.run_query] {exc}", file=sys.stderr)
-            get_connection.clear()
-            raise
+                raise
     # Unreachable, but keep mypy happy
     raise RuntimeError("run_query exhausted retries") from last_exc
