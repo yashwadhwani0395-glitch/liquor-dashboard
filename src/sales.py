@@ -1092,6 +1092,108 @@ def _section_breakdown(principal_df: pd.DataFrame,
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_smirnoff_family(start: date, end: date,
+                          ly_start: date, ly_end: date) -> pd.DataFrame:
+    """Per-variant cases for the Smirnoff family in the selected period +
+    the year-ago window. Kept separate from Top-10 brands so Smirnoff
+    Minty Jamum (a very large FY26 target) is always visible instead of
+    getting lost in the Diageo aggregate.
+    """
+    type_ph = ",".join(str(t) for t in SALES_TYPES)
+    sql = f"""
+        SELECT
+            b.BrandName,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS Cases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN {_CASES} ELSE 0 END) AS LyCases,
+            SUM(CASE WHEN h.VoucherDate BETWEEN ? AND ? THEN vi.TotalAmount ELSE 0 END) AS Rev
+        FROM TrVocHead h
+        JOIN TrVocItem vi
+            ON  vi.TransTypeID = h.TransTypeID
+            AND vi.VoucherNo   = h.VoucherNo
+            AND vi.ItemID      LIKE 'I%'
+            AND vi.FinancialYear = CASE
+                WHEN MONTH(h.VoucherDate) >= 4
+                THEN CAST(YEAR(h.VoucherDate) AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate)+1 AS VARCHAR)
+                ELSE CAST(YEAR(h.VoucherDate)-1 AS VARCHAR)
+                     + '-' + CAST(YEAR(h.VoucherDate) AS VARCHAR)
+            END
+        JOIN MsItemMaster  im ON im.ItemID = vi.ItemID
+        JOIN MsBrandMaster b  ON b.BrandID = im.BrandID
+        WHERE h.TransTypeID IN ({type_ph})
+          AND h.Cancelled   = 'N'
+          AND h.VoucherDate BETWEEN ? AND ?
+          AND b.BrandName LIKE 'SMIRNOFF%'
+        GROUP BY b.BrandName
+    """
+    s, e, ls, le = str(start), str(end), str(ly_start), str(ly_end)
+    params = (s, e, ls, le, s, e, ls, e)
+    df = run_query(sql, params)
+    if df.empty:
+        return df
+    for c in ("Cases", "LyCases", "Rev"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    # Keep only rows with any activity in either window; drop the pure noise
+    df = df[(df["Cases"] > 0) | (df["LyCases"] > 0)].copy()
+    df = df.sort_values("Cases", ascending=False).reset_index(drop=True)
+    return df
+
+
+def _section_smirnoff_family(sf_df: pd.DataFrame) -> None:
+    """Broken-out Smirnoff variant table, with Minty Jamum highlighted."""
+    st.markdown("##### 🍸 Smirnoff family — variant split")
+    if sf_df.empty:
+        st.info("No Smirnoff activity in the selected period.")
+        return
+    total_cases = float(sf_df["Cases"].sum())
+    total_ly    = float(sf_df["LyCases"].sum())
+    # Jamum stripe
+    jamum = sf_df[sf_df["BrandName"].str.contains(
+        "Jamum|Jamun", case=False, regex=True, na=False)]
+    jamum_cases = float(jamum["Cases"].sum())
+    jamum_ly    = float(jamum["LyCases"].sum())
+    jamum_share = (jamum_cases / total_cases * 100) if total_cases else 0.0
+    jamum_yoy_pct = ((jamum_cases - jamum_ly) / jamum_ly * 100) if jamum_ly > 0 else None
+
+    a, b, c = st.columns(3)
+    a.metric("Smirnoff family — period cases", f"{total_cases:,.0f} cs",
+             delta=(f"{(total_cases-total_ly)/total_ly*100:+.1f}% vs LY"
+                    if total_ly > 0 else None))
+    b.metric("Minty Jamum — period cases", f"{jamum_cases:,.0f} cs",
+             delta=(f"{jamum_yoy_pct:+.1f}% vs LY"
+                    if jamum_yoy_pct is not None else "no LY baseline"))
+    c.metric("Minty Jamum — share of family", f"{jamum_share:.1f}%")
+
+    display = sf_df[["BrandName", "Cases", "LyCases", "Rev"]].copy()
+    display["YoY Cases %"] = display.apply(
+        lambda r: _yoy_delta(r["Cases"], r["LyCases"])[0], axis=1)
+    display["% of family"] = (display["Cases"] / total_cases * 100
+                              if total_cases else 0.0).round(1)
+    display = display.rename(columns={
+        "BrandName": "Variant", "Cases": "Period cs",
+        "LyCases": "LY same period cs", "Rev": "Revenue"})
+
+    def _highlight(row):
+        is_jamum = "Jamum" in str(row["Variant"]) or "Jamun" in str(row["Variant"])
+        return ["background-color:#FEF3C7; font-weight:600" if is_jamum else ""
+                for _ in row]
+
+    styled = (display.style
+              .apply(_highlight, axis=1)
+              .format({
+                  "Period cs":       "{:,.0f}",
+                  "LY same period cs": "{:,.0f}",
+                  "Revenue":         format_inr,
+                  "% of family":     "{:.1f}%",
+              }))
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption(
+        "Highlighted row = Smirnoff Minty Jamum. Broken out separately "
+        "from the Top-10 brands table because its FY26 target has become "
+        "large enough to warrant its own tracker.")
+
+
 def _section_brand_growth(brands_df: pd.DataFrame) -> None:
     st.markdown("##### Top 10 brands — performance and growth")
     if brands_df.empty:
@@ -1180,6 +1282,7 @@ def render() -> None:
         principal_df = _load_principal_growth(start, end, ly_start, ly_end)
         channel_df   = _load_channel_revenue(start, end, principal_ids)
         brands_df    = _load_brand_growth(start, end, ly_start, ly_end, principal_ids)
+        smirnoff_df  = _load_smirnoff_family(start, end, ly_start, ly_end)
 
     if kpi["rev"] == 0 and kpi["ly_rev"] == 0:
         st.warning("No sales data for the selected period or filters.")
@@ -1197,3 +1300,5 @@ def render() -> None:
     _section_breakdown(principal_df, channel_df)
     st.divider()
     _section_brand_growth(brands_df)
+    st.divider()
+    _section_smirnoff_family(smirnoff_df)
