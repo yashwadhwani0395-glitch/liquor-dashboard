@@ -66,11 +66,11 @@
   "United Breweries__2026-07": {
     "breakdown": {
       "Cross Supply": 0,
-      "Institution": 20540,
-      "KW Beer": 32990
+      "Institution": 20000,
+      "KW Beer": 25000
     },
-    "total_cases": 53530,
-    "updated_at": "2026-07-01"
+    "total_cases": 45000,
+    "updated_at": "2026-07-10"
   },
   "United Spirits__2026-05": {
     "breakdown": {
