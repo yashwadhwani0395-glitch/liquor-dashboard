@@ -193,69 +193,8 @@ def _render_attention_today() -> None:
                f"₹{a['bounces']['amt']/1e5:.1f}L in 30d" if a["bounces"]["count"]
                else "no bounces 30d",
                high=1, mid=1)
-
-    with st.expander("🔍 Show top-5 offenders in each category",
-                     expanded=False):
-        # Banned
-        st.markdown("**🚫 Banned outlets that still owe us money**")
-        if a["banned"]["top"].empty:
-            st.caption("No banned parties with outstanding balance.")
-        else:
-            b = a["banned"]["top"].rename(columns={
-                "PartyName": "Party", "BalanceAmount": "Owed"})[["Party", "Owed"]]
-            st.dataframe(b.style.format({"Owed": format_inr}),
-                         use_container_width=True, hide_index=True)
-
-        # 90+ overdue
-        st.markdown("**⏰ Parties >90 days overdue** (drill in Debtors Ageing)")
-        if a["overdue"]["top"].empty:
-            st.caption("No 90+ overdue parties.")
-        else:
-            o = a["overdue"]["top"].rename(columns={
-                "PartyName": "Party", "Remaining": "Overdue ₹",
-                "MaxAge": "Oldest bill (days)"})[
-                ["Party", "Overdue ₹", "Oldest bill (days)"]]
-            st.dataframe(o.style.format({"Overdue ₹": format_inr,
-                                          "Oldest bill (days)": "{:.0f}"}),
-                         use_container_width=True, hide_index=True)
-
-        # Ghosted
-        st.markdown("**👻 Ghosted outlets** (no sales bill in 90+ days)")
-        if a["ghosted"]["top"].empty:
-            st.caption("No ghosted outlets.")
-        else:
-            g = a["ghosted"]["top"].rename(columns={
-                "PartyName": "Party", "DaysSinceLastBill": "Days silent",
-                "LastBillDate": "Last bill"})[
-                ["Party", "Last bill", "Days silent"]]
-            st.dataframe(g, use_container_width=True, hide_index=True)
-
-        # Stockouts
-        st.markdown("**📦 SKUs currently out of stock** (highest-value first)")
-        if a["oos"]["top"].empty:
-            st.caption("No stockouts.")
-        else:
-            keep_cols = [c for c in ("BrandName", "Principal", "ValRateCase",
-                                     "ItemID") if c in a["oos"]["top"].columns]
-            oos_show = a["oos"]["top"][keep_cols].rename(columns={
-                "BrandName": "Brand", "ValRateCase": "Rate/case (₹)",
-                "ItemID": "SKU"})
-            st.dataframe(
-                oos_show.style.format({"Rate/case (₹)": format_inr}),
-                use_container_width=True, hide_index=True)
-
-        # Bounces
-        st.markdown("**📉 Cheque returns in the last 30 days**")
-        if a["bounces"]["top"].empty:
-            st.caption("No cheque bounces in the last 30 days.")
-        else:
-            b = a["bounces"]["top"].rename(columns={
-                "PartyName": "Party", "TotalReturnedAmt": "Bounced ₹",
-                "ReturnCount": "# returns",
-                "DaysSinceLastReturn": "Days ago"})[
-                ["Party", "Bounced ₹", "# returns", "Days ago"]]
-            st.dataframe(b.style.format({"Bounced ₹": format_inr}),
-                         use_container_width=True, hide_index=True)
+    st.caption("Open the corresponding tab (Bans · Debtors Ageing · "
+               "Inventory) for the party-wise breakdown.")
 
 
 def _render_hero_strip(today: date) -> None:

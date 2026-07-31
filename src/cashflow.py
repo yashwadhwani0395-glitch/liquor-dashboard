@@ -331,6 +331,117 @@ def _section_trading(today: date) -> None:
     )
 
 
+def _section_cash_conversion_cycle(today: date) -> None:
+    """Cash Conversion Cycle — the single number that measures how many
+    days our cash is tied up in the working-capital pipe.
+
+        CCC = DIO + DSO − DPO
+
+        DIO (Days Inventory Outstanding) = Inventory / (annualised COGS) × 365
+        DSO (Days Sales Outstanding)     = Receivables / (annualised Rev) × 365
+        DPO (Days Payable Outstanding)   = Payables / (annualised COGS) × 365
+
+    Denominators use trailing 12 months so a one-off month can't distort
+    the story. Positive CCC = cash locked up; negative = we're funded by
+    suppliers. For a liquor distributor 40-70 days is typical; consistent
+    creep upward is a red flag (over-stocking or slow collections).
+    """
+    st.subheader("⏱️ Cash Conversion Cycle (live)")
+    st.caption(
+        "Days-Inventory + Days-Sales − Days-Payable. Denominators are "
+        "trailing 12-month totals so one-off spikes don't distort the "
+        "reading. Lower is better; below 30 days is elite, over 90 "
+        "means cash is stuck."
+    )
+
+    # ── Snapshots ──
+    debtors     = float(_load_head_balance(_GL_DEBTORS))
+    payables    = abs(float(_load_head_balance(_GL_CREDITORS)))
+    stock       = _load_stock_value_by_principal()
+    inv_val     = float(stock["CloseValue"].sum()) if not stock.empty else 0.0
+
+    # ── Trailing-12M flows ──
+    ttm_start = date(today.year - 1, today.month, min(today.day, 28))
+    mov = _load_movements_by_principal(ttm_start, today)
+    ttm_cogs      = float(mov[mov["Flow"] == "SAL"]["Value"].sum()) if not mov.empty else 0.0
+    ttm_purchases = float(mov[mov["Flow"] == "PUR"]["Value"].sum()) if not mov.empty else 0.0
+
+    # Revenue TTM — pull from sales.py's period-KPI loader
+    try:
+        from src.sales import _load_period_kpis
+        kpi = _load_period_kpis(ttm_start, today,
+                                # LY window doesn't matter for the TTM read
+                                ttm_start, today, ())
+        ttm_revenue = float(kpi.get("rev", 0.0))
+    except Exception:
+        ttm_revenue = 0.0
+
+    def _days(numerator: float, annual_denom: float) -> float:
+        return (numerator / annual_denom) * 365.0 if annual_denom > 0 else 0.0
+
+    dio = _days(inv_val,  ttm_cogs)
+    dso = _days(debtors,  ttm_revenue)
+    dpo = _days(payables, ttm_purchases)
+    ccc = dio + dso - dpo
+
+    # ── Hero metrics ──
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("DIO — days inventory", f"{dio:.0f} d",
+              help=f"Inventory {_cr(inv_val)} ÷ TTM COGS {_cr(ttm_cogs)} × 365. "
+                   f"Days of stock we hold at the current sell-through rate.")
+    c2.metric("DSO — days receivable", f"{dso:.0f} d",
+              help=f"Debtors {_cr(debtors)} ÷ TTM revenue {_cr(ttm_revenue)} × 365. "
+                   f"Average days customers take to pay us.")
+    c3.metric("DPO — days payable", f"{dpo:.0f} d",
+              help=f"Payables {_cr(payables)} ÷ TTM purchases {_cr(ttm_purchases)} × 365. "
+                   f"Average days we take to pay suppliers.")
+    ccc_color = "inverse" if ccc > 60 else "normal"
+    c4.metric("CCC — cash cycle", f"{ccc:.0f} d",
+              delta=f"{dio:.0f} + {dso:.0f} − {dpo:.0f}",
+              delta_color="off",
+              help="The Cash Conversion Cycle. Days it takes for a rupee "
+                   "spent on inventory to come back as cash from customers.")
+
+    # ── Waterfall bar ──
+    fig = go.Figure(go.Bar(
+        x=["DIO", "+ DSO", "− DPO", "= CCC"],
+        y=[dio, dso, -dpo, ccc],
+        marker_color=["#378ADD", "#1D9E75", "#EF9F27", "#1B4F72"],
+        text=[f"{v:+.0f}" if i != 0 and i != 3 else f"{v:.0f}"
+              for i, v in enumerate([dio, dso, -dpo, ccc])],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        height=280,
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="Days", zeroline=True, zerolinecolor="#9CA3AF"),
+        xaxis=dict(tickfont=dict(size=13)),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Interpretation caption ──
+    if ttm_cogs == 0 or ttm_revenue == 0:
+        st.warning("Trailing-12M denominators are zero — CCC not meaningful yet. "
+                   "This usually means TrVocItem doesn't have 12 months of history "
+                   "(Teknik's Indian-FY retention policy).")
+    else:
+        if ccc < 30:
+            verdict = "🟢 **Elite** — cash cycles very quickly."
+        elif ccc < 60:
+            verdict = "🟢 **Healthy** — typical for a well-run distributor."
+        elif ccc < 90:
+            verdict = "🟡 **Watch** — cash is starting to get stuck."
+        else:
+            verdict = "🔴 **High** — significant cash locked in the pipe. Chase collections, tighten stock."
+        st.caption(
+            f"{verdict}  Your rupee spent on stock takes **{ccc:.0f} days** "
+            f"to come back as cash. Suppliers effectively fund **{dpo:.0f} days** of that; "
+            f"the other **{max(ccc, 0):.0f} days** is our capital at work."
+        )
+
+
 def _section_working_capital(today: date) -> None:
     st.subheader("💼 Working-capital snapshot (live)")
     debtors   = _load_head_balance(_GL_DEBTORS)          # +ve = receivable
@@ -636,6 +747,9 @@ def render() -> None:
     st.divider()
 
     if sub.endswith("Overview"):
+        safe_section("Cash Conversion Cycle",
+                     _section_cash_conversion_cycle, today)
+        st.divider()
         safe_section("Working capital", _section_working_capital, today)
         st.divider()
         safe_section("Stock & trading", _section_trading, today)
