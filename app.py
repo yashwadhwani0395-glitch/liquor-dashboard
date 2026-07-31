@@ -1,7 +1,13 @@
 import hmac
 import traceback
+from datetime import datetime, timezone, timedelta
 import streamlit as st
 from db import get_connection_status
+
+# IST = UTC+5:30 — hard-coded because Streamlit Cloud runs in UTC and
+# datetime.now() there prints UTC hours by default. Kept as a constant
+# so timezone handling is obvious to anyone reading the header code.
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 st.set_page_config(
     page_title="KWPL Dashboard",
@@ -152,11 +158,35 @@ footer    { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 # ── Header bar ───────────────────────────────────────────────────────────────
+# Track when the cache was last fully cleared. Streamlit's @st.cache_data
+# has per-function TTLs so a global "last fresh" doesn't exist natively —
+# we stamp it ourselves whenever the user clicks 🔄 Refresh (or when the
+# app cold-starts). Shown as a caption in the header so the owner always
+# knows how fresh the numbers are.
+if "last_refresh_at" not in st.session_state:
+    st.session_state["last_refresh_at"] = datetime.now(_IST)
+
+now_ist   = datetime.now(_IST)
+refresh   = st.session_state["last_refresh_at"]
+age_min   = int((now_ist - refresh).total_seconds() // 60)
+if age_min < 1:
+    age_txt = "just now"
+elif age_min < 60:
+    age_txt = f"{age_min}m ago"
+else:
+    age_txt = f"{age_min // 60}h {age_min % 60}m ago"
+
 status = get_connection_status()
 status_html = (
     '<span class="kwpl-status">● DB Connected</span>'
     if status else
     '<span class="kwpl-status-off">● DB Offline</span>'
+)
+freshness_html = (
+    f'<span style="color:rgba(255,255,255,0.75); font-size:0.72rem; '
+    f'margin-right:12px">'
+    f'Now {now_ist.strftime("%H:%M")} IST · Last refresh {refresh.strftime("%H:%M")} '
+    f'({age_txt})</span>'
 )
 _hdr, _btn_refresh, _btn_logout = st.columns([11, 1, 1])
 with _hdr:
@@ -166,7 +196,10 @@ with _hdr:
             <div class="kwpl-logo">KWPL</div>
             <div class="kwpl-sub">Kranti Wines Pvt. Ltd.</div>
         </div>
-        {status_html}
+        <div style="display:flex; align-items:center">
+            {freshness_html}
+            {status_html}
+        </div>
     </div>
     """, unsafe_allow_html=True)
 with _btn_refresh:
@@ -177,6 +210,7 @@ with _btn_refresh:
         # Also re-probe the connection in case it was stale
         from db import get_connection
         get_connection.clear()
+        st.session_state["last_refresh_at"] = datetime.now(_IST)
         st.rerun()
 with _btn_logout:
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)

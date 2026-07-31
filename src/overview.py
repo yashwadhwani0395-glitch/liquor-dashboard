@@ -22,6 +22,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
+from db import run_query
 from utils.helpers import (
     current_month_range, same_mtd_window, format_inr, mtd_label,
 )
@@ -385,6 +386,174 @@ def _render_cash_and_stock() -> None:
             st.caption(f"By principal:  {lines}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Q4 — Party search: type any part of a party name, get a snapshot card
+# ═══════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _search_parties(query: str) -> pd.DataFrame:
+    """Return top 10 parties whose name/id matches the query (case-insensitive)."""
+    if not query or len(query.strip()) < 2:
+        return pd.DataFrame()
+    q = f"%{query.strip().lower()}%"
+    return run_query("""
+        SELECT TOP 10
+            PartyID,
+            PartyName,
+            ISNULL(CreditDays, 0)                     AS CreditDays,
+            ISNULL(BannedByAssoc, '')                 AS BannedByAssoc,
+            ISNULL(AssoBan_Type, '')                  AS AssoBanType,
+            ISNULL(AssoBilling_YN, '')                AS AssoBillingYN,
+            ISNULL(LicenseTypeID, '')                 AS LicenseTypeID
+        FROM MsPartyMaster
+        WHERE PartyID LIKE 'D%'
+          AND (LOWER(PartyName) LIKE ? OR LOWER(PartyID) LIKE ?)
+        ORDER BY PartyName
+    """, (q, q))
+
+
+def _render_party_search() -> None:
+    st.markdown("### 🔎 Look up an outlet")
+    q = st.text_input(
+        "Type a party name or PartyID (e.g. 'amul', 'walvekar', 'D000012')",
+        key="ov_party_search",
+        label_visibility="collapsed",
+        placeholder="Type a party name or PartyID (min 2 characters)…",
+    )
+    if not q or len(q.strip()) < 2:
+        st.caption("Type at least 2 characters to search. Results include "
+                   "credit days, ban status, current outstanding, last bill "
+                   "date, and last cheque bounce.")
+        return
+
+    try:
+        matches = _search_parties(q)
+    except Exception as e:
+        st.warning(f"Search unavailable: `{e}`"); return
+
+    if matches.empty:
+        st.info(f"No parties match `{q}`.")
+        return
+
+    # Enrich each match with outstanding + last bill + cheque bounces
+    try:
+        ledger  = _load_ledger()
+        unpaid  = _fifo_unpaid(ledger, pd.Timestamp(date.today()))
+        lb      = _load_last_bill_per_party()
+        cheques = _load_cheque_returns_per_party()
+    except Exception:
+        ledger = unpaid = lb = cheques = pd.DataFrame()
+
+    if not unpaid.empty:
+        owed = unpaid.groupby("PartyID")["Remaining"].sum().to_dict()
+        max_age = unpaid.groupby("PartyID")["AgeDays"].max().to_dict()
+    else:
+        owed, max_age = {}, {}
+    last_bill_map = (lb.set_index("PartyID")[["LastBillDate", "DaysSinceLastBill"]]
+                     .to_dict("index") if not lb.empty else {})
+    cheque_map = (cheques.set_index("PartyID")[
+                    ["ReturnCount", "TotalReturnedAmt", "DaysSinceLastReturn"]]
+                  .to_dict("index") if not cheques.empty else {})
+
+    st.caption(f"{len(matches)} match{'es' if len(matches) != 1 else ''} for `{q}`.")
+    for _, r in matches.iterrows():
+        pid  = r["PartyID"]
+        name = r["PartyName"] or "(no name)"
+        owed_amt = float(owed.get(pid, 0))
+        oldest = int(max_age.get(pid, 0))
+        lb_info = last_bill_map.get(pid, {})
+        days_silent = int(lb_info.get("DaysSinceLastBill", -1))
+        last_bill_date = lb_info.get("LastBillDate")
+        ch = cheque_map.get(pid, {})
+
+        # Ban badge
+        ban_html = ""
+        if r["BannedByAssoc"] == "Y":
+            reason = r["AssoBanType"] or "reason not recorded"
+            ban_html = (f"<span style='background:#fee2e2; color:#991b1b; "
+                        f"padding:2px 8px; border-radius:12px; font-size:0.7rem; "
+                        f"font-weight:700'>🚫 BANNED · {reason}</span> ")
+
+        # Silent badge
+        silent_html = ""
+        if days_silent >= 90:
+            silent_html = (f"<span style='background:#fef3c7; color:#92400e; "
+                           f"padding:2px 8px; border-radius:12px; font-size:0.7rem; "
+                           f"font-weight:700'>👻 SILENT {days_silent}d</span> ")
+
+        with st.container(border=True):
+            st.markdown(f"""
+            <div style='display:flex; justify-content:space-between; align-items:flex-start'>
+              <div>
+                <div style='font-size:1rem; font-weight:700; color:#111827'>{name}</div>
+                <div style='font-size:0.78rem; color:#6b7280; margin-top:2px'>
+                  PartyID <code>{pid}</code> · Credit days: {int(r['CreditDays'])}
+                </div>
+                <div style='margin-top:6px'>{ban_html}{silent_html}</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            cA, cB, cC, cD = st.columns(4)
+            cA.metric("Currently owed", format_inr(owed_amt))
+            cB.metric("Oldest bill (d)",
+                      f"{oldest}" if oldest else "—",
+                      help="Days since the oldest unpaid bill was raised.")
+            cC.metric("Last bill",
+                      last_bill_date.strftime("%d-%b-%y")
+                        if last_bill_date is not None
+                        and not pd.isna(last_bill_date) else "never",
+                      delta=f"{days_silent}d ago"
+                        if days_silent >= 0 else None,
+                      delta_color="inverse")
+            if ch:
+                cD.metric("Cheque bounces",
+                          f"{int(ch['ReturnCount'])}",
+                          delta=f"₹{ch['TotalReturnedAmt']/1e5:.1f}L "
+                                f"· last {int(ch['DaysSinceLastReturn'])}d ago",
+                          delta_color="inverse")
+            else:
+                cD.metric("Cheque bounces", "0")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Q5 — Quick jumps: 5 one-click shortcuts to the pages you open daily
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _jump_to(page: str) -> None:
+    """Set the top-nav radio to `page` and rerun so the user lands there.
+    Works because app.py's radio is keyed 'top_nav' — writing that key
+    before the widget renders puts it in the requested state.
+    """
+    st.session_state["top_nav"] = page
+    st.rerun()
+
+
+def _render_quick_jumps() -> None:
+    st.markdown("### ⭐ Quick jumps")
+    cols = st.columns(5)
+    with cols[0]:
+        if st.button("📋 Sales Plan\n(edit targets)",
+                     key="qj_sp", use_container_width=True):
+            _jump_to("Sales")
+    with cols[1]:
+        if st.button("💰 Debtors\n(chase money)",
+                     key="qj_db", use_container_width=True):
+            _jump_to("Debtors Ageing")
+    with cols[2]:
+        if st.button("📊 Meeting Pack\n(principal deck)",
+                     key="qj_mp", use_container_width=True):
+            _jump_to("Sales")
+    with cols[3]:
+        if st.button("📦 Inventory\n(stock status)",
+                     key="qj_inv", use_container_width=True):
+            _jump_to("Purchase")
+    with cols[4]:
+        if st.button("💵 Cash Flow\n(bank position)",
+                     key="qj_cf", use_container_width=True):
+            _jump_to("Cash Flow")
+
+
 def render() -> None:
     st.title("📊 Overview")
     st.caption(
@@ -400,3 +569,7 @@ def render() -> None:
     _render_principals(today)
     st.divider()
     _render_cash_and_stock()
+    st.divider()
+    _render_quick_jumps()
+    st.divider()
+    _render_party_search()
