@@ -15,6 +15,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Windows terminals default to cp1252 which chokes on ₹, →, • etc. that
+# appear in tracebacks from pages using Indian rupee formatting. Force
+# UTF-8 so failures print cleanly instead of masking the real error
+# with a UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Streamlit stub — minimal subset for render-path coverage
@@ -86,6 +96,18 @@ class _Stub:
         class _CC:
             @staticmethod
             def Column(label, **k): return label
+            @staticmethod
+            def NumberColumn(label, **k): return label
+            @staticmethod
+            def TextColumn(label, **k): return label
+            @staticmethod
+            def SelectboxColumn(label, **k): return label
+            @staticmethod
+            def CheckboxColumn(label, **k): return label
+            @staticmethod
+            def DateColumn(label, **k): return label
+            @staticmethod
+            def LinkColumn(label, **k): return label
         return _CC()
     def rerun(self): pass
     def stop(self): pass
@@ -132,7 +154,7 @@ print("=" * 70)
 
 # ── Module imports ───────────────────────────────────────────────────────
 print("\n[1/3] Module imports")
-modules = ["overview","sales","salesman","distribution","principal","operations",
+modules = ["overview","bans","sales","salesman","distribution","principal","operations",
            "sales_plan","purchase","inventory","debtors","expenses","cashflow","balance_sheet",
            "discounts","nrm"]
 for mod in modules:
@@ -148,6 +170,7 @@ for mod in modules:
 # ── Page renders ─────────────────────────────────────────────────────────
 print("\n[2/3] Page render() calls")
 from src.overview    import render as r_overview
+from src.bans        import render as r_bans
 from src.sales       import render as r_sales
 from src.salesman    import render as r_salesman
 from src.distribution import render as r_distribution
@@ -164,6 +187,7 @@ from src.discounts   import render as r_discounts
 from src.nrm         import render as r_nrm
 
 test_page("Overview",         r_overview)
+test_page("Bans",             r_bans)
 test_page("Sales Overview",   r_sales)
 test_page("Team Performance", r_salesman)
 test_page("Distribution",     r_distribution)

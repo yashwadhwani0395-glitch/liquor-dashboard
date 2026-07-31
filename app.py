@@ -251,6 +251,7 @@ def coming_soon(title: str, desc: str, icon: str = "🚧") -> None:
 # consistent. Each module is small at import time (heavy work is gated by
 # @st.cache_data on call), so memory cost is negligible.
 from src.overview     import render as render_overview
+from src.bans         import render as render_bans
 from src.purchase     import render as render_purchase
 from src.inventory    import render as render_inventory
 from src.sales_plan   import render as render_sales_plan
@@ -293,7 +294,7 @@ def safe_render(fn, page_label: str) -> None:
 
 
 _PAGES = ["Overview", "Purchase", "Sales", "NRM", "Discounts",
-          "Expenses", "Debtors Ageing", "Cash Flow", "Balance Sheet"]
+          "Expenses", "Debtors Ageing", "Bans", "Cash Flow", "Balance Sheet"]
 page = st.radio("Section", _PAGES, horizontal=True, key="top_nav",
                 label_visibility="collapsed")
 st.divider()
@@ -341,6 +342,9 @@ elif page == "Expenses":
 
 elif page == "Debtors Ageing":
     safe_render(render_debtors, "Debtors Ageing")
+
+elif page == "Bans":
+    safe_render(render_bans, "Trader Association Bans")
 
 elif page == "Cash Flow":
     safe_render(render_cashflow, "Cash Flow")
