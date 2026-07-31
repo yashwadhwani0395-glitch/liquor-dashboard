@@ -1,0 +1,56 @@
+name: Morning digest
+
+# Fires at 03:30 UTC every weekday = 09:00 IST Mon-Fri.
+# Adjust the cron below if you want Saturday briefings too, or a
+# different time.
+#
+# One-time setup — GitHub → repo Settings → Secrets and variables →
+# Actions → New repository secret. Add ALL of these:
+#
+#   DB_SERVER        e.g. 182.156.137.121,5235
+#   DB_NAME          e.g. KW2526
+#   DB_USER          e.g. KWPL
+#   DB_PASSWORD      the SQL password
+#   SMTP_USER        Gmail address that sends the digest
+#   SMTP_PASSWORD    Gmail App Password — NOT the account password.
+#                    Generate at https://myaccount.google.com/apppasswords
+#                    (requires 2-Step Verification enabled first).
+#   DIGEST_TO        comma-separated recipient list, e.g.
+#                    yashwadhwani0395@gmail.com,kranti@example.com
+#
+# Optional Variables (repo Settings → Variables → New repository variable):
+#   STREAMLIT_APP_URL  used by the existing keepalive; the digest picks
+#                      it up too so the email links back to the app.
+#
+# Free tier note: this uses ~15 seconds per run × 22 weekdays/month
+# ≈ 6 minutes/month against GitHub's 2000-min free tier.
+
+on:
+  schedule:
+    - cron: '30 3 * * 1-5'     # 03:30 UTC = 09:00 IST, Mon–Fri
+  workflow_dispatch:            # manual "Run workflow" for testing
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pymssql pandas
+
+      - name: Send morning digest
+        env:
+          DB_SERVER:       ${{ secrets.DB_SERVER }}
+          DB_NAME:         ${{ secrets.DB_NAME }}
+          DB_USER:         ${{ secrets.DB_USER }}
+          DB_PASSWORD:     ${{ secrets.DB_PASSWORD }}
+          SMTP_USER:       ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:   ${{ secrets.SMTP_PASSWORD }}
+          DIGEST_TO:       ${{ secrets.DIGEST_TO }}
+          DIGEST_APP_URL:  ${{ vars.STREAMLIT_APP_URL }}
+        run: python scripts/send_digest.py
