@@ -261,6 +261,7 @@ from src.salesman     import render as render_salesman
 from src.distribution import render as render_distribution
 from src.principal    import render as render_principal
 from src.operations   import render as render_operations
+from src.reactivation import render as render_reactivation
 from src.discounts    import render as render_discounts
 from src.expenses     import render as render_expenses
 from src.debtors      import render as render_debtors
@@ -313,7 +314,7 @@ elif page == "Purchase":
 elif page == "Sales":
     _SALES = ["Sales Plan", "Sales Overview", "Segment Analysis",
               "Team Performance", "Distribution", "Meeting Pack",
-              "Operations Rhythm"]
+              "Operations Rhythm", "Reactivation"]
     sub = st.radio("View", _SALES, horizontal=True, key="sales_nav",
                    label_visibility="collapsed")
     if sub == "Sales Plan":
@@ -328,8 +329,10 @@ elif page == "Sales":
         safe_render(render_distribution, "Distribution")
     elif sub == "Meeting Pack":
         safe_render(render_principal, "Meeting Pack")
-    else:
+    elif sub == "Operations Rhythm":
         safe_render(render_operations, "Operations Rhythm")
+    else:
+        safe_render(render_reactivation, "Reactivation")
 
 elif page == "NRM":
     safe_render(render_nrm, "NRM Planner")

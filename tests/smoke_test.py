@@ -154,7 +154,7 @@ print("=" * 70)
 
 # ── Module imports ───────────────────────────────────────────────────────
 print("\n[1/3] Module imports")
-modules = ["overview","bans","sales","salesman","distribution","principal","operations",
+modules = ["overview","bans","reactivation","sales","salesman","distribution","principal","operations",
            "sales_plan","purchase","inventory","debtors","expenses","cashflow","balance_sheet",
            "discounts","nrm"]
 for mod in modules:
@@ -169,9 +169,10 @@ for mod in modules:
 
 # ── Page renders ─────────────────────────────────────────────────────────
 print("\n[2/3] Page render() calls")
-from src.overview    import render as r_overview
-from src.bans        import render as r_bans
-from src.sales       import render as r_sales
+from src.overview     import render as r_overview
+from src.bans         import render as r_bans
+from src.reactivation import render as r_reactivation
+from src.sales        import render as r_sales
 from src.salesman    import render as r_salesman
 from src.distribution import render as r_distribution
 from src.principal   import render as r_principal
@@ -188,6 +189,7 @@ from src.nrm         import render as r_nrm
 
 test_page("Overview",         r_overview)
 test_page("Bans",             r_bans)
+test_page("Reactivation",     r_reactivation)
 test_page("Sales Overview",   r_sales)
 test_page("Team Performance", r_salesman)
 test_page("Distribution",     r_distribution)
