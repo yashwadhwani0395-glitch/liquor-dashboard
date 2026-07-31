@@ -1222,8 +1222,19 @@ def _subtarget_cards(target_entry: dict, achieved_by_team: dict[str, float],
 # the old snapshot AND records the restore in the log (so the undo itself is
 # undoable).
 def _edit_target_controls(principal: str, op_month: str,
-                          target_entry: dict) -> None:
-    """Render the Edit/Undo controls under the hero card.
+                          target_entry: dict,
+                          subteams: dict[str, list[str]] | None = None) -> None:
+    """Render the Edit / Clear / Undo controls under the hero card.
+
+    Two edit paths:
+      · ✏️ Edit values — opens an inline form pre-filled with the current
+        breakdown. Owner tweaks one channel or several and hits Save.
+        This is the fast-edit path — no data lost, no restart.
+      · 🗑️ Clear target — the pre-existing destructive path: wipes the
+        entry so `_no_target_form` renders on next load. Useful when
+        starting a month fresh or if the current entry is corrupt.
+
+    Both routes snapshot to the undo log so mistakes are recoverable.
 
     Uses session_state to keep the multi-step confirm flow alive across
     Streamlit reruns. All keys are scoped to (principal, op_month) so
@@ -1234,20 +1245,121 @@ def _edit_target_controls(principal: str, op_month: str,
 
     pending_clear_key = f"_clear_pending__{principal}__{op_month}"
     pending_undo_key  = f"_undo_pending__{principal}__{op_month}"
+    edit_open_key     = f"_edit_open__{principal}__{op_month}"
 
-    # ── Row of buttons (Edit + Undo if available) ──
+    # ── Row of buttons ──
     has_undo = can_undo(principal, op_month, kind="principal_target")
-    cols = st.columns([1, 1, 4]) if has_undo else st.columns([1, 5])
-    with cols[0]:
-        if st.button("✏️ Edit target", key=f"edit_tgt_{principal}_{op_month}"):
+    button_specs = [("edit",), ("clear",)]
+    if has_undo:
+        button_specs.append(("undo",))
+    col_widths = [1] * len(button_specs) + [max(1, 6 - len(button_specs))]
+    cols = st.columns(col_widths)
+    idx = 0
+    with cols[idx]:
+        if st.button("✏️ Edit values",
+                     key=f"edit_vals_{principal}_{op_month}",
+                     help="Fast-edit the existing target — pre-filled form, "
+                          "no data loss."):
+            st.session_state[edit_open_key] = True
+            st.rerun()
+    idx += 1
+    with cols[idx]:
+        if st.button("🗑️ Clear target",
+                     key=f"clear_tgt_{principal}_{op_month}",
+                     help="Wipe the entry — use only if you want to start "
+                          "from scratch. Recoverable via ↩️ Undo."):
             st.session_state[pending_clear_key] = True
             st.rerun()
+    idx += 1
     if has_undo:
-        with cols[1]:
+        with cols[idx]:
             if st.button("↩️ Undo last change",
                          key=f"undo_tgt_{principal}_{op_month}"):
                 st.session_state[pending_undo_key] = get_last_undo_entry(
                     principal, op_month, kind="principal_target")
+                st.rerun()
+
+    # ── Edit-in-place form ──
+    # Pre-filled with the current breakdown so owner only tweaks what's
+    # changing. Save routes through save_principal_target + undo snapshot,
+    # so a bad save is one-click recoverable.
+    if st.session_state.get(edit_open_key):
+        cur_breakdown = dict(target_entry.get("breakdown", {}))
+        # Merge with the principal's canonical sub-teams so a channel that
+        # doesn't exist in the current entry (e.g. Cross Supply was 0 last
+        # month and got omitted) still shows up as an editable input.
+        canonical = list(subteams.keys()) if subteams else []
+        editable_keys = list(dict.fromkeys(canonical + list(cur_breakdown.keys())))
+        with st.form(f"edit_tgt_form_{principal}_{op_month}"):
+            st.markdown(
+                f"**Edit {principal} — {_fmt_month(op_month)} target**  "
+                f"<span style='color:#6b7280;font-size:0.85rem'>"
+                f"(fields pre-filled with current values)</span>",
+                unsafe_allow_html=True,
+            )
+            cols = st.columns(max(1, len(editable_keys)))
+            new_breakdown: dict[str, int] = {}
+            for col, key in zip(cols, editable_keys):
+                with col:
+                    v = st.number_input(
+                        f"{key} cases",
+                        min_value=0, step=500,
+                        value=int(cur_breakdown.get(key, 0)),
+                        key=f"edit_val_{principal}_{key}_{op_month}",
+                    )
+                    new_breakdown[key] = int(v)
+            new_total = sum(new_breakdown.values())
+            old_total = int(target_entry.get("total_cases", 0))
+            delta = new_total - old_total
+            delta_color = "#16a34a" if delta > 0 else ("#dc2626" if delta < 0 else "#6b7280")
+            st.markdown(
+                f"**New total: {new_total:,} cases**  "
+                f"<span style='color:{delta_color};font-weight:600'>"
+                f"({delta:+,} vs current {old_total:,})</span>",
+                unsafe_allow_html=True,
+            )
+            c_save, c_cancel, _ = st.columns([1, 1, 4])
+            with c_save:
+                edit_saved = st.form_submit_button("💾 Save changes",
+                                                   type="primary")
+            with c_cancel:
+                edit_cancel = st.form_submit_button("✗ Cancel")
+        if edit_cancel:
+            st.session_state.pop(edit_open_key, None)
+            st.rerun()
+        if edit_saved:
+            if new_total == 0:
+                st.warning("Total is zero. Use 🗑️ Clear target if you want "
+                           "to wipe the entry entirely.")
+            else:
+                # Drop zero-value channels from the saved breakdown to keep
+                # the JSON tidy (matches the convention used by _no_target_form
+                # and my earlier manual edits).
+                clean_breakdown = {k: v for k, v in new_breakdown.items() if v > 0}
+                # Include any 0-value channels the user explicitly kept if
+                # they were in the canonical set — otherwise Sales Plan
+                # rendering silently drops the card. Preserve 0s only for
+                # channels that were in the canonical subteams list.
+                for k in canonical:
+                    if k not in clean_breakdown:
+                        clean_breakdown[k] = 0
+                append_undo_entry(
+                    principal, op_month,
+                    kind="principal_target",
+                    old_snapshot=target_entry,
+                    new_snapshot={
+                        "total_cases": new_total,
+                        "breakdown":   clean_breakdown,
+                        "updated_at":  date.today().isoformat(),
+                    },
+                    user_action="edit_values",
+                )
+                save_principal_target(principal, op_month, new_total, clean_breakdown)
+                st.session_state.pop(edit_open_key, None)
+                st.success(
+                    f"Saved {principal} {_fmt_month(op_month)}: "
+                    f"{new_total:,} cases ({delta:+,} vs previous)."
+                )
                 st.rerun()
 
     # ── Confirm banner for CLEAR ──
@@ -2560,7 +2672,8 @@ def render() -> None:
 
         safe_section("Segments", _section_segment_breakdown, cid, op_month)
 
-        _edit_target_controls(principal, op_month, target_entry)
+        _edit_target_controls(principal, op_month, target_entry,
+                              subteams=cfg["subteams"])
 
     st.divider()
 
