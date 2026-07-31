@@ -97,6 +97,17 @@ SALES_TT: tuple[int, ...] = (
 # Set membership for fast Python-side lookups
 SALES_TT_SET: frozenset[int] = frozenset(SALES_TT)
 
+# Bounced-cheque TransType. When a cheque returns unpaid, TT=12 debits
+# the customer's ledger for the reversed amount — that money is genuinely
+# owed to us even though there's no fresh sales invoice behind it.
+BOUNCE_TT: int = 12
+
+# What counts as "open outstanding" for FIFO / dead-money math. Wider
+# than SALES_TT because a party can also owe us via bounced cheques
+# even after all their invoices have been formally cleared. Not wider
+# than that — old ROs / SOs are still excluded.
+OPEN_TT_SET: frozenset[int] = SALES_TT_SET | {BOUNCE_TT}
+
 # PDC (post-dated cheque) exclusion: any CR-side row whose VoucherDate
 # is in the future is a cheque entered but not yet cleared. We exclude
 # them from the FIFO Cr pool until they actually clear (= today catches
@@ -319,6 +330,13 @@ def _load_ledger() -> pd.DataFrame:
     See module docstring for the rationale.
     """
     sales_csv = ",".join(str(t) for t in SALES_TT)
+    # Widen the outer filter to include bounced cheques (TT=12) as open
+    # items, otherwise parties whose only remaining exposure is bounced-
+    # cheque debt (no fresh sales invoice) are invisibly excluded from
+    # dead-money / 90+ / all downstream ageing views. _fifo_unpaid tags
+    # bounced-cheque rows as "Bounced cheque" so they never mix with the
+    # normal principal totals.
+    open_csv = ",".join(str(t) for t in sorted(OPEN_TT_SET))
     sql = f"""
         WITH bill_brands AS (
             SELECT
@@ -398,7 +416,7 @@ def _load_ledger() -> pd.DataFrame:
           -- filter defensively in pandas.
           AND d.DrCrIndicator = 'D'
           AND CAST(d.BalanceAmount AS float) > 0.5
-          AND d.TransTypeID IN ({sales_csv})
+          AND d.TransTypeID IN ({open_csv})
           -- Drop any forward-dated DR rows (shouldn't exist but protects
           -- against data-entry slip-ups).
           AND CAST(h.VoucherDate AS date) <= CAST(GETDATE() AS date)
@@ -667,41 +685,53 @@ def _fifo_unpaid(ledger: pd.DataFrame,
                  party_closebal: dict[str, float] | None = None) -> pd.DataFrame:
     """Mirror Teknik's Manual Matching report, bill for bill.
 
-    An open bill = a SALES-BILL Dr row (transtype in SALES_TT — the 'MS'
-    invoices) that still carries BalanceAmount > 0. Its Remaining is exactly
-    that BalanceAmount — the same per-bill figure the manual-matching screen
-    shows — and it is aged by its OWN bill date.
+    An open item = a Dr row in OPEN_TT_SET (sales bills in SALES_TT
+    plus bounced cheques in TT=12) that still carries BalanceAmount > 0.
+    Its Remaining is exactly that BalanceAmount — the same per-bill
+    figure the manual-matching screen shows — and it is aged by its
+    OWN bill date.
 
-    We deliberately EXCLUDE non-bill Dr rows that also carry a stale
-    BalanceAmount: Receipt Orders (RO), Sales Orders (SO, not yet billed),
-    bank/payment vouchers (BP) etc. Those are receipts/orders, not outstanding
-    invoices — counting them wrongly inflated the 90+ tail (e.g. EAGLE's old
-    RO rows showed as ₹46 L of 90+ when in reality every EAGLE invoice is paid).
-    Restricting to sales bills reconciles the total to the manual-matching
-    report (~₹59 Cr) and correctly shows active accounts with no 90+.
+    Bounced cheques (TT=12) are included even though they aren't sales
+    bills — when a cheque returns unpaid, the ERP debits the customer's
+    ledger to reverse the earlier credit, and that debit is real money
+    owed. Without it, ghosted parties whose only remaining exposure is
+    bounced-cheque debt (e.g. YESHSHREE HOTEL, HANAMGHAR BEER SHOPEE)
+    were invisibly excluded from Dead Money and the >90-day view.
+
+    We deliberately EXCLUDE other non-bill Dr rows: Receipt Orders (RO),
+    Sales Orders (SO, not yet billed), unrelated bank/payment vouchers.
+    Those are receipts/orders, not outstanding — counting them wrongly
+    inflated the 90+ tail on cleared accounts (e.g. EAGLE's old RO rows
+    showed as ₹46 L of 90+ when every EAGLE invoice was actually paid).
 
     NO allocation, NO capping, NO newest/oldest re-ordering — a straight
-    roll-up of the real open invoices. (Paid invoices carry BalanceAmount = 0
+    roll-up of the real open items. (Cleared items carry BalanceAmount=0
     and never appear.) `party_closebal` is accepted for signature
-    compatibility but unused — the report is bill-driven, not balance-driven.
+    compatibility but unused — the report is item-driven.
     """
     drs = ledger.loc[
         (ledger["DrCrIndicator"] == "D")
         & (ledger["BalanceAmount"] > 0.5)
-        & (ledger["TransTypeID"].isin(SALES_TT_SET))
+        & (ledger["TransTypeID"].isin(OPEN_TT_SET))
     ].copy()
     if drs.empty:
         return drs
 
-    # Credit days per Dr row (McDowell/CD rule for sales; 40-day default else)
-    is_sales = drs["TransTypeID"].isin(SALES_TT_SET)
+    # Credit-days rule per row:
+    #   sales bills — 15 for McDowell / 17 for CD-item / 40 default
+    #   bounced cheques — 0 (immediately overdue; the party had every day
+    #     until the cheque bounced to clear the original bill).
+    is_sales  = drs["TransTypeID"].isin(SALES_TT_SET)
+    is_bounce = drs["TransTypeID"] == BOUNCE_TT
     drs["IsSalesBill"] = is_sales.astype(int)
     drs["CreditDays"] = np.where(
         is_sales & (drs["HasMcDowells"] == 1), 15,
-        np.where(is_sales & (drs["HasCDItem"] == 1), 17, 40),
+        np.where(is_sales & (drs["HasCDItem"] == 1), 17,
+                 np.where(is_sales, 40, 0)),   # bounces → 0
     )
     drs["Principal"] = drs["DominantPrincipal"].map(PRINCIPAL_MAP).fillna("Other")
     drs.loc[~is_sales, "Principal"] = "Adjustment (non-sales Dr)"
+    drs.loc[is_bounce, "Principal"] = "Bounced cheque"
 
     # Remaining = the bill's own open BalanceAmount. Nothing else.
     drs["Remaining"] = drs["BalanceAmount"]
