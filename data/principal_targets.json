@@ -45,6 +45,16 @@
     "total_cases": 8644,
     "updated_at": "2026-07-10"
   },
+  "Diageo__2026-08": {
+    "breakdown": {
+      "MOP": 348,
+      "One Day": 0,
+      "POP": 331,
+      "Retail": 4470
+    },
+    "total_cases": 5149,
+    "updated_at": "2026-08-05"
+  },
   "United Breweries__2026-05": {
     "breakdown": {
       "Cross Supply": 10000,
@@ -101,5 +111,15 @@
     },
     "total_cases": 16085,
     "updated_at": "2026-07-10"
+  },
+  "United Spirits__2026-08": {
+    "breakdown": {
+      "MOP": 500,
+      "One Day": 0,
+      "POP": 5,
+      "Retail": 14693
+    },
+    "total_cases": 15198,
+    "updated_at": "2026-08-05"
   }
 }
