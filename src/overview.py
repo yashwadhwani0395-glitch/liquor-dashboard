@@ -459,38 +459,56 @@ def _render_party_search() -> None:
 # Q5 — Quick jumps: 5 one-click shortcuts to the pages you open daily
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _jump_to(page: str) -> None:
-    """Set the top-nav radio to `page` and rerun so the user lands there.
-    Works because app.py's radio is keyed 'top_nav' — writing that key
-    before the widget renders puts it in the requested state.
+def _jump_cb(top: str, sub_key: str | None = None, sub_val: str | None = None):
+    """Button on_click callback — sets nav state BEFORE the next script
+    rerun instantiates the radios.
+
+    Doing this inside render() (rather than as a callback) throws
+    `st.session_state.top_nav cannot be modified after the widget was
+    instantiated` because app.py has already created the radio with that
+    key by the time Overview's render() runs. on_click fires on the
+    click event, before any widgets are re-created on the next pass,
+    so the writes go through cleanly.
     """
-    st.session_state["top_nav"] = page
-    st.rerun()
+    st.session_state["top_nav"] = top
+    if sub_key and sub_val is not None:
+        st.session_state[sub_key] = sub_val
 
 
 def _render_quick_jumps() -> None:
     st.markdown("### ⭐ Quick jumps")
     cols = st.columns(5)
     with cols[0]:
-        if st.button("📋 Sales Plan\n(edit targets)",
-                     key="qj_sp", use_container_width=True):
-            _jump_to("Sales")
+        st.button(
+            "📋 Sales Plan\n(edit targets)",
+            key="qj_sp", use_container_width=True,
+            on_click=_jump_cb,
+            kwargs=dict(top="Sales", sub_key="sales_nav",
+                        sub_val="Sales Plan"))
     with cols[1]:
-        if st.button("💰 Debtors\n(chase money)",
-                     key="qj_db", use_container_width=True):
-            _jump_to("Debtors Ageing")
+        st.button(
+            "💰 Debtors\n(chase money)",
+            key="qj_db", use_container_width=True,
+            on_click=_jump_cb, kwargs=dict(top="Debtors Ageing"))
     with cols[2]:
-        if st.button("📊 Meeting Pack\n(principal deck)",
-                     key="qj_mp", use_container_width=True):
-            _jump_to("Sales")
+        st.button(
+            "📊 Meeting Pack\n(principal deck)",
+            key="qj_mp", use_container_width=True,
+            on_click=_jump_cb,
+            kwargs=dict(top="Sales", sub_key="sales_nav",
+                        sub_val="Meeting Pack"))
     with cols[3]:
-        if st.button("📦 Inventory\n(stock status)",
-                     key="qj_inv", use_container_width=True):
-            _jump_to("Purchase")
+        st.button(
+            "📦 Inventory\n(stock status)",
+            key="qj_inv", use_container_width=True,
+            on_click=_jump_cb,
+            kwargs=dict(top="Purchase", sub_key="pur_nav",
+                        sub_val="🏭 Inventory"))
     with cols[4]:
-        if st.button("💵 Cash Flow\n(bank position)",
-                     key="qj_cf", use_container_width=True):
-            _jump_to("Cash Flow")
+        st.button(
+            "💵 Cash Flow\n(bank position)",
+            key="qj_cf", use_container_width=True,
+            on_click=_jump_cb, kwargs=dict(top="Cash Flow"))
 
 
 def render() -> None:
