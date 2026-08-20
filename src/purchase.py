@@ -808,9 +808,19 @@ def render() -> None:
 
     c1, c2 = st.columns([2, 1])
     with c1:
+        # Explicit min/max bounds — Streamlit 1.58+ makes the calendar's
+        # navigable range depend on the widget's `value` param, which
+        # gets shadowed by session_state on reruns. When today ticks
+        # forward (crosses into a new month), the picker can end up
+        # bounded by a stale session-state value and refuse to select
+        # the current month. Setting min/max explicitly keeps the whole
+        # historical window pickable regardless of what session_state
+        # carries over.
         date_range = st.date_input(
             "Period",
             value=(fy_start, today),
+            min_value=date(2020, 1, 1),
+            max_value=today,
             key="purchase_dates",
         )
     with c2:

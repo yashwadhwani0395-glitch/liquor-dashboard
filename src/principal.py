@@ -1011,9 +1011,12 @@ def render() -> None:
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
     c1, c2 = st.columns([3, 1])
     with c1:
+        # See src/purchase.py for the min/max_value rationale.
         date_range = st.date_input(
             "Period for analysis",
             value=(fy_start, today),
+            min_value=date(2020, 1, 1),
+            max_value=today,
             key="principal_dates",
         )
     if isinstance(date_range, tuple) and len(date_range) == 2:

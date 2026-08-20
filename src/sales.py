@@ -1240,9 +1240,14 @@ def render() -> None:
 
     c1, c2 = st.columns([2, 1])
     with c1:
+        # min/max_value explicit — Streamlit 1.58+ falls back to stale
+        # session_state bounds when today crosses into a new month, which
+        # then refuses to select the current-month range.
         date_range = st.date_input(
             "Analysis period",
             value=(fy_start, today),
+            min_value=date(2020, 1, 1),
+            max_value=today,
             key="sales_dates",
         )
     with c2:
