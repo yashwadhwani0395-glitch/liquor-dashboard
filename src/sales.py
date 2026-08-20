@@ -1169,8 +1169,15 @@ def _section_smirnoff_family(sf_df: pd.DataFrame) -> None:
     display = sf_df[["BrandName", "Cases", "LyCases", "Rev"]].copy()
     display["YoY Cases %"] = display.apply(
         lambda r: _yoy_delta(r["Cases"], r["LyCases"])[0], axis=1)
-    display["% of family"] = (display["Cases"] / total_cases * 100
-                              if total_cases else 0.0).round(1)
+    # NOTE: previously `(series_expr if total_cases else 0.0).round(1)` —
+    # when total_cases is 0 the ternary evaluates to the raw float 0.0,
+    # and float has no .round() method (that's Python's builtin round(),
+    # not an attribute). Crashed on any period with zero Smirnoff sales
+    # (trivially reachable via the "Today"/"Yesterday" quick-range presets).
+    if total_cases:
+        display["% of family"] = (display["Cases"] / total_cases * 100).round(1)
+    else:
+        display["% of family"] = 0.0
     display = display.rename(columns={
         "BrandName": "Variant", "Cases": "Period cs",
         "LyCases": "LY same period cs", "Rev": "Revenue"})
@@ -1246,14 +1253,14 @@ def render() -> None:
     c_from, c_to, c_pri = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
-            "From", value=fy_start,
+            "From",
             min_value=date(2020, 1, 1), max_value=today,
-            format="DD-MMM-YYYY", key="sales_start")
+            format="DD-MM-YYYY", key="sales_start")
     with c_to:
         end = st.date_input(
-            "To", value=today,
+            "To",
             min_value=date(2020, 1, 1), max_value=today,
-            format="DD-MMM-YYYY", key="sales_end")
+            format="DD-MM-YYYY", key="sales_end")
     with c_pri:
         principal_filter = st.multiselect(
             "Principal",

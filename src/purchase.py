@@ -815,23 +815,24 @@ def render() -> None:
     # default YYYY/MM/DD makes it hard to eyeball at a glance.
     _apply_date_preset("purchase", today, fy_start)
 
+    # No `value=` here — _apply_date_preset() already seeded
+    # session_state[key] above, and passing both triggers a Streamlit
+    # warning banner on every preset click.
     c_from, c_to, c_pri = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
             "From",
-            value=fy_start,
             min_value=date(2020, 1, 1),
             max_value=today,
-            format="DD-MMM-YYYY",
+            format="DD-MM-YYYY",
             key="purchase_start",
         )
     with c_to:
         end = st.date_input(
             "To",
-            value=today,
             min_value=date(2020, 1, 1),
             max_value=today,
-            format="DD-MMM-YYYY",
+            format="DD-MM-YYYY",
             key="purchase_end",
         )
     with c_pri:

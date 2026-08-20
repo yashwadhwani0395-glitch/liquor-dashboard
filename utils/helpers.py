@@ -102,15 +102,30 @@ def section_header(title: str, subtitle: str = ""):
 def _apply_date_preset(key_prefix: str, today: date, fy_start: date) -> None:
     """Render a row of quick-preset buttons that seed the From/To pickers.
 
+    Also seeds st.session_state[f'{key_prefix}_start'/'_end'] with the
+    FY-to-date default on first render (only if absent), so callers can
+    create their date_input widgets with ONLY `key=` and no `value=`.
+    Passing both `value=` and having a callback also write session_state
+    triggers Streamlit's "created with a default value but also had its
+    value set via the Session State API" warning banner on every preset
+    click — seeding once here and never touching `value=` downstream
+    avoids that noise entirely.
+
     Widgets that read st.session_state[f'{key_prefix}_start' / '_end']
     must be created AFTER this call. Preset writes happen inside on_click
     callbacks so they land before the next rerun instantiates the pickers,
     avoiding the 'session_state cannot be modified after widget instantiated'
     error.
     """
+    start_key, end_key = f"{key_prefix}_start", f"{key_prefix}_end"
+    if start_key not in st.session_state:
+        st.session_state[start_key] = fy_start
+    if end_key not in st.session_state:
+        st.session_state[end_key] = today
+
     def _set(start_val: date, end_val: date) -> None:
-        st.session_state[f"{key_prefix}_start"] = start_val
-        st.session_state[f"{key_prefix}_end"]   = end_val
+        st.session_state[start_key] = start_val
+        st.session_state[end_key]   = end_val
 
     # Current month = 1st of this month → today
     month_start = today.replace(day=1)

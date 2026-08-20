@@ -1014,14 +1014,14 @@ def render() -> None:
     c_from, c_to, _ = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
-            "From", value=fy_start,
+            "From",
             min_value=date(2020, 1, 1), max_value=today,
-            format="DD-MMM-YYYY", key="principal_start")
+            format="DD-MM-YYYY", key="principal_start")
     with c_to:
         end = st.date_input(
-            "To", value=today,
+            "To",
             min_value=date(2020, 1, 1), max_value=today,
-            format="DD-MMM-YYYY", key="principal_end")
+            format="DD-MM-YYYY", key="principal_end")
 
     if start > end:
         st.warning("Start date must be before end date.")
