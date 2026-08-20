@@ -806,24 +806,31 @@ def render() -> None:
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        # Explicit min/max bounds — Streamlit 1.58+ makes the calendar's
-        # navigable range depend on the widget's `value` param, which
-        # gets shadowed by session_state on reruns. When today ticks
-        # forward (crosses into a new month), the picker can end up
-        # bounded by a stale session-state value and refuse to select
-        # the current month. Setting min/max explicitly keeps the whole
-        # historical window pickable regardless of what session_state
-        # carries over.
-        date_range = st.date_input(
-            "Period",
-            value=(fy_start, today),
+    # Two separate From / To pickers instead of the range-mode widget.
+    # Streamlit's range date_input has a nasty bug: once session_state
+    # holds (start, end), clicking a NEW date AFTER the stored end
+    # (e.g. an August date when the stored end is in July) enters an
+    # invalid-range state and stops accepting further clicks. Two
+    # independent widgets sidestep it entirely — each one only has to
+    # obey its own min/max bounds.
+    c_from, c_to, c_pri = st.columns([1, 1, 2])
+    with c_from:
+        start = st.date_input(
+            "From",
+            value=fy_start,
             min_value=date(2020, 1, 1),
             max_value=today,
-            key="purchase_dates",
+            key="purchase_start",
         )
-    with c2:
+    with c_to:
+        end = st.date_input(
+            "To",
+            value=today,
+            min_value=date(2020, 1, 1),
+            max_value=today,
+            key="purchase_end",
+        )
+    with c_pri:
         principal_filter = st.multiselect(
             "Principal",
             options=list(_PRINCIPAL_NAMES.values()),
@@ -831,10 +838,6 @@ def render() -> None:
             key="purchase_principal_filter",
         )
 
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-    else:
-        start, end = fy_start, today
     if start > end:
         st.warning("Start date must be before end date.")
         return

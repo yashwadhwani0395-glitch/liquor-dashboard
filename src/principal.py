@@ -1009,20 +1009,18 @@ def render() -> None:
     # ── Date range ──
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        # See src/purchase.py for the min/max_value rationale.
-        date_range = st.date_input(
-            "Period for analysis",
-            value=(fy_start, today),
-            min_value=date(2020, 1, 1),
-            max_value=today,
-            key="principal_dates",
-        )
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-    else:
-        start, end = fy_start, today
+    # Two separate From / To pickers — see src/purchase.py for why.
+    c_from, c_to, _ = st.columns([1, 1, 2])
+    with c_from:
+        start = st.date_input(
+            "From", value=fy_start,
+            min_value=date(2020, 1, 1), max_value=today,
+            key="principal_start")
+    with c_to:
+        end = st.date_input(
+            "To", value=today,
+            min_value=date(2020, 1, 1), max_value=today,
+            key="principal_end")
 
     if start > end:
         st.warning("Start date must be before end date.")

@@ -1238,30 +1238,25 @@ def render() -> None:
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        # min/max_value explicit — Streamlit 1.58+ falls back to stale
-        # session_state bounds when today crosses into a new month, which
-        # then refuses to select the current-month range.
-        date_range = st.date_input(
-            "Analysis period",
-            value=(fy_start, today),
-            min_value=date(2020, 1, 1),
-            max_value=today,
-            key="sales_dates",
-        )
-    with c2:
+    # Two separate From / To pickers — see src/purchase.py for why.
+    c_from, c_to, c_pri = st.columns([1, 1, 2])
+    with c_from:
+        start = st.date_input(
+            "From", value=fy_start,
+            min_value=date(2020, 1, 1), max_value=today,
+            key="sales_start")
+    with c_to:
+        end = st.date_input(
+            "To", value=today,
+            min_value=date(2020, 1, 1), max_value=today,
+            key="sales_end")
+    with c_pri:
         principal_filter = st.multiselect(
             "Principal",
             options=list(_PRINCIPAL_NAMES.values()),
             default=[],
             key="sales_principal_filter",
         )
-
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start, end = date_range
-    else:
-        start, end = fy_start, today
     if start > end:
         st.warning("Start date must be before end date.")
         return
