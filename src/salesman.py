@@ -24,6 +24,7 @@ from utils.helpers import (
     same_mtd_window,
     mtd_sum_in_window,
     mtd_label,
+    _apply_date_preset,
 )
 from src.distribution import (
     SALESMAN_MAP,
@@ -659,18 +660,19 @@ def render() -> None:
     # ── Date range ──
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
-    # Two separate From / To pickers — see src/purchase.py for why.
+    # From / To + presets — see src/purchase.py for why we split range.
+    _apply_date_preset("sm", today, fy_start)
     c_from, c_to, _ = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
             "From", value=fy_start,
             min_value=date(2020, 1, 1), max_value=today,
-            key="sm_start")
+            format="DD-MMM-YYYY", key="sm_start")
     with c_to:
         end = st.date_input(
             "To", value=today,
             min_value=date(2020, 1, 1), max_value=today,
-            key="sm_end")
+            format="DD-MMM-YYYY", key="sm_end")
     if start > end:
         st.warning("Start date must be before end date.")
         return

@@ -25,6 +25,7 @@ from utils.helpers import (
     same_mtd_window,
     mtd_sum_in_window,
     mtd_label,
+    _apply_date_preset,
 )
 
 # ── Sales transaction type IDs ──────────────────────────────────────────────
@@ -1238,18 +1239,21 @@ def render() -> None:
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-    # Two separate From / To pickers — see src/purchase.py for why.
+    # Two From / To pickers + quick-preset row + DD-MMM-YYYY format
+    # so the month name is visible. See src/purchase.py for why we
+    # split the range picker.
+    _apply_date_preset("sales", today, fy_start)
     c_from, c_to, c_pri = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
             "From", value=fy_start,
             min_value=date(2020, 1, 1), max_value=today,
-            key="sales_start")
+            format="DD-MMM-YYYY", key="sales_start")
     with c_to:
         end = st.date_input(
             "To", value=today,
             min_value=date(2020, 1, 1), max_value=today,
-            key="sales_end")
+            format="DD-MMM-YYYY", key="sales_end")
     with c_pri:
         principal_filter = st.multiselect(
             "Principal",

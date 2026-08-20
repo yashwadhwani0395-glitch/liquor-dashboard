@@ -99,6 +99,64 @@ def section_header(title: str, subtitle: str = ""):
     st.divider()
 
 
+def _apply_date_preset(key_prefix: str, today: date, fy_start: date) -> None:
+    """Render a row of quick-preset buttons that seed the From/To pickers.
+
+    Widgets that read st.session_state[f'{key_prefix}_start' / '_end']
+    must be created AFTER this call. Preset writes happen inside on_click
+    callbacks so they land before the next rerun instantiates the pickers,
+    avoiding the 'session_state cannot be modified after widget instantiated'
+    error.
+    """
+    def _set(start_val: date, end_val: date) -> None:
+        st.session_state[f"{key_prefix}_start"] = start_val
+        st.session_state[f"{key_prefix}_end"]   = end_val
+
+    # Current month = 1st of this month → today
+    month_start = today.replace(day=1)
+    # Last complete month
+    lm_end   = month_start - timedelta(days=1)
+    lm_start = lm_end.replace(day=1)
+    # Last 3 months = start of 3-months-ago through today
+    l3m_start_year = today.year
+    l3m_start_month = today.month - 3
+    while l3m_start_month <= 0:
+        l3m_start_month += 12
+        l3m_start_year -= 1
+    l3m_start = date(l3m_start_year, l3m_start_month, 1)
+
+    st.markdown(
+        "<div style='font-size:0.78rem;color:#6b7280;margin-bottom:4px'>"
+        "Quick presets:</div>", unsafe_allow_html=True)
+    cols = st.columns(6)
+    with cols[0]:
+        st.button("This month", key=f"{key_prefix}_p_thismo",
+                  on_click=_set, kwargs=dict(start_val=month_start, end_val=today),
+                  use_container_width=True)
+    with cols[1]:
+        st.button("Last month", key=f"{key_prefix}_p_lastmo",
+                  on_click=_set, kwargs=dict(start_val=lm_start, end_val=lm_end),
+                  use_container_width=True)
+    with cols[2]:
+        st.button("Last 3 months", key=f"{key_prefix}_p_l3m",
+                  on_click=_set, kwargs=dict(start_val=l3m_start, end_val=today),
+                  use_container_width=True)
+    with cols[3]:
+        st.button("FY-to-date", key=f"{key_prefix}_p_fytd",
+                  on_click=_set, kwargs=dict(start_val=fy_start, end_val=today),
+                  use_container_width=True)
+    with cols[4]:
+        st.button("Today", key=f"{key_prefix}_p_today",
+                  on_click=_set, kwargs=dict(start_val=today, end_val=today),
+                  use_container_width=True)
+    with cols[5]:
+        st.button("Yesterday", key=f"{key_prefix}_p_yday",
+                  on_click=_set,
+                  kwargs=dict(start_val=today - timedelta(days=1),
+                              end_val=today - timedelta(days=1)),
+                  use_container_width=True)
+
+
 # ── KEG-aware case-equivalent SQL fragment ────────────────────────────────────
 # Standard 1 case = 7.8 litres. KEG items have BottlesPerCase=1 in the ERP
 # (each row's TotalBottleQty is the count of kegs sold). Use volume conversion

@@ -19,7 +19,8 @@ except ImportError:
 
 from db import run_query
 from utils.helpers import (format_inr, CASES_SQL_EXPR as _CASES,
-                          cases_sql, keg_mode_toggle)
+                          cases_sql, keg_mode_toggle,
+                          _apply_date_preset)
 
 # ── Transaction types ────────────────────────────────────────────────────────
 PURCHASE_TYPES: tuple[int, ...] = (11, 20, 22, 30, 32, 33, 36, 42, 45, 46, 48, 54)
@@ -806,13 +807,14 @@ def render() -> None:
     today    = date.today()
     fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
 
-    # Two separate From / To pickers instead of the range-mode widget.
-    # Streamlit's range date_input has a nasty bug: once session_state
-    # holds (start, end), clicking a NEW date AFTER the stored end
-    # (e.g. an August date when the stored end is in July) enters an
-    # invalid-range state and stops accepting further clicks. Two
-    # independent widgets sidestep it entirely — each one only has to
-    # obey its own min/max bounds.
+    # Two separate From / To pickers instead of the range-mode widget
+    # (Streamlit range picker gets stuck when the stored end is before
+    # a new start click). Preset buttons above skip the calendar for
+    # common ranges. Format string is DD-MMM-YYYY (e.g. 13-Aug-2026)
+    # so the month name is visible in the input box itself — the
+    # default YYYY/MM/DD makes it hard to eyeball at a glance.
+    _apply_date_preset("purchase", today, fy_start)
+
     c_from, c_to, c_pri = st.columns([1, 1, 2])
     with c_from:
         start = st.date_input(
@@ -820,6 +822,7 @@ def render() -> None:
             value=fy_start,
             min_value=date(2020, 1, 1),
             max_value=today,
+            format="DD-MMM-YYYY",
             key="purchase_start",
         )
     with c_to:
@@ -828,6 +831,7 @@ def render() -> None:
             value=today,
             min_value=date(2020, 1, 1),
             max_value=today,
+            format="DD-MMM-YYYY",
             key="purchase_end",
         )
     with c_pri:
@@ -841,6 +845,9 @@ def render() -> None:
     if start > end:
         st.warning("Start date must be before end date.")
         return
+    st.caption(
+        f"Showing **{start:%d-%b-%Y}** → **{end:%d-%b-%Y}**  "
+        f"({(end - start).days + 1} days).")
 
     keg_aware = keg_mode_toggle("purchase_keg_mode")
 
