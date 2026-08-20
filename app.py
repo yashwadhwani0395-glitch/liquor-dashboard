@@ -79,10 +79,17 @@ if not _require_login():
 # ── Global CSS ──────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Hide sidebar toggle & default Streamlit chrome */
+/* Hide sidebar toggle & default Streamlit chrome.
+   IMPORTANT: target Streamlit's OWN header via data-testid, not the
+   bare `header` tag selector. A bare `header { visibility: hidden }`
+   hides EVERY <header> element on the page — including the month/year
+   navigation bar inside the BaseWeb date-picker calendar popup, which
+   made every st.date_input calendar show a numbers-only grid with no
+   visible month/year (owner-reported). Scoping to stHeader fixes the
+   calendar without bringing back Streamlit's own toolbar. */
 [data-testid="collapsedControl"] { display: none !important; }
 #MainMenu { visibility: hidden; }
-header    { visibility: hidden; }
+[data-testid="stHeader"] { visibility: hidden; }
 footer    { visibility: hidden; }
 
 /* Remove top padding so header sits flush */
